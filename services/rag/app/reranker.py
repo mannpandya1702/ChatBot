@@ -50,21 +50,51 @@ class HashingReranker(Reranker):
 
 
 class BgeReranker(Reranker):
+    """bge-reranker-v2-m3 as a standard transformers cross-encoder.
+
+    Run directly via AutoModelForSequenceClassification rather than
+    FlagEmbedding's compute_score(), whose slow-tokenizer path breaks on current
+    transformers (XLMRobertaTokenizer has no `prepare_for_model`). The model
+    emits one relevance logit per (query, passage) pair; sigmoid maps it to the
+    (0, 1) score the refusal threshold compares against.
+    """
+
     name = "bge"
+    _batch = 16
+    _max_length = 512
 
     def __init__(self) -> None:
-        from FlagEmbedding import FlagReranker  # type: ignore
+        import torch  # noqa: F401 — ensure torch is present before model load
+        from transformers import (  # type: ignore
+            AutoModelForSequenceClassification,
+            AutoTokenizer,
+        )
 
-        self._model = FlagReranker(settings.rerank_model, use_fp16=True)
+        self._torch = torch
+        self._tok = AutoTokenizer.from_pretrained(settings.rerank_model)
+        self._model = AutoModelForSequenceClassification.from_pretrained(
+            settings.rerank_model
+        )
+        self._model.eval()
 
     def rerank(self, query: str, passages, top_k: int) -> list[RerankResult]:
         pairs = [[query, p.text] for p in passages]
-        raw = self._model.compute_score(pairs, normalize=True)  # sigmoid-normalised
-        if not isinstance(raw, list):
-            raw = [raw]
+        scores: list[float] = []
+        with self._torch.no_grad():
+            for i in range(0, len(pairs), self._batch):
+                batch = pairs[i : i + self._batch]
+                inputs = self._tok(
+                    batch,
+                    padding=True,
+                    truncation=True,
+                    max_length=self._max_length,
+                    return_tensors="pt",
+                )
+                logits = self._model(**inputs, return_dict=True).logits.view(-1).float()
+                scores.extend(self._torch.sigmoid(logits).tolist())
         scored = [
             RerankResult(id=p.id, score=float(s), text=p.text)
-            for p, s in zip(passages, raw)
+            for p, s in zip(passages, scores)
         ]
         scored.sort(key=lambda r: r.score, reverse=True)
         return scored[:top_k]
