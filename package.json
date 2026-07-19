@@ -1,0 +1,21 @@
+{
+  "name": "sainik-sahayak",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Invite-only bilingual RAG chatbot for Indian Army jawans. Answers strictly from an admin-managed PDF knowledge base with mandatory citations, or refuses cleanly.",
+  "scripts": {
+    "db:local:apply": "bash scripts/local-db/apply.sh",
+    "test:rls": "tsx scripts/test-rls.ts",
+    "seed:admin": "tsx scripts/seed-admin.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.11.10",
+    "pg": "^8.13.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.47.0"
+  }
+}

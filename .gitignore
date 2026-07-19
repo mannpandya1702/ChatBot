@@ -1,0 +1,17 @@
+# env & secrets — never committed (Operator rule 4)
+.env
+.env.*
+!.env.example
+
+# deps & builds
+node_modules/
+.next/
+dist/
+__pycache__/
+*.pyc
+.venv/
+
+# local artifacts
+*.log
+.DS_Store
+supabase/.temp/
