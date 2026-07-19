@@ -44,8 +44,8 @@ def test_table_is_atomic_and_never_split():
 def test_overlap_between_consecutive_text_chunks():
     # Distinct filler per paragraph so a shared sentence can ONLY come from the
     # overlap tail, not from coincidentally identical text.
-    para_a = "Alpha topic opens here. " + "Alpha detail sentence stands alone. " * 40
-    para_b = "Beta topic opens here. " + "Beta detail sentence stands alone. " * 40
+    para_a = "Alpha topic opens here. " + "Alpha detail sentence stands alone. " * 60
+    para_b = "Beta topic opens here. " + "Beta detail sentence stands alone. " * 60
     chunks = chunk_blocks([_para(para_a), _para(para_b)])
     assert len(chunks) >= 2
     # A later (beta) chunk must carry an alpha sentence forward as overlap.

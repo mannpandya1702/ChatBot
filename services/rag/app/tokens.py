@@ -30,10 +30,19 @@ def _hf_tokenizer():
 
 
 def count_tokens(text: str) -> int:
+    from .config import settings
+
+    if settings.token_backend == "heuristic":
+        return _heuristic_tokens(text)
     tok = _hf_tokenizer()
     if tok is not None:
         return len(tok.encode(text, add_special_tokens=False))
-    return _heuristic_tokens(text)
+    if settings.token_backend == "hf":
+        raise RuntimeError(
+            "RAG_TOKEN_BACKEND=hf but the model tokenizer is unavailable "
+            "(install transformers)."
+        )
+    return _heuristic_tokens(text)  # 'auto' fallback
 
 
 def _heuristic_tokens(text: str) -> int:

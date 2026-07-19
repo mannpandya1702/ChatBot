@@ -10,6 +10,9 @@ import os
 os.environ.setdefault("RAG_EMBEDDING_BACKEND", "hashing")
 os.environ.setdefault("RAG_RERANK_BACKEND", "hashing")
 os.environ.setdefault("RAG_SERVICE_SECRET", "test-secret")
+# Deterministic token counts regardless of whether transformers is installed,
+# so chunk-boundary assertions are stable across environments.
+os.environ.setdefault("RAG_TOKEN_BACKEND", "heuristic")
 
 import subprocess  # noqa: E402
 import uuid  # noqa: E402

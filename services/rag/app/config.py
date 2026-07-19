@@ -23,6 +23,14 @@ class Settings(BaseSettings):
     embedding_dim: int = 1024
     embed_batch_size: int = 32
 
+    # Token counter for chunk sizing. 'auto' uses the real XLM-R tokenizer when
+    # transformers is installed (production accuracy) and falls back to the
+    # script-aware heuristic otherwise. Pinned explicitly so chunk boundaries
+    # are never silently altered by what happens to be installed. 'hf' forces
+    # the model tokenizer (errors if unavailable); 'heuristic' forces the
+    # dependency-free counter (used in tests for determinism).
+    token_backend: str = "auto"  # auto | hf | heuristic
+
     # Chunking (spec §6).
     chunk_target_tokens: int = 600
     chunk_max_tokens: int = 900
