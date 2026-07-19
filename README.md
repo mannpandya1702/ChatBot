@@ -9,7 +9,7 @@ admin-managed PDF knowledge base — or the bot refuses cleanly. No guesswork.
 
 ```
 apps/web/              Next.js 15 app (chat UI + admin console)     [Phase 2/4]
-services/rag/          FastAPI ingestion/embedding/rerank service   [Phase 1]
+services/rag/          FastAPI ingestion/embedding/rerank service   [Phase 1 ✓ code]
 supabase/migrations/   schema, RLS, hybrid_search, log_event        [Phase 0 ✓]
 scripts/               seed-admin, test-rls, local db harness       [Phase 0 ✓]
 golden/                eval set (golden.jsonl)                      [Phase 7]
@@ -32,3 +32,14 @@ SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... \
 ```
 
 See `docs/ARCHITECTURE.md` for the full design and the phase log.
+
+## rag-service (Phase 1)
+
+```bash
+cd services/rag && pip install -r requirements.txt
+python -m pytest            # 19 tests: chunker, OCR fallback, endpoints, e2e ingest
+```
+
+Bulk load (operator): `RAG_DATABASE_URL=... python services/rag/cli.py ingest ./pdfs --tier 1`
+
+Backends swap by env: `RAG_EMBEDDING_BACKEND=bge|hashing`, `RAG_RERANK_BACKEND=bge|hashing`.

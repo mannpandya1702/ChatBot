@@ -82,6 +82,18 @@ middleware.
   shimmed by `scripts/local-db/shim-auth.sql`; migrations themselves are untouched
   Supabase SQL). RLS matrix green via `npm run test:rls`. Seed script ready
   (`npm run seed:admin`, needs hosted credentials).
-- Phase 1 — rag-service: pending (needs sample PDFs).
-- Phase 2 — chat API: pending (needs LLM provider decision, spec §15 Q1).
+- **Phase 1 — rag-service: code-complete, verified on synthetic fixtures.**
+  FastAPI service (`/health`, `/embed`, `/rerank`, `/ingest`, all behind
+  `X-Service-Secret`), PyMuPDF extraction with Tesseract `hin+eng` OCR fallback
+  (<40 chars/page), structure-aware chunker (target 600 / hard-max 900 / 15%
+  overlap / tables never split / heading breadcrumb), pluggable embed+rerank
+  backends (`bge` real · `hashing` deterministic double), Supabase-Storage and
+  local file sources, bulk `cli.py ingest`, and a Dockerfile that bakes in the
+  models. `pytest` = 19 passed incl. an end-to-end ingest into real
+  Postgres+pgvector (chunks + 1024-dim embeddings asserted in the DB) and the
+  CLI dedup path. **Remaining for DoD sign-off:** run the operator's real PDF
+  through the `bge` backend end-to-end (pending the file + a real-model smoke
+  check). The `bge` backend selects via `RAG_EMBEDDING_BACKEND=bge`.
+- Phase 2 — chat API: pending (needs LLM provider decision, spec §15 Q1 →
+  answered *unclassified*, so Anthropic is viable for the pilot; needs creds).
 - Phases 3–8: pending.
