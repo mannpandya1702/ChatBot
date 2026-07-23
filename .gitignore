@@ -23,3 +23,6 @@ supabase/.temp/
 
 # TS incremental build cache
 *.tsbuildinfo
+
+# Next.js generated (regenerated every build)
+apps/web/next-env.d.ts
