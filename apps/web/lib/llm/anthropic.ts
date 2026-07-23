@@ -5,7 +5,18 @@ import { CLASSIFY_SYSTEM, classifyUserMessage } from "../prompts/classify";
 import { REWRITE_SYSTEM, rewriteUserPayload } from "../prompts/rewrite";
 import type { Classification, Classifier, Generator, Rewriter } from "../chat/types";
 
-const anthropic = createAnthropic({ apiKey: env.anthropicApiKey });
+// The Vercel AI SDK expects the base URL to already include `/v1` (it appends
+// only `/messages`), whereas the official Anthropic SDK convention — and some
+// environments' ANTHROPIC_BASE_URL — omit it. Normalize so either form works.
+function anthropicBaseUrl(): string {
+  const raw = (process.env.ANTHROPIC_BASE_URL ?? "https://api.anthropic.com").replace(/\/+$/, "");
+  return raw.endsWith("/v1") ? raw : `${raw}/v1`;
+}
+
+const anthropic = createAnthropic({
+  apiKey: env.anthropicApiKey,
+  baseURL: anthropicBaseUrl(),
+});
 
 const LABELS: Classification[] = [
   "greeting",

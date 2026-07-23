@@ -113,7 +113,16 @@ middleware.
   (`lib/chat/db.ts`), settings loader, zod request schema, and `app/api/chat/route.ts`
   (Bearer auth for now; Phase 3 adds the cookie+AAL2 middleware). `vitest` = 15 passed
   (branch routing, fail-closed refusals, uncited-answer replacement, log
-  minimisation, Hindi NOT_FOUND); `tsc --noEmit` clean. **Remaining for DoD
-  sign-off:** a live `curl` showing a grounded cited answer + `NOT_FOUND` for
-  "capital of France" (needs KB content — the operator's PDF or a seed doc).
+  minimisation, Hindi NOT_FOUND); `tsc --noEmit` clean.
+  - **Live DoD PASSED** (`apps/web/scripts/live-smoke.mts` — drives the real
+    pipeline against live Supabase + Anthropic `claude-sonnet-4-6` + the local
+    rag-service with a seeded KB and a tier-3 user, then cleans up). "How do I
+    apply for annual leave?" → grounded Hinglish answer, every sentence cited
+    `[S1]`/`[S2]`, `refused:false`; "capital of France?" → exact `NOT_FOUND`,
+    `refused:true`. Driving the pipeline from Node surfaced three integration
+    fixes the unit tests can't: undici proxy egress (`EnvHttpProxyAgent`), cold
+    rag-model warmup, and normalising the AI SDK's `/v1` base URL against
+    `ANTHROPIC_BASE_URL`. The operator's real PDF replaces the seed KB for the
+    production sign-off; the same pipeline is curl-able at `/api/chat` once
+    Phase 3 auth issues sessions.
 - Phases 3–8: pending.
