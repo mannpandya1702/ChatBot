@@ -76,12 +76,21 @@ middleware.
 
 ## Phase log
 
-- **Phase 0 — scaffold + schema: DONE.** Migrations apply clean on a fresh database
-  (`scripts/local-db/apply.sh`, stand-in for `supabase db reset` — the remote build
-  environment has no Docker, so the Supabase-auth surface the migrations rely on is
-  shimmed by `scripts/local-db/shim-auth.sql`; migrations themselves are untouched
-  Supabase SQL). RLS matrix green via `npm run test:rls`. Seed script ready
-  (`npm run seed:admin`, needs hosted credentials).
+- **Phase 0 — scaffold + schema: DONE, and LIVE on hosted Supabase.** Migrations apply
+  clean on a fresh database (`scripts/local-db/apply.sh`, stand-in for `supabase db
+  reset` — the remote build environment has no Docker, so the Supabase-auth surface the
+  migrations rely on is shimmed by `scripts/local-db/shim-auth.sql`; migrations
+  themselves are untouched Supabase SQL). RLS matrix green via `npm run test:rls`
+  (61/61). Seed script ready (`npm run seed:admin`).
+  - **Applied to the hosted project** (`ap-south-1`, **PostgreSQL 17.6** — Supabase's
+    current default; migrations are 15/16/17-compatible) over the Management API
+    (this sandbox has HTTPS egress only; direct Postgres TCP is blocked). Verified
+    live: 9 tables all RLS-enabled (0 disabled), 13 policies, 6 settings seeded,
+    pgvector in `public`, HNSW + GIN indexes present, audit_logs INSERT/UPDATE/DELETE
+    revoked. Deny-by-default confirmed at the real API boundary (anon → 401 on
+    profiles/app_settings; service_role → 200) and the authenticated path proven via a
+    create→sign-in→read→cleanup cycle (super_admin saw only its own row; test user
+    deleted, DB left clean). Canonical apply path for operators is `supabase db push`.
 - **Phase 1 — rag-service: code-complete, verified on synthetic fixtures.**
   FastAPI service (`/health`, `/embed`, `/rerank`, `/ingest`, all behind
   `X-Service-Secret`), PyMuPDF extraction with Tesseract `hin+eng` OCR fallback
