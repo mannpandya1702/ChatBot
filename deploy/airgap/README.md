@@ -15,6 +15,10 @@ authority's responsibility.
 
 ## Quick start (near-turnkey)
 
+> **On Windows?** Follow **[`WINDOWS.md`](./WINDOWS.md)** — a beginner-friendly,
+> click-by-click version of this (WSL2 + Docker Desktop, provision-then-
+> disconnect). The steps below are the OS-agnostic reference.
+
 Three commands, given Docker + the Supabase self-hosting bundle
 (§2). The scripts generate every secret and key for you, so you edit almost
 nothing. Detailed manual steps and troubleshooting follow in §2 onward.

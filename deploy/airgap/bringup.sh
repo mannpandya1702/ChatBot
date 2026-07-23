@@ -29,7 +29,8 @@ POSTGRES_DB="$(getenv POSTGRES_DB)"; POSTGRES_DB="${POSTGRES_DB:-postgres}"
 WEB_PORT="$(getenv WEB_PORT)"; WEB_PORT="${WEB_PORT:-3000}"
 PUBLIC_URL="$(getenv SUPABASE_PUBLIC_URL)"
 
-COMPOSE=(docker compose -f "$SUPABASE_DOCKER_DIR/docker-compose.yml"
+COMPOSE=(docker compose --env-file "$ENV_FILE"
+         -f "$SUPABASE_DOCKER_DIR/docker-compose.yml"
          -f "$REPO_DIR/deploy/airgap/docker-compose.airgap.yml")
 [ "$SLIM" -eq 1 ] && COMPOSE+=(-f "$REPO_DIR/deploy/airgap/docker-compose.slim.yml")
 
@@ -88,6 +89,26 @@ fi
 # 6. app services
 step "starting ollama + rag + web"
 "${COMPOSE[@]}" up -d ollama rag web
+
+# 6b. ensure the LLM model(s) are present. From a staged bundle they were
+#     restored into the volume; otherwise pull them now (needs internet — do
+#     this during your setup window, before you disconnect the host).
+GEN_MODEL="$(getenv GENERATION_MODEL)"
+CLASSIFY_MODEL="$(getenv OLLAMA_CLASSIFY_MODEL)"
+step "waiting for ollama"
+for i in $(seq 1 30); do "${COMPOSE[@]}" exec -T ollama ollama list >/dev/null 2>&1 && break; sleep 2; done
+ensure_model() {
+  local m="$1"; [ -z "$m" ] && return 0
+  if "${COMPOSE[@]}" exec -T ollama ollama list 2>/dev/null | grep -q "$m"; then
+    echo "   model present: $m"
+  else
+    echo "   pulling model: $m  (needs internet; skip by staging it in the bundle)"
+    "${COMPOSE[@]}" exec -T ollama ollama pull "$m" \
+      || echo "   WARN: could not pull $m (offline?). Load it before using chat."
+  fi
+}
+ensure_model "$GEN_MODEL"
+ensure_model "$CLASSIFY_MODEL"
 
 echo
 echo "=========================================================="
