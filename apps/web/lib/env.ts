@@ -11,4 +11,8 @@ export const env = {
   ragServiceUrl: process.env.RAG_SERVICE_URL ?? "http://localhost:8000",
   ragServiceSecret: process.env.RAG_SERVICE_SECRET ?? "",
   rerankRefusalThreshold: Number(process.env.RERANK_REFUSAL_THRESHOLD ?? "0.35"),
+  ipAllowlist: (process.env.IP_ALLOWLIST ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
 };

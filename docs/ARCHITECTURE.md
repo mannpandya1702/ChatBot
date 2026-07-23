@@ -125,4 +125,26 @@ middleware.
     `ANTHROPIC_BASE_URL`. The operator's real PDF replaces the seed KB for the
     production sign-off; the same pipeline is curl-able at `/api/chat` once
     Phase 3 auth issues sessions.
-- Phases 3–8: pending.
+- **Phase 3 — auth: foundation code-complete.** `middleware.ts` — deny-by-default
+  gate on every route: IP allowlist (fail-closed) → session → AAL2
+  (`mfa.getAuthenticatorAssuranceLevel`) → active profile, funnelling to
+  `/onboarding` until password-change + TOTP are done and signing out
+  deactivated users. `lib/auth/ip.ts` (CIDR allowlist, 5 tests), `lib/auth/
+  lockout.ts` (5 failures / 15 min via login_attempts, service-role only),
+  `lib/auth/invite.ts` (super_admin invites any role/tier; admin invites jawans
+  at tier 1 only; one-time temp password), `lib/supabase/server.ts` (SSR cookie
+  client). `tsc` clean; `vitest` 20/20. **Remaining:** /login + /onboarding UI
+  (password change → TOTP enrollment → AAL2 verify) and the live DoD
+  (/chat unreachable without AAL2; deactivated user signed out; lockout).
+- Phases 4–8: pending.
+
+## Content classification handling (governance)
+
+Deliberate policy, enforced in this session: **RESTRICTED / classified / unclear
+material is never ingested through the cloud pipeline** (Anthropic API or hosted
+Supabase) and is not downloaded into the cloud build sandbox. Such content is
+handled only on the operator's **air-gapped** deployment (self-hosted Supabase +
+`LLM_PROVIDER=ollama` + local BGE/OCR), per spec §1.4 and §15 Q1. The cloud
+pilot (Phases 0–2) is for genuinely unclassified welfare/pension/leave/SOP
+documents only. Classification and handling authorization are the operator's
+information-security authority's responsibility, not the build's.
