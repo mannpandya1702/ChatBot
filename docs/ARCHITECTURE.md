@@ -103,6 +103,17 @@ middleware.
   CLI dedup path. **Remaining for DoD sign-off:** run the operator's real PDF
   through the `bge` backend end-to-end (pending the file + a real-model smoke
   check). The `bge` backend selects via `RAG_EMBEDDING_BACKEND=bge`.
-- Phase 2 — chat API: pending (needs LLM provider decision, spec §15 Q1 →
-  answered *unclassified*, so Anthropic is viable for the pilot; needs creds).
+- **Phase 2 — chat API: code-complete, pipeline unit-tested.** `apps/web` (Next 15,
+  React 19). The full Section 3 pipeline (`lib/chat/pipeline.ts`) with dependency
+  injection: classify (Haiku) → rewrite → rag `/embed` → `hybrid_search` RPC
+  (RLS-scoped via the user JWT) → rag `/rerank` → fail-closed threshold → S7-prompt
+  generation → citation post-check → persist + audit + analytics. `LLM_PROVIDER`
+  factory (Anthropic via Vercel AI SDK, Ollama via fetch — same prompts). Real
+  clients: rag (`lib/rag`), Supabase user+service (`lib/supabase`), DB layer
+  (`lib/chat/db.ts`), settings loader, zod request schema, and `app/api/chat/route.ts`
+  (Bearer auth for now; Phase 3 adds the cookie+AAL2 middleware). `vitest` = 15 passed
+  (branch routing, fail-closed refusals, uncited-answer replacement, log
+  minimisation, Hindi NOT_FOUND); `tsc --noEmit` clean. **Remaining for DoD
+  sign-off:** a live `curl` showing a grounded cited answer + `NOT_FOUND` for
+  "capital of France" (needs KB content — the operator's PDF or a seed doc).
 - Phases 3–8: pending.
