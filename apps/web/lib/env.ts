@@ -5,6 +5,9 @@ export const env = {
   ollamaBaseUrl: process.env.OLLAMA_BASE_URL ?? "http://localhost:11434",
   generationModel: process.env.GENERATION_MODEL ?? "claude-sonnet-4-6",
   classifierModel: process.env.CLASSIFIER_MODEL ?? "claude-haiku-4-5",
+  // Ollama-only: optional lighter tag for the cheap classify/rewrite hops.
+  // Falls back to GENERATION_MODEL so a single-model air-gap install just works.
+  ollamaClassifyModel: process.env.OLLAMA_CLASSIFY_MODEL || process.env.GENERATION_MODEL || "",
   supabaseUrl: process.env.NEXT_PUBLIC_SUPABASE_URL ?? "",
   supabaseAnonKey: process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? "",
   supabaseServiceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY ?? "",

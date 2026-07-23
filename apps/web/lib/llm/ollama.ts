@@ -10,6 +10,7 @@ import { parseLabel } from "./anthropic";
 import type { Classifier, Generator, Rewriter } from "../chat/types";
 
 async function ollamaChat(
+  model: string,
   system: string,
   user: string,
   numPredict: number,
@@ -18,7 +19,7 @@ async function ollamaChat(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: env.generationModel, // for ollama, GENERATION_MODEL holds the ollama tag
+      model,
       stream: false,
       options: { num_predict: numPredict, temperature: 0 },
       messages: [
@@ -32,21 +33,25 @@ async function ollamaChat(
   return data.message?.content ?? "";
 }
 
+// Generation uses the full model; the cheap classify/rewrite hops use the
+// lighter tag if configured (OLLAMA_CLASSIFY_MODEL), else the same model.
+const CLASSIFY_MODEL = env.ollamaClassifyModel || env.generationModel;
+
 export const ollamaClassifier: Classifier = {
   async classify(input) {
-    return parseLabel(await ollamaChat(CLASSIFY_SYSTEM, classifyUserMessage(input), 16));
+    return parseLabel(await ollamaChat(CLASSIFY_MODEL, CLASSIFY_SYSTEM, classifyUserMessage(input), 16));
   },
 };
 
 export const ollamaRewriter: Rewriter = {
   async rewrite(history, latest) {
-    return (await ollamaChat(REWRITE_SYSTEM, rewriteUserPayload(history, latest), 256)).trim();
+    return (await ollamaChat(CLASSIFY_MODEL, REWRITE_SYSTEM, rewriteUserPayload(history, latest), 256)).trim();
   },
 };
 
 export const ollamaGenerator: Generator = {
   async generate({ system, userPayload, maxOutputTokens }) {
-    const text = await ollamaChat(system, userPayload, maxOutputTokens);
+    const text = await ollamaChat(env.generationModel, system, userPayload, maxOutputTokens);
     return { text, model: env.generationModel };
   },
 };
