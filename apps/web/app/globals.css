@@ -1,0 +1,79 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Olive/navy military theme. Light is the default; .dark flips to a navy base. */
+:root {
+  --background: 40 30% 98%;
+  --foreground: 215 30% 15%;
+  --card: 0 0% 100%;
+  --card-foreground: 215 30% 15%;
+  --primary: 74 38% 30%;            /* olive */
+  --primary-foreground: 60 30% 96%;
+  --secondary: 215 45% 22%;         /* navy */
+  --secondary-foreground: 0 0% 98%;
+  --muted: 40 20% 94%;
+  --muted-foreground: 215 12% 42%;
+  --accent: 74 30% 92%;
+  --accent-foreground: 74 38% 24%;
+  --destructive: 0 70% 42%;
+  --destructive-foreground: 0 0% 98%;
+  --border: 40 15% 86%;
+  --input: 40 15% 86%;
+  --ring: 74 38% 30%;
+  --radius: 0.5rem;
+}
+
+.dark {
+  --background: 215 40% 10%;
+  --foreground: 40 30% 92%;
+  --card: 215 35% 13%;
+  --card-foreground: 40 30% 92%;
+  --primary: 74 40% 46%;
+  --primary-foreground: 215 40% 10%;
+  --secondary: 215 40% 20%;
+  --secondary-foreground: 0 0% 98%;
+  --muted: 215 30% 17%;
+  --muted-foreground: 40 15% 68%;
+  --accent: 215 30% 20%;
+  --accent-foreground: 40 30% 92%;
+  --destructive: 0 62% 50%;
+  --destructive-foreground: 0 0% 98%;
+  --border: 215 25% 22%;
+  --input: 215 25% 24%;
+  --ring: 74 40% 46%;
+}
+
+* {
+  border-color: hsl(var(--border));
+}
+
+body {
+  background-color: hsl(var(--background));
+  color: hsl(var(--foreground));
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Respect users who prefer a dark UI, without needing JS on first paint. */
+@media (prefers-color-scheme: dark) {
+  :root:not(.light) {
+    --background: 215 40% 10%;
+    --foreground: 40 30% 92%;
+    --card: 215 35% 13%;
+    --card-foreground: 40 30% 92%;
+    --primary: 74 40% 46%;
+    --primary-foreground: 215 40% 10%;
+    --secondary: 215 40% 20%;
+    --secondary-foreground: 0 0% 98%;
+    --muted: 215 30% 17%;
+    --muted-foreground: 40 15% 68%;
+    --accent: 215 30% 20%;
+    --accent-foreground: 40 30% 92%;
+    --destructive: 0 62% 50%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 215 25% 22%;
+    --input: 215 25% 24%;
+    --ring: 74 40% 46%;
+  }
+}
