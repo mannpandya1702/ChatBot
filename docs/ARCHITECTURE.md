@@ -147,4 +147,24 @@ handled only on the operator's **air-gapped** deployment (self-hosted Supabase +
 `LLM_PROVIDER=ollama` + local BGE/OCR), per spec §1.4 and §15 Q1. The cloud
 pilot (Phases 0–2) is for genuinely unclassified welfare/pension/leave/SOP
 documents only. Classification and handling authorization are the operator's
-information-security authority's responsibility, not the build's.
+information-security authority's responsibility, not the build's. Authorship of a
+classified document does not lift its marking — declassification is a formal act
+of the issuing authority, so "the author says it's fine" is not a basis to route
+RESTRICTED content through the cloud path.
+
+## Air-gapped deployment (`deploy/airgap/`)
+
+The offline path for classified/access-controlled KBs. Everything runs on the
+operator's own hardware — Postgres+pgvector, BGE-M3/reranker/OCR, and the LLM
+(Ollama) — so no query text or document content ever leaves the machine. It is a
+thin overlay (`docker-compose.airgap.yml` adds `ollama` + `rag` + `web`) on the
+upstream Supabase self-hosting stack, plus offline helpers: `gen-jwt.mjs` (mint
+API keys from the JWT secret), `stage-models.sh` (the one online step — pull
+models/images into a transferable bundle), and `apply-migrations.sh` (apply
+migrations 1–5 and assert RLS on every table). The chat pipeline, fail-closed
+gate, `[S#]` enforcement, and RLS are identical to the cloud pilot — only the LLM
+transport and hosting differ. Full runbook: `deploy/airgap/README.md`.
+
+The `web` service ships as a standalone Next server (`output: "standalone"`,
+`apps/web/Dockerfile`); the Ollama provider uses `GENERATION_MODEL` for
+generation and an optional lighter `OLLAMA_CLASSIFY_MODEL` for classify/rewrite.

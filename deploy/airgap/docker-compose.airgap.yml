@@ -1,0 +1,103 @@
+# Sainik Sahayak — air-gap overlay.
+#
+# This file adds ONLY our three services (ollama, rag, web) on top of the
+# official Supabase self-hosting stack. It is meant to be merged with the
+# upstream compose so everything shares one project + network:
+#
+#   cd supabase/docker
+#   docker compose \
+#     -f docker-compose.yml \
+#     -f /path/to/repo/deploy/airgap/docker-compose.airgap.yml \
+#     up -d
+#
+# Service names from the upstream stack we rely on: `db` (Postgres+pgvector,
+# 5432) and `kong` (API gateway, 8000). See deploy/airgap/README.md.
+#
+# Build contexts are relative to THIS file's directory (deploy/airgap/), so the
+# merged run resolves them correctly regardless of the working directory.
+services:
+  ollama:
+    # Pin a specific tag when you stage images (see stage-models.sh). `latest`
+    # is a placeholder — record the exact tag you `docker save` so the
+    # air-gapped host loads the identical image.
+    image: ollama/ollama:0.5.4
+    restart: unless-stopped
+    volumes:
+      - ollama_models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    # No ports published: only `web` (same network) talks to it. Keep it off the
+    # host to preserve the deny-by-default posture.
+
+  rag:
+    build:
+      context: ../../services/rag
+    image: sainik/rag:local
+    restart: unless-stopped
+    volumes:
+      # Host folder holding the PDF(s) to ingest, read-only. Set KB_DIR to an
+      # absolute path on the offline host (e.g. /secure/kb). Used by:
+      #   docker compose exec rag python cli.py ingest /kb --tier N
+      - ${KB_DIR:-./kb}:/kb:ro
+    environment:
+      RAG_SERVICE_SECRET: ${RAG_SERVICE_SECRET}
+      # Direct Postgres (service path bypasses RLS by design — writes documents/
+      # chunks only). Connects to the upstream `db` service.
+      RAG_DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-postgres}
+      RAG_EMBEDDING_BACKEND: bge
+      RAG_RERANK_BACKEND: bge
+      RAG_TOKEN_BACKEND: auto
+      RAG_OCR_LANGUAGES: hin+eng
+      # Models are baked into the image; no model-hub egress at runtime.
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://localhost:8000/health'); "]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+    # No ports published: only `web` calls it, over the internal network.
+
+  web:
+    build:
+      context: ../../apps/web
+      args:
+        # Public vars are inlined at build time by Next. Must match the values
+        # the browser will use to reach Supabase (the external Kong URL).
+        NEXT_PUBLIC_SUPABASE_URL: ${SUPABASE_PUBLIC_URL}
+        NEXT_PUBLIC_SUPABASE_ANON_KEY: ${ANON_KEY}
+    image: sainik/web:local
+    restart: unless-stopped
+    environment:
+      # --- provider: fully local inference ---
+      LLM_PROVIDER: ollama
+      OLLAMA_BASE_URL: http://ollama:11434
+      GENERATION_MODEL: ${GENERATION_MODEL}
+      OLLAMA_CLASSIFY_MODEL: ${OLLAMA_CLASSIFY_MODEL:-}
+      # --- supabase (server-side) ---
+      NEXT_PUBLIC_SUPABASE_URL: ${SUPABASE_PUBLIC_URL}
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY}
+      # --- rag-service ---
+      RAG_SERVICE_URL: http://rag:8000
+      RAG_SERVICE_SECRET: ${RAG_SERVICE_SECRET}
+      # --- fail-closed + access posture ---
+      RERANK_REFUSAL_THRESHOLD: ${RERANK_REFUSAL_THRESHOLD:-0.35}
+      IP_ALLOWLIST: ${IP_ALLOWLIST:-}
+      NODE_ENV: production
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    depends_on:
+      - rag
+      - ollama
+      - kong
+
+volumes:
+  ollama_models:
