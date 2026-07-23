@@ -1,0 +1,11 @@
+{
+  "name": "Sainik Sahayak",
+  "short_name": "Sahayak",
+  "description": "Internal knowledge assistant for jawans — answers only from approved documents.",
+  "start_url": "/chat",
+  "display": "standalone",
+  "background_color": "#f7f7f2",
+  "theme_color": "#3f4a1f",
+  "lang": "en",
+  "orientation": "portrait"
+}

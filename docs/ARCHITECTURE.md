@@ -133,10 +133,28 @@ middleware.
   lockout.ts` (5 failures / 15 min via login_attempts, service-role only),
   `lib/auth/invite.ts` (super_admin invites any role/tier; admin invites jawans
   at tier 1 only; one-time temp password), `lib/supabase/server.ts` (SSR cookie
-  client). `tsc` clean; `vitest` 20/20. **Remaining:** /login + /onboarding UI
-  (password change → TOTP enrollment → AAL2 verify) and the live DoD
+  client). **UI complete:** `/login` (two-step password → TOTP via server
+  actions, lockout + IP enforced server-side) and `/onboarding` (forced
+  password change → TOTP QR enrollment → AAL2 verify), plus `POST /auth/signout`.
+  `tsc` clean; `vitest` 20/20. **Remaining for DoD sign-off:** the live auth run
   (/chat unreachable without AAL2; deactivated user signed out; lockout).
-- Phases 4–8: pending.
+- **Phase 4 — chat UI: code-complete.** `/chat` — mobile-first conversation view
+  (olive/navy Tailwind theme, Hindi-capable), user/assistant bubbles, a Sources
+  list from `[S#]` citations, a distinct treatment for fail-closed NOT_FOUND,
+  bilingual empty state with example prompts, char-capped composer, and an Admin
+  link for admins. `/api/chat` now accepts the cookie session (AAL2 middleware)
+  as well as Bearer, and returns `conversationId`. UI foundation: Tailwind v3 +
+  CSS-variable theme, accessible primitives (`lib/ui`), browser Supabase client.
+- **Phase 5 — admin console: code-complete.** `/admin` (role-gated via
+  `requireAdmin`): **Users** — service-role listing incl. inactive, invite
+  (one-time password), activate/deactivate with role-correct authorization;
+  **Documents** — PDF upload (dedup by sha256) → private `kb` Storage bucket
+  (auto-created) → synchronous rag `/ingest`, with live status, re-ingest, and
+  delete (chunks cascade); **Analytics** — top answered questions and the
+  unanswered-query gap from `query_analytics` (no user linkage), refusal rate.
+  Polish: `not-found`, error boundary, web manifest, chat loading state.
+- Phases 6–8 (hardening, eval, cloud deploy config): pending. Air-gap deploy
+  kit shipped (`deploy/airgap/`).
 
 ## Content classification handling (governance)
 

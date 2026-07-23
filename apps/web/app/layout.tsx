@@ -5,6 +5,7 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "Sainik Sahayak",
   description: "Internal knowledge assistant — answers only from the approved knowledge base.",
+  manifest: "/manifest.webmanifest",
 };
 
 export const viewport: Viewport = {
