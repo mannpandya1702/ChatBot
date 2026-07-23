@@ -158,12 +158,15 @@ The offline path for classified/access-controlled KBs. Everything runs on the
 operator's own hardware — Postgres+pgvector, BGE-M3/reranker/OCR, and the LLM
 (Ollama) — so no query text or document content ever leaves the machine. It is a
 thin overlay (`docker-compose.airgap.yml` adds `ollama` + `rag` + `web`) on the
-upstream Supabase self-hosting stack, plus offline helpers: `gen-jwt.mjs` (mint
-API keys from the JWT secret), `stage-models.sh` (the one online step — pull
-models/images into a transferable bundle), and `apply-migrations.sh` (apply
-migrations 1–5 and assert RLS on every table). The chat pipeline, fail-closed
-gate, `[S#]` enforcement, and RLS are identical to the cloud pilot — only the LLM
-transport and hosting differ. Full runbook: `deploy/airgap/README.md`.
+upstream Supabase self-hosting stack, plus offline helpers. The operator path is
+~3 commands: `bootstrap-env.sh` (generate every secret + mint the anon/service
+keys with bash+openssl, lock down auth), `stage-models.sh` (the one online step —
+pull models/images into a transferable bundle), and `bringup.sh` (load →
+Supabase core → `apply-migrations.sh` → `seed-admin.sh` → app; `--slim` drops the
+non-essential services). `gen-jwt.mjs` is the Node equivalent of the key minting.
+The chat pipeline, fail-closed gate, `[S#]` enforcement, and RLS are identical to
+the cloud pilot — only the LLM transport and hosting differ. Full runbook:
+`deploy/airgap/README.md`.
 
 The `web` service ships as a standalone Next server (`output: "standalone"`,
 `apps/web/Dockerfile`); the Ollama provider uses `GENERATION_MODEL` for

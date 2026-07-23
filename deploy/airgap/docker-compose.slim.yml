@@ -1,0 +1,15 @@
+# Optional stack trim: skip the non-essential upstream Supabase services.
+# Merge AFTER the base + overlay (bringup.sh --slim does this). Assigning a
+# service to a profile that is never enabled keeps it from starting — nothing
+# the app uses depends on these (Studio is the admin dashboard; `meta` backs
+# only Studio; `functions` is the edge runtime we don't use).
+#
+# If your Supabase bundle version does not define one of these services, delete
+# that block — a profile override on a non-existent service errors.
+services:
+  studio:
+    profiles: ["donotstart"]
+  meta:
+    profiles: ["donotstart"]
+  functions:
+    profiles: ["donotstart"]

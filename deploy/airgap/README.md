@@ -13,6 +13,58 @@ authority's responsibility.
 
 ---
 
+## Quick start (near-turnkey)
+
+Three commands, given Docker + the Supabase self-hosting bundle
+(§2). The scripts generate every secret and key for you, so you edit almost
+nothing. Detailed manual steps and troubleshooting follow in §2 onward.
+
+**A — on a machine with internet:** generate config, then stage images + models.
+
+```bash
+# writes all secrets, mints anon/service keys, locks down auth (no signup/anon)
+SUPABASE_DOCKER_DIR=/path/to/supabase/docker \
+SUPABASE_PUBLIC_URL=http://<offline-host-lan-ip>:8000 \
+GEN_MODEL=qwen2.5:7b-instruct \
+  deploy/airgap/bootstrap-env.sh
+
+# builds our images + pulls the model(s) into a transferable bundle
+SUPABASE_DOCKER_DIR=/path/to/supabase/docker GEN_MODEL=qwen2.5:7b-instruct \
+  deploy/airgap/stage-models.sh
+```
+
+Copy three things to the offline host: this repo, the Supabase bundle (with its
+now-filled `.env`), and `deploy/airgap/airgap-bundle/`.
+
+**B — on the offline host:** one command does the rest.
+
+```bash
+SUPABASE_DOCKER_DIR=/path/to/supabase/docker \
+BUNDLE_DIR=/path/to/airgap-bundle \
+  deploy/airgap/bringup.sh --slim
+```
+
+It loads images, restores the models, starts Supabase, applies the
+migrations (and asserts RLS on every table), seeds the first super_admin
+(**prints a one-time password**), and starts the app. `--slim` skips the
+non-essential Supabase services (dashboard, edge functions).
+
+**C — ingest your document:**
+
+```bash
+# put your PDF(s) in the folder you set as KB_DIR, then:
+cd /path/to/supabase/docker
+docker compose -f docker-compose.yml \
+  -f /path/to/repo/deploy/airgap/docker-compose.airgap.yml \
+  exec rag python cli.py ingest /kb --tier 1
+```
+
+That's it — open `http://<offline-host>:<WEB_PORT>` and sign in with the seeded
+admin (first login forces a password change + TOTP). Everything below is the
+same flow, unpacked, for when you want the detail or hit a snag.
+
+---
+
 ## 1. What you get
 
 ```
