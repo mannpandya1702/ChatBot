@@ -40,11 +40,14 @@ export async function middleware(req: NextRequest) {
   const path = req.nextUrl.pathname;
   const isPublic = PUBLIC_PREFIXES.some((p) => path === p || path.startsWith(p + "/"));
   const isOnboarding = path === ONBOARDING || path.startsWith(ONBOARDING + "/");
+  // API routes get a 401 JSON on denial instead of an HTML redirect.
+  const isApi = path.startsWith("/api/");
+  const deny = (to: string) => (isApi ? unauthorized() : redirect(req, to));
 
   const { data: { user } } = await supabase.auth.getUser();
 
   if (!user) {
-    return isPublic ? res : redirect(req, "/login");
+    return isPublic ? res : deny("/login");
   }
 
   // 2. AAL2 — must have completed TOTP. Below AAL2 → funnel to onboarding.
@@ -60,12 +63,12 @@ export async function middleware(req: NextRequest) {
 
   if (!profile || profile.is_active !== true) {
     await supabase.auth.signOut();
-    return redirect(req, "/login");
+    return deny("/login");
   }
 
   const mustOnboard = !atAal2 || profile.must_change_password === true;
   if (mustOnboard) {
-    return isOnboarding || isPublic ? res : redirect(req, "/onboarding");
+    return isOnboarding || isPublic ? res : deny("/onboarding");
   }
 
   // Fully authenticated — keep them out of login/onboarding.
@@ -78,6 +81,13 @@ function redirect(req: NextRequest, to: string): NextResponse {
   url.pathname = to;
   url.search = "";
   return NextResponse.redirect(url);
+}
+
+function unauthorized(): NextResponse {
+  return new NextResponse(JSON.stringify({ error: "unauthorized" }), {
+    status: 401,
+    headers: { "content-type": "application/json" },
+  });
 }
 
 export const config = {
