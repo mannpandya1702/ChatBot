@@ -8,6 +8,10 @@
 # scratch / working files
 scratchpad/
 
+# sandbox-only live-test helpers (hardcoded local paths/proxy; not for prod)
+apps/web/scripts/e2e.mjs
+apps/web/scripts/proxy-preload.mjs
+
 # deps & builds
 node_modules/
 .next/
