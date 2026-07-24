@@ -56,8 +56,22 @@ export async function POST(req: Request): Promise<Response> {
     return NextResponse.json({ error: "rate_limited" }, { status: 429 });
   }
 
-  let conversationId = convIn ?? null;
-  if (!conversationId) {
+  let conversationId: string;
+  if (convIn) {
+    // Ownership gate: messages are written via the service role (RLS-bypassing),
+    // so a client-supplied conversationId MUST be verified against the caller
+    // here. The user client is RLS-scoped, so this returns a row only if the
+    // caller owns it; 404 (not 403) avoids confirming another user's UUID.
+    const { data: owned } = await uc
+      .from("conversations")
+      .select("id")
+      .eq("id", convIn)
+      .maybeSingle();
+    if (!owned) {
+      return NextResponse.json({ error: "conversation not found" }, { status: 404 });
+    }
+    conversationId = convIn;
+  } else {
     const { data: conv, error } = await uc
       .from("conversations")
       .insert({ user_id: userId, title: message.slice(0, 60) })
