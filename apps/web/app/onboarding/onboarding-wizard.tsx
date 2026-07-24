@@ -16,7 +16,8 @@ function Qr({ code }: { code: string }) {
   return (
     <div className="mx-auto flex h-44 w-44 items-center justify-center rounded-md border border-border bg-white p-2">
       {isDataUrl ? (
-        // eslint-disable-next-line @next/next/no-img-element
+        // Intentionally a plain <img>: `code` is a data: URL (QR PNG), which
+        // next/image cannot optimise anyway. Not a remote/static asset.
         <img src={code} alt="Authenticator QR code" className="h-full w-full" />
       ) : (
         <div className="h-full w-full [&>svg]:h-full [&>svg]:w-full" dangerouslySetInnerHTML={{ __html: code }} />
