@@ -26,6 +26,22 @@ def connect():
         conn.close()
 
 
+def lock_document(conn: "psycopg.Connection", document_id: str) -> None:
+    """Serialise ingestion per document with a transaction-scoped advisory lock.
+
+    Two concurrent ingests of the SAME document (e.g. a double-submitted re-index)
+    would otherwise race the delete+insert in replace_chunks — colliding on the
+    (document_id, chunk_index) unique key or leaving a half-written chunk set — and
+    duplicate the expensive extract+embed work. The lock is keyed on a stable hash
+    of the document id and auto-releases at commit/rollback, so it blocks only the
+    matching document and never a different one.
+    """
+    conn.execute(
+        "select pg_advisory_xact_lock(hashtextextended(%s, 0))",
+        (document_id,),
+    )
+
+
 def get_document(conn: "psycopg.Connection", document_id: str) -> dict | None:
     row = conn.execute(
         "select id, storage_path, sha256, access_tier, status "

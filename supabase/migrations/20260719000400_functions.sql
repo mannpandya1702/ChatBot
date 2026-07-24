@@ -16,10 +16,36 @@ create or replace function public.log_event(
 language plpgsql security definer
 set search_path = ''
 as $$
-declare v_id bigint;
+declare
+  v_id  bigint;
+  v_uid uuid := auth.uid();
 begin
+  -- Anti-forgery hygiene. user_id is always the caller's own auth.uid() (never
+  -- client-supplied), so a JWT caller can't impersonate another user. The rest
+  -- guards the residual vectors: flooding the trail with junk event_types or
+  -- bloating it with a huge detail blob, and — the important one — a JWT caller
+  -- forging an entry that looks server-asserted.
+  if p_event_type is null or length(p_event_type) = 0 or length(p_event_type) > 64 then
+    raise exception 'invalid audit event_type';
+  end if;
+  if p_detail is not null and jsonb_typeof(p_detail) <> 'object' then
+    raise exception 'audit detail must be a JSON object';
+  end if;
+  if p_detail is not null and length(p_detail::text) > 4000 then
+    raise exception 'audit detail too large';
+  end if;
   insert into public.audit_logs (user_id, event_type, detail, ip, user_agent)
-  values (auth.uid(), p_event_type, p_detail, p_ip, p_user_agent)
+  values (
+    v_uid,
+    p_event_type,
+    -- The server-computed "via" wins over any client-supplied key (|| keeps the
+    -- right operand on conflict), so an event written under a user JWT can never
+    -- masquerade as one written by the trusted server (service role).
+    coalesce(p_detail, '{}'::jsonb)
+      || jsonb_build_object('via', case when v_uid is null then 'server' else 'jwt' end),
+    p_ip,
+    p_user_agent
+  )
   returning id into v_id;
   return v_id;
 end

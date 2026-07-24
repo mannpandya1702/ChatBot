@@ -218,6 +218,26 @@ create trigger messages_guard_update
   before update on public.messages
   for each row execute function private.guard_message_update();
 
+-- Keep conversations.updated_at in step with real activity so the sidebar can
+-- order by recency. DEFINER so the bump lands regardless of who inserts the
+-- message (the pipeline writes messages via the service role).
+create or replace function private.bump_conversation_updated_at()
+returns trigger language plpgsql security definer
+set search_path = ''
+as $$
+begin
+  update public.conversations
+     set updated_at = now()
+   where id = new.conversation_id;
+  return new;
+end
+$$;
+
+drop trigger if exists messages_bump_conversation on public.messages;
+create trigger messages_bump_conversation
+  after insert on public.messages
+  for each row execute function private.bump_conversation_updated_at();
+
 -- ── audit_logs: append-only at the DB level ─────────────────────────────────
 -- Reads: admin & super_admin. Writes: ONLY via log_event() (migration 4).
 drop policy if exists audit_logs_select_admin on public.audit_logs;

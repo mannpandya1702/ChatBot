@@ -52,6 +52,9 @@ def ingest_pdf_bytes(
     """Extract → chunk → embed → upsert for one already-fetched PDF. Commits on
     success; marks the document failed (committed) on any error."""
     try:
+        # Serialise same-document ingests before any work so a concurrent
+        # re-index can't corrupt the chunk set (released at commit/rollback).
+        db.lock_document(conn, document_id)
         validate_pdf_bytes(data)
         with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
             tmp.write(data)

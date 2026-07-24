@@ -33,10 +33,23 @@ function pages(s: RetrievedSource): string {
   return ` (pp. ${s.pageStart}–${s.pageEnd})`;
 }
 
+/**
+ * Neutralise the context delimiter inside untrusted source text so a document
+ * (its title or extracted/OCR'd body) can't emit a literal `</context>` to
+ * break out of the wrapper and have the trailing text read as instructions
+ * (prompt-injection defence, spec §8). The visible characters are preserved
+ * with inert look-alike brackets — document text stays data, never structure.
+ */
+function neutralizeDelimiters(s: string): string {
+  return s.replace(/<(\s*\/?\s*context\s*)>/gi, "‹$1›");
+}
+
 /** Wrap the top sources as untrusted data for the generation model. */
 export function buildContext(sources: RetrievedSource[]): string {
   const blocks = sources.map(
-    (s) => `[S${s.index}] "${s.documentTitle}"${pages(s)}\n${s.content}`,
+    (s) =>
+      `[S${s.index}] "${neutralizeDelimiters(s.documentTitle)}"${pages(s)}\n` +
+      neutralizeDelimiters(s.content),
   );
   return `<context>\n${blocks.join("\n\n")}\n</context>`;
 }
