@@ -37,9 +37,30 @@ models). Never add `-v` unless you intend to erase all data.
 ## Users
 
 The web **Admin** console (top-right link, admin/super-admin only) is the normal
-path: invite jawans, set their access tier, activate/deactivate, and reset
-passwords. New users get a one-time password and are forced through a password
-change + authenticator (TOTP) enrollment on first login before any access.
+path. New users get a one-time password and are forced through a password change
++ authenticator (TOTP) enrollment on first login before any access.
+
+| Action | Where | Who |
+|--------|-------|-----|
+| Invite a user | **+ Invite user** | admin (jawans at tier 1) · super-admin (any role/tier) |
+| Activate / deactivate | row button | admin (jawans) · super-admin (anyone but self) |
+| **Reset password** | row → **Manage** | admin (jawans) · super-admin (anyone) |
+| **Reset authenticator** | row → **Manage** | admin (jawans) · super-admin (anyone) |
+| Change role / access tier | row → **Manage** | super-admin only (not on yourself) |
+
+**Lost or replaced phone.** This is the common one. The system refuses to enroll a
+second authenticator while a verified one exists (that is what stops an attacker
+with only a password from enrolling their own device), so a user whose phone is
+gone **cannot** self-recover — an admin must clear it:
+
+> Admin → Users → the user's row → **Manage** → **Reset authenticator**
+
+That signs them out everywhere and lets them enroll a new authenticator app at
+next login. Their password is unchanged. Use **Reset password** as well if the
+password is also unknown — it prints a new one-time password (shown once).
+
+Both actions are recorded in the audit log with the acting admin, the target, and
+the time.
 
 Seed the very first super-admin from the CLI (one time):
 
@@ -138,6 +159,7 @@ on personnel changes and on any suspected exposure.
 | `rag` exits immediately | `RAG_SERVICE_SECRET` is empty or the built-in default. Set a strong secret in `.env` and `$COMPOSE up -d rag`. |
 | A document is stuck on "processing" | The ingester was interrupted. Run the **sweep-stale** job, then re-ingest. |
 | 6-digit login code always rejected | Host clock drift. TOTP needs correct time — fix the machine's clock. |
+| User lost their phone / can't produce a code | Admin → Users → **Manage** → **Reset authenticator** (see [Users](#users)). They cannot self-recover by design. |
 | Login blocked after failed attempts | Lockout is per service number for a short window; wait it out or reset via Admin. |
 | "no space left on device" | Free disk (old dumps, `docker system prune`), then retry. Deletes still succeed when writes fail. |
 | Everything 403s | The `IP_ALLOWLIST` is set and the client IP isn't on it. Adjust the allowlist or connect from an allowed network. |

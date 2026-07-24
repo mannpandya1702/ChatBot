@@ -55,6 +55,14 @@ middleware, not by convention. First login forces a password change and
 authenticator enrollment. Repeated failures are rate-limited per service number
 (server-side lockout).
 
+Enrollment is refused once a verified factor exists, so an attacker holding only a
+stolen password cannot enroll their own device to reach AAL2. The consequence is
+that a user who loses their phone has **no self-service recovery**: an admin must
+clear the factor (Admin → Users → Manage → Reset authenticator). That path is
+privileged — admins may act on jawans only, super-admins on anyone — it signs the
+user out of all sessions, and every use is written to the audit log with the
+acting admin and the target.
+
 **Authorization.** RLS is the real boundary. Tier gating is denormalised onto
 chunks so a jawan can never retrieve above their tier even via search. Admin
 mutations are constrained by column-level guards (e.g. only a super-admin may

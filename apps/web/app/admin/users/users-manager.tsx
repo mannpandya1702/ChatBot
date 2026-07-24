@@ -1,9 +1,16 @@
 "use client";
-import { useActionState, useState } from "react";
+import { Fragment, useActionState, useState } from "react";
 import { Button } from "@/lib/ui/button";
 import { Input } from "@/lib/ui/input";
 import { Label, Card, Alert, Spinner } from "@/lib/ui/misc";
-import { inviteAction, setActiveAction, type InviteState } from "./actions";
+import {
+  inviteAction,
+  setActiveAction,
+  resetAuthenticatorAction,
+  resetPasswordAction,
+  updateAccessAction,
+  type InviteState,
+} from "./actions";
 
 export interface UserRow {
   id: string;
@@ -31,6 +38,69 @@ export function UsersManager({
   const [showForm, setShowForm] = useState(false);
   const [copied, setCopied] = useState(false);
   const isSuper = callerRole === "super_admin";
+
+  // Per-row management panel. Only one row is open at a time, so a single draft
+  // and result pair is enough state.
+  const [openRow, setOpenRow] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [draft, setDraft] = useState<{ role: string; tier: number }>({ role: "jawan", tier: 1 });
+  const [result, setResult] = useState<
+    { id: string; error?: string; text?: string; tempPassword?: string } | null
+  >(null);
+
+  function openManage(u: UserRow) {
+    const next = openRow === u.id ? null : u.id;
+    setOpenRow(next);
+    setResult(null);
+    if (next) setDraft({ role: u.role, tier: u.access_tier });
+  }
+
+  async function doResetPassword(u: UserRow) {
+    if (!window.confirm(
+      `Issue a new temporary password for ${u.service_number}? Their current password stops working immediately.`,
+    )) return;
+    setBusy(`${u.id}:pw`);
+    setResult(null);
+    const r = await resetPasswordAction(u.id);
+    setBusy(null);
+    setResult(
+      r.error
+        ? { id: u.id, error: r.error }
+        : {
+            id: u.id,
+            text: `New temporary password for ${r.serviceNumber ?? u.service_number} — shown once.`,
+            tempPassword: r.tempPassword,
+          },
+    );
+  }
+
+  async function doResetAuthenticator(u: UserRow) {
+    if (!window.confirm(
+      `Remove ${u.service_number}'s authenticator? They are signed out everywhere and must enroll a new authenticator app at next login.`,
+    )) return;
+    setBusy(`${u.id}:mfa`);
+    setResult(null);
+    const r = await resetAuthenticatorAction(u.id);
+    setBusy(null);
+    setResult(
+      r.error
+        ? { id: u.id, error: r.error }
+        : {
+            id: u.id,
+            text: r.removed
+              ? `Authenticator cleared (${r.removed} removed). They enroll a new one at next login.`
+              : "No authenticator was enrolled — they will set one up at next login.",
+          },
+    );
+  }
+
+  async function doUpdateAccess(u: UserRow) {
+    setBusy(`${u.id}:acc`);
+    setResult(null);
+    const r = await updateAccessAction(u.id, draft.role, draft.tier);
+    setBusy(null);
+    setResult(r.error ? { id: u.id, error: r.error } : { id: u.id, text: "Access updated." });
+  }
 
   // Works on a secure origin AND on a plain-HTTP LAN (where navigator.clipboard
   // is undefined) via an execCommand fallback, with visible confirmation.
@@ -152,9 +222,13 @@ export function UsersManager({
             <tbody className="divide-y divide-border">
               {users.map((u) => {
                 const isSelf = u.id === callerId;
-                const canToggle = !isSelf && (isSuper || u.role === "jawan");
+                const canManage = isSuper || u.role === "jawan";
+                const canToggle = !isSelf && canManage;
+                const open = openRow === u.id;
+                const res = result?.id === u.id ? result : null;
                 return (
-                  <tr key={u.id} className={u.is_active ? "" : "opacity-60"}>
+                  <Fragment key={u.id}>
+                  <tr className={u.is_active ? "" : "opacity-60"}>
                     <td className="px-4 py-2 font-mono text-xs">{u.service_number}</td>
                     <td className="px-4 py-2">
                       {u.full_name}
@@ -171,19 +245,128 @@ export function UsersManager({
                       )}
                     </td>
                     <td className="px-4 py-2 text-right">
-                      {canToggle ? (
-                        <form action={setActiveAction} className="inline">
-                          <input type="hidden" name="targetId" value={u.id} />
-                          <input type="hidden" name="active" value={(!u.is_active).toString()} />
-                          <Button type="submit" size="sm" variant={u.is_active ? "outline" : "default"}>
-                            {u.is_active ? "Deactivate" : "Activate"}
+                      <div className="flex items-center justify-end gap-2">
+                        {canToggle && (
+                          <form action={setActiveAction} className="inline">
+                            <input type="hidden" name="targetId" value={u.id} />
+                            <input type="hidden" name="active" value={(!u.is_active).toString()} />
+                            <Button type="submit" size="sm" variant={u.is_active ? "outline" : "default"}>
+                              {u.is_active ? "Deactivate" : "Activate"}
+                            </Button>
+                          </form>
+                        )}
+                        {canManage ? (
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            onClick={() => openManage(u)}
+                            aria-expanded={open}
+                          >
+                            {open ? "Close" : "Manage"}
                           </Button>
-                        </form>
-                      ) : (
-                        <span className="text-xs text-muted-foreground">—</span>
-                      )}
+                        ) : (
+                          !canToggle && <span className="text-xs text-muted-foreground">—</span>
+                        )}
+                      </div>
                     </td>
                   </tr>
+
+                  {open && (
+                    <tr className="bg-muted/30">
+                      <td colSpan={6} className="px-4 py-4">
+                        <div className="space-y-3">
+                          <div className="flex flex-wrap gap-2">
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              disabled={busy === `${u.id}:pw`}
+                              onClick={() => doResetPassword(u)}
+                            >
+                              {busy === `${u.id}:pw` && <Spinner />} Reset password
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              disabled={busy === `${u.id}:mfa`}
+                              onClick={() => doResetAuthenticator(u)}
+                            >
+                              {busy === `${u.id}:mfa` && <Spinner />} Reset authenticator
+                            </Button>
+                            <p className="w-full text-xs text-muted-foreground">
+                              Use <strong>Reset authenticator</strong> when someone loses or replaces
+                              their phone — it signs them out and lets them enroll a new authenticator
+                              app at next login.
+                            </p>
+                          </div>
+
+                          {isSuper && !isSelf && (
+                            <div className="flex flex-wrap items-end gap-2 border-t border-border pt-3">
+                              <div className="space-y-1.5">
+                                <Label htmlFor={`role-${u.id}`}>Role</Label>
+                                <select
+                                  id={`role-${u.id}`}
+                                  value={draft.role}
+                                  onChange={(e) => setDraft((d) => ({ ...d, role: e.target.value }))}
+                                  className="flex h-9 w-40 rounded-md border border-input bg-card px-3 text-sm"
+                                >
+                                  <option value="jawan">Jawan</option>
+                                  <option value="admin">Admin</option>
+                                  <option value="super_admin">Super admin</option>
+                                </select>
+                              </div>
+                              <div className="space-y-1.5">
+                                <Label htmlFor={`tier-${u.id}`}>Access tier</Label>
+                                <select
+                                  id={`tier-${u.id}`}
+                                  value={String(draft.tier)}
+                                  onChange={(e) => setDraft((d) => ({ ...d, tier: Number(e.target.value) }))}
+                                  className="flex h-9 w-32 rounded-md border border-input bg-card px-3 text-sm"
+                                >
+                                  <option value="1">Tier 1</option>
+                                  <option value="2">Tier 2</option>
+                                  <option value="3">Tier 3</option>
+                                </select>
+                              </div>
+                              <Button
+                                size="sm"
+                                disabled={busy === `${u.id}:acc`}
+                                onClick={() => doUpdateAccess(u)}
+                              >
+                                {busy === `${u.id}:acc` && <Spinner />} Save access
+                              </Button>
+                            </div>
+                          )}
+
+                          {res?.error && <Alert variant="error">{res.error}</Alert>}
+                          {res && !res.error && !res.tempPassword && (
+                            <Alert variant="success">{res.text}</Alert>
+                          )}
+                          {res?.tempPassword && (
+                            <div>
+                              <Label>{res.text}</Label>
+                              <div className="mt-1 flex items-center gap-2">
+                                <code className="flex-1 break-all rounded bg-muted px-3 py-2 font-mono text-sm">
+                                  {res.tempPassword}
+                                </code>
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="sm"
+                                  onClick={() => copyPassword(res.tempPassword ?? "")}
+                                >
+                                  {copied ? "Copied!" : "Copy"}
+                                </Button>
+                              </div>
+                              <p className="mt-1 text-xs text-muted-foreground">
+                                Share it securely. They must change it and re-confirm TOTP at next login.
+                              </p>
+                            </div>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                  </Fragment>
                 );
               })}
               {users.length === 0 && (

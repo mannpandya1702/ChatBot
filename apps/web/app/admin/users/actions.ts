@@ -2,6 +2,11 @@
 import { revalidatePath } from "next/cache";
 import { requireAdmin } from "@/lib/auth/admin-guard";
 import { createInvite } from "@/lib/auth/invite";
+import {
+  resetAuthenticator,
+  resetPassword,
+  updateUserAccess,
+} from "@/lib/auth/admin-ops";
 import { serviceClient } from "@/lib/supabase/service";
 
 export interface InviteState {
@@ -55,4 +60,61 @@ export async function setActiveAction(form: FormData): Promise<void> {
 
   await svc.from("profiles").update({ is_active: active }).eq("id", targetId);
   revalidatePath("/admin/users");
+}
+
+/**
+ * Row-level admin operations. These return a result (rather than redirecting) so
+ * the console can show the one-time password or a precise error inline; the
+ * library layer owns authorization and auditing.
+ */
+export interface OpResult {
+  ok?: boolean;
+  error?: string;
+  tempPassword?: string;
+  serviceNumber?: string;
+  removed?: number;
+}
+
+function failure(e: unknown): OpResult {
+  return { error: e instanceof Error ? e.message : "Operation failed." };
+}
+
+/** Clear enrolled authenticators so the user can set up a new phone at next login. */
+export async function resetAuthenticatorAction(targetId: string): Promise<OpResult> {
+  const admin = await requireAdmin();
+  try {
+    const { removed } = await resetAuthenticator(admin.userId, targetId);
+    revalidatePath("/admin/users");
+    return { ok: true, removed };
+  } catch (e) {
+    return failure(e);
+  }
+}
+
+/** Issue a new one-time password (shown once) and force a change at next login. */
+export async function resetPasswordAction(targetId: string): Promise<OpResult> {
+  const admin = await requireAdmin();
+  try {
+    const { tempPassword, serviceNumber } = await resetPassword(admin.userId, targetId);
+    revalidatePath("/admin/users");
+    return { ok: true, tempPassword, serviceNumber };
+  } catch (e) {
+    return failure(e);
+  }
+}
+
+/** Change a user's role and/or access tier (super_admin only). */
+export async function updateAccessAction(
+  targetId: string,
+  role: string,
+  accessTier: number,
+): Promise<OpResult> {
+  const admin = await requireAdmin();
+  try {
+    await updateUserAccess(admin.userId, targetId, { role, accessTier });
+    revalidatePath("/admin/users");
+    return { ok: true };
+  } catch (e) {
+    return failure(e);
+  }
 }
