@@ -29,7 +29,32 @@ export function UsersManager({
 }) {
   const [invite, doInvite, inviting] = useActionState(inviteAction, {} as InviteState);
   const [showForm, setShowForm] = useState(false);
+  const [copied, setCopied] = useState(false);
   const isSuper = callerRole === "super_admin";
+
+  // Works on a secure origin AND on a plain-HTTP LAN (where navigator.clipboard
+  // is undefined) via an execCommand fallback, with visible confirmation.
+  async function copyPassword(text: string) {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+      }
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // leave the password visible on screen for manual copy
+    }
+  }
 
   return (
     <div className="space-y-6">
@@ -50,8 +75,8 @@ export function UsersManager({
                 <Label>One-time temporary password (shown once)</Label>
                 <div className="mt-1 flex items-center gap-2">
                   <code className="flex-1 break-all rounded bg-muted px-3 py-2 font-mono text-sm">{invite.tempPassword}</code>
-                  <Button type="button" variant="outline" size="sm" onClick={() => navigator.clipboard?.writeText(invite.tempPassword ?? "")}>
-                    Copy
+                  <Button type="button" variant="outline" size="sm" onClick={() => copyPassword(invite.tempPassword ?? "")}>
+                    {copied ? "Copied!" : "Copy"}
                   </Button>
                 </div>
                 <p className="mt-1 text-xs text-muted-foreground">

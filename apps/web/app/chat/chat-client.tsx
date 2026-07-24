@@ -42,11 +42,20 @@ export function ChatClient({ user }: { user: User }) {
   const [error, setError] = useState<string | null>(null);
   const [conversationId, setConversationId] = useState<string | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
+  const taRef = useRef<HTMLTextAreaElement>(null);
   const isAdmin = user.role === "admin" || user.role === "super_admin";
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, pending]);
+
+  // Grow the composer to fit its content (capped ~6 lines), shrink back on reset.
+  useEffect(() => {
+    const el = taRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+  }, [input]);
 
   async function send(text: string) {
     const message = text.trim();
@@ -55,13 +64,19 @@ export function ChatClient({ user }: { user: User }) {
     setInput("");
     setMessages((m) => [...m, { role: "user", content: message }]);
     setPending(true);
+    let failed = false;
     try {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message, conversationId: conversationId ?? undefined }),
       });
+      if (res.status === 401) {
+        window.location.href = "/login"; // session expired — send them to sign in
+        return;
+      }
       if (!res.ok) {
+        failed = true;
         setError(
           res.status === 429
             ? "You’re sending messages too quickly. Please wait a moment. / कृपया थोड़ी देर प्रतीक्षा करें।"
@@ -76,11 +91,20 @@ export function ChatClient({ user }: { user: User }) {
         { role: "assistant", content: data.text, citations: data.citations, refused: data.refused },
       ]);
     } catch {
+      failed = true;
       setError("Network error. Please check your connection. / नेटवर्क त्रुटि।");
     } finally {
       setPending(false);
+      if (failed) {
+        // drop the unanswered bubble and hand the user their text back to retry
+        setMessages((m) => (m[m.length - 1]?.role === "user" ? m.slice(0, -1) : m));
+        setInput(message);
+      }
+      taRef.current?.focus();
     }
   }
+
+  const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant");
 
   return (
     <div className="flex h-dvh flex-col bg-background">
@@ -103,6 +127,10 @@ export function ChatClient({ user }: { user: User }) {
       </header>
 
       <main className="mx-auto flex w-full max-w-2xl flex-1 flex-col overflow-y-auto px-4 py-4">
+        {/* Always-mounted live region so screen readers announce every turn. */}
+        <div className="sr-only" role="status" aria-live="polite">
+          {pending ? "Searching the knowledge base" : lastAssistant?.content ?? ""}
+        </div>
         {messages.length === 0 ? (
           <div className="m-auto max-w-md text-center">
             <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-accent text-2xl" aria-hidden="true">🎖️</div>
@@ -123,7 +151,7 @@ export function ChatClient({ user }: { user: User }) {
             </div>
           </div>
         ) : (
-          <div className="space-y-4" aria-live="polite">
+          <div className="space-y-4">
             {messages.map((m, i) => (
               <MessageBubble key={i} m={m} />
             ))}
@@ -148,6 +176,7 @@ export function ChatClient({ user }: { user: User }) {
             className="flex items-end gap-2"
           >
             <textarea
+              ref={taRef}
               value={input}
               onChange={(e) => setInput(e.target.value.slice(0, MAX))}
               onKeyDown={(e) => {
@@ -158,8 +187,8 @@ export function ChatClient({ user }: { user: User }) {
               }}
               rows={1}
               placeholder="Type your question… / अपना प्रश्न लिखें…"
-              className="max-h-40 min-h-[2.5rem] flex-1 resize-none rounded-md border border-input bg-card px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              disabled={pending}
+              aria-label="Type your question / अपना प्रश्न लिखें"
+              className="max-h-40 min-h-[2.5rem] flex-1 resize-none rounded-md border border-input bg-card px-3 py-2 text-base sm:text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             />
             <Button type="submit" size="icon" disabled={pending || !input.trim()} aria-label="Send">
               {pending ? <Spinner /> : <SendIcon />}
