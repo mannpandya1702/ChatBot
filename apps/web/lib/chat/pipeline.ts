@@ -34,6 +34,19 @@ function generationPayload(context: string, notFound: string, question: string):
   );
 }
 
+/**
+ * Analytics and audit are non-critical: a transient failure must never discard a
+ * generated answer or 500 the user. Log server-side and continue. (The core
+ * message writes stay strict — they must succeed.)
+ */
+async function bestEffort(label: string, p: Promise<unknown>): Promise<void> {
+  try {
+    await p;
+  } catch (e) {
+    console.error(`[chat] non-critical ${label} write failed:`, e instanceof Error ? e.message : e);
+  }
+}
+
 export async function runChat(
   deps: PipelineDeps,
   input: PipelineInput,
@@ -90,7 +103,7 @@ export async function runChat(
   const chunks = await deps.db.hybridSearch(embedding, query, TOP_K_SEARCH);
 
   const refuse = async (topScore: number | null): Promise<PipelineResult> => {
-    await deps.db.recordQueryEvent(query, lang, true, topScore);
+    await bestEffort("analytics", deps.db.recordQueryEvent(query, lang, true, topScore));
     return finish(deps, input, {
       text: notFound,
       refused: true,
@@ -135,7 +148,7 @@ export async function runChat(
   });
 
   const checked = citationPostCheck(answer, sources, notFound);
-  await deps.db.recordQueryEvent(query, lang, checked.refused, bestScore);
+  await bestEffort("analytics", deps.db.recordQueryEvent(query, lang, checked.refused, bestScore));
   return finish(deps, input, {
     text: checked.text,
     refused: checked.refused,
@@ -163,13 +176,13 @@ async function finish(
     },
   );
   // Metadata only — never the query text (log minimisation, spec §4).
-  await deps.db.logEvent(r.auditType, {
+  await bestEffort("audit", deps.db.logEvent(r.auditType, {
     conversation_id: input.conversationId,
     message_id: assistantMessageId,
     refused: r.refused,
     latency_ms: r.latencyMs,
     classification: r.classification,
-  });
+  }));
   return {
     text: r.text,
     refused: r.refused,

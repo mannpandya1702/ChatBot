@@ -181,4 +181,25 @@ describe("runChat — persistence & log minimisation", () => {
     const r = await runChat(deps, { ...input, message: "फ्रांस की राजधानी क्या है?" });
     expect(r.text).toBe("NOT_FOUND_HI");
   });
+
+  it("a failing analytics/audit write does not discard a grounded answer (H2)", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const deps = makeDeps({
+      classification: "kb_question",
+      searchResult: [CHUNK],
+      rerankScores: [0.92],
+      generatorText: "Answer [S1].",
+    });
+    deps.db.spies.recordQueryEvent.mockRejectedValue(new Error("analytics db down"));
+    deps.db.spies.logEvent.mockRejectedValue(new Error("audit db down"));
+
+    const r = await runChat(deps, input);
+
+    // the grounded, cited answer still comes back — non-critical writes are best-effort
+    expect(r.refused).toBe(false);
+    expect(r.text).toContain("[S1]");
+    expect(r.assistantMessageId).toBe("asst-msg-id");
+    expect(deps.db.spies.persistAssistantMessage).toHaveBeenCalled();
+    errSpy.mockRestore();
+  });
 });

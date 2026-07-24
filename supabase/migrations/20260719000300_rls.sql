@@ -61,21 +61,25 @@ alter table public.query_analytics enable row level security;
 
 -- ── profiles ────────────────────────────────────────────────────────────────
 -- Read: own row, or any row for admin/super_admin. Deactivated users read nothing.
+drop policy if exists profiles_select_own on public.profiles;
 create policy profiles_select_own on public.profiles
   for select to authenticated
   using (id = auth.uid() and private.user_is_active());
 
+drop policy if exists profiles_select_admin on public.profiles;
 create policy profiles_select_admin on public.profiles
   for select to authenticated
   using (private.user_role() in ('admin', 'super_admin') and private.user_is_active());
 
 -- Update: super_admin any row; admin only jawan rows (column guard in trigger below).
 -- No self-update, no INSERT, no DELETE via client JWTs (invite/reset = service role).
+drop policy if exists profiles_update_super_admin on public.profiles;
 create policy profiles_update_super_admin on public.profiles
   for update to authenticated
   using (private.user_role() = 'super_admin' and private.user_is_active())
   with check (private.user_role() = 'super_admin');
 
+drop policy if exists profiles_update_admin_on_jawans on public.profiles;
 create policy profiles_update_admin_on_jawans on public.profiles
   for update to authenticated
   using (private.user_role() = 'admin' and private.user_is_active() and role = 'jawan')
@@ -117,6 +121,7 @@ begin
 end
 $$;
 
+drop trigger if exists profiles_guard_update on public.profiles;
 create trigger profiles_guard_update
   before update on public.profiles
   for each row execute function private.guard_profile_update();
@@ -125,6 +130,7 @@ create trigger profiles_guard_update
 -- SELECT only where status = 'ready' and tier fits the caller (spec §4 matrix).
 -- Admin-console listings (incl. processing/failed) read via service role
 -- server-side; no client-JWT write path exists for either table.
+drop policy if exists documents_select_ready_tier on public.documents;
 create policy documents_select_ready_tier on public.documents
   for select to authenticated
   using (
@@ -133,6 +139,7 @@ create policy documents_select_ready_tier on public.documents
     and private.user_is_active()
   );
 
+drop policy if exists chunks_select_ready_tier on public.chunks;
 create policy chunks_select_ready_tier on public.chunks
   for select to authenticated
   using (
@@ -143,6 +150,7 @@ create policy chunks_select_ready_tier on public.chunks
 
 -- ── conversations ───────────────────────────────────────────────────────────
 -- Owner-only for every operation. Admins do NOT read chat content (spec §4).
+drop policy if exists conversations_owner_all on public.conversations;
 create policy conversations_owner_all on public.conversations
   for all to authenticated
   using (user_id = auth.uid() and private.user_is_active())
@@ -154,6 +162,7 @@ create policy conversations_owner_all on public.conversations
 -- never write chat content, which keeps the citation post-check trustworthy.
 -- Owner UPDATE is allowed solely so thumbs feedback works; a trigger pins it
 -- to the feedback column.
+drop policy if exists messages_select_owner on public.messages;
 create policy messages_select_owner on public.messages
   for select to authenticated
   using (
@@ -164,6 +173,7 @@ create policy messages_select_owner on public.messages
     )
   );
 
+drop policy if exists messages_update_owner_feedback on public.messages;
 create policy messages_update_owner_feedback on public.messages
   for update to authenticated
   using (
@@ -203,12 +213,14 @@ begin
 end
 $$;
 
+drop trigger if exists messages_guard_update on public.messages;
 create trigger messages_guard_update
   before update on public.messages
   for each row execute function private.guard_message_update();
 
 -- ── audit_logs: append-only at the DB level ─────────────────────────────────
 -- Reads: admin & super_admin. Writes: ONLY via log_event() (migration 4).
+drop policy if exists audit_logs_select_admin on public.audit_logs;
 create policy audit_logs_select_admin on public.audit_logs
   for select to authenticated
   using (private.user_role() in ('admin', 'super_admin') and private.user_is_active());
@@ -216,10 +228,12 @@ create policy audit_logs_select_admin on public.audit_logs
 revoke insert, update, delete on public.audit_logs from authenticated, anon;
 
 -- ── app_settings ────────────────────────────────────────────────────────────
+drop policy if exists app_settings_select_authenticated on public.app_settings;
 create policy app_settings_select_authenticated on public.app_settings
   for select to authenticated
   using (private.user_is_active());
 
+drop policy if exists app_settings_write_super_admin on public.app_settings;
 create policy app_settings_write_super_admin on public.app_settings
   for all to authenticated
   using (private.user_role() = 'super_admin' and private.user_is_active())
@@ -227,6 +241,7 @@ create policy app_settings_write_super_admin on public.app_settings
 
 -- ── query_analytics ─────────────────────────────────────────────────────────
 -- Inserted server-side only (service role / record_query_event). Admin+ read.
+drop policy if exists query_analytics_select_admin on public.query_analytics;
 create policy query_analytics_select_admin on public.query_analytics
   for select to authenticated
   using (private.user_role() in ('admin', 'super_admin') and private.user_is_active());
