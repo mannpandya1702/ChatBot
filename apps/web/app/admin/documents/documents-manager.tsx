@@ -22,7 +22,7 @@ function StatusBadge({ status }: { status: DocRow["status"] }) {
   if (status === "ready") return <span className="inline-flex rounded-full bg-primary/15 px-2 py-0.5 text-xs text-primary">Ready</span>;
   if (status === "failed") return <span className="inline-flex rounded-full bg-destructive/15 px-2 py-0.5 text-xs text-destructive">Failed</span>;
   return (
-    <span className="inline-flex items-center gap-1 rounded-full bg-amber-500/15 px-2 py-0.5 text-xs text-amber-700 dark:text-amber-400">
+    <span className="inline-flex items-center gap-1 rounded-full bg-amber-500/15 px-2 py-0.5 text-xs text-amber-800 dark:text-amber-400">
       <Spinner className="h-3 w-3" /> Processing
     </span>
   );

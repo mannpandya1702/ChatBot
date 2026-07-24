@@ -105,5 +105,20 @@ services:
       - ollama
       - kong
 
+  # Enable TOTP MFA in self-hosted GoTrue explicitly. The middleware hard-requires
+  # AAL2, so if enrollment isn't enabled the first login can never complete and the
+  # deployment locks everyone out. Setting it here (an overlay onto the upstream
+  # `auth` service) makes the enforced posture the default instead of a hand-edit
+  # nobody remembers. Both the legacy and current variable names are set; GoTrue
+  # ignores ones it doesn't recognise, so this is safe across bundle versions.
+  # Acceptance gate: the operator's first admin login (which forces TOTP enrolment)
+  # is the live proof MFA works — if it fails there, it fails visibly at setup, not
+  # silently for jawans later.
+  auth:
+    environment:
+      GOTRUE_MFA_ENABLED: "true"
+      GOTRUE_MFA_TOTP_ENROLL_ENABLED: "true"
+      GOTRUE_MFA_TOTP_VERIFY_ENABLED: "true"
+
 volumes:
   ollama_models:

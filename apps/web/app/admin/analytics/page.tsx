@@ -82,7 +82,7 @@ export default async function AnalyticsPage() {
             {topGaps.map((q) => (
               <li key={q.text} className="flex items-center justify-between gap-3 py-2 text-sm">
                 <span className="truncate">{q.text}</span>
-                <span className="shrink-0 rounded-full bg-amber-500/15 px-2 py-0.5 text-xs text-amber-700 dark:text-amber-400">{q.count}×</span>
+                <span className="shrink-0 rounded-full bg-amber-500/15 px-2 py-0.5 text-xs text-amber-800 dark:text-amber-400">{q.count}×</span>
               </li>
             ))}
           </ul>

@@ -222,13 +222,15 @@ In your Supabase bundle's `docker/.env`:
 1. Set `POSTGRES_PASSWORD`, `JWT_SECRET`, `ANON_KEY`, `SERVICE_ROLE_KEY`,
    `DASHBOARD_PASSWORD`, and `SUPABASE_PUBLIC_URL` to the §3 values (replace the
    shipped demo values — do not leave them).
-2. Enforce invite-only MFA auth:
+2. Enforce invite-only auth:
    ```
-   GOTRUE_MFA_ENABLED=true
    DISABLE_SIGNUP=true
    ENABLE_ANONYMOUS_USERS=false
    ```
-   (Confirm the exact GoTrue variable names for your bundle version.)
+   TOTP MFA is enabled automatically by the air-gap overlay (`docker-compose.airgap.yml`
+   sets `GOTRUE_MFA_*` on the `auth` service), so you do not hand-edit it here. Your
+   first admin login — which forces TOTP enrolment — is the live confirmation MFA
+   works; if enrolment fails there, MFA isn't active (check the `auth` container env).
 3. **Append** the contents of `deploy/airgap/.env.airgap.example` and fill in
    `RAG_SERVICE_SECRET`, `GENERATION_MODEL`, `OLLAMA_CLASSIFY_MODEL`,
    `RERANK_REFUSAL_THRESHOLD`, `IP_ALLOWLIST`, `WEB_PORT`, `KB_DIR`.
