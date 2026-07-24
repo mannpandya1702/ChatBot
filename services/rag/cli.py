@@ -74,16 +74,70 @@ def ingest_dir(directory: str, tier: int, reindex: bool) -> int:
     return 1 if failures else 0
 
 
+def sweep_stale(older_than_minutes: int) -> int:
+    """Mark documents stranded in 'processing' as failed (operator maintenance)."""
+    with db.connect() as conn:
+        swept = db.sweep_stale_documents(conn, older_than_minutes)
+        conn.commit()
+    if swept:
+        print(f"swept {len(swept)} stale document(s) to 'failed':")
+        for did in swept:
+            print(f"  {did}")
+    else:
+        print("no stale documents")
+    return 0
+
+
+def purge(args) -> int:
+    """Delete data past per-table retention windows (operator maintenance)."""
+    with db.connect() as conn:
+        counts = db.purge_old_data(
+            conn,
+            conversations_days=args.conversations_days,
+            audit_days=args.audit_days,
+            analytics_days=args.analytics_days,
+            login_attempts_days=args.login_attempts_days,
+        )
+        conn.commit()
+    if counts:
+        for table, n in counts.items():
+            print(f"purged {n} row(s) from {table}")
+    else:
+        print("nothing purged (pass at least one --*-days window)")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="cli.py")
     sub = parser.add_subparsers(dest="cmd", required=True)
+
     ing = sub.add_parser("ingest", help="ingest a directory of PDFs")
     ing.add_argument("directory")
     ing.add_argument("--tier", type=int, default=1, choices=(1, 2, 3))
     ing.add_argument("--reindex", action="store_true", help="re-ingest even if sha256 exists")
+
+    sweep = sub.add_parser(
+        "sweep-stale", help="mark documents stuck in 'processing' past a threshold as failed"
+    )
+    sweep.add_argument("--older-than-minutes", type=int, default=60)
+
+    pur = sub.add_parser("purge", help="delete data past retention windows (per table, opt-in)")
+    pur.add_argument("--conversations-days", type=int, default=None,
+                     help="delete conversations (and their messages) idle this many days")
+    pur.add_argument("--audit-days", type=int, default=None,
+                     help="delete audit_logs older than this many days")
+    pur.add_argument("--analytics-days", type=int, default=None,
+                     help="delete query_analytics older than this many days")
+    pur.add_argument("--login-attempts-days", type=int, default=None,
+                     help="delete login_attempts older than this many days")
+
     args = parser.parse_args()
     if args.cmd == "ingest":
         return ingest_dir(args.directory, args.tier, args.reindex)
+    if args.cmd == "sweep-stale":
+        return sweep_stale(args.older_than_minutes)
+    if args.cmd == "purge":
+        return purge(args)
     return 2
 
 

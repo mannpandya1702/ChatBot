@@ -103,3 +103,60 @@ def mark_failed(conn, document_id, error: str) -> None:
         "update public.documents set status='failed', error=%s where id=%s",
         (error[:2000], document_id),
     )
+
+
+def sweep_stale_documents(conn, older_than_minutes: int) -> list[str]:
+    """Mark documents orphaned in 'processing' past the threshold as 'failed'.
+
+    A document sits in 'processing' only between row creation and the end of its
+    (synchronous) ingest; if the ingesting process is killed mid-run the row is
+    stranded there forever and the admin sees a spinner that never resolves.
+    created_at is a reliable proxy for processing-start because no code path
+    re-enters 'processing' on an already-created row (re-index keeps the prior
+    status until it finishes). Returns the swept ids so the caller can report
+    them. Caller commits.
+    """
+    rows = conn.execute(
+        "update public.documents "
+        "set status='failed', "
+        "    error='ingestion did not finish; marked failed by stale sweep' "
+        "where status='processing' "
+        "  and created_at < now() - make_interval(mins => %s) "
+        "returning id",
+        (older_than_minutes,),
+    ).fetchall()
+    return [str(r[0]) for r in rows]
+
+
+def purge_old_data(
+    conn,
+    conversations_days: int | None = None,
+    audit_days: int | None = None,
+    analytics_days: int | None = None,
+    login_attempts_days: int | None = None,
+) -> dict[str, int]:
+    """Delete data past its retention window (spec §4 log-minimisation / M3).
+
+    Each window is independent and skipped when None, so an operator opts in per
+    table. Messages cascade with their parent conversation. login_attempts only
+    feed the short lockout window, so they can be purged aggressively. Returns
+    per-table deleted-row counts. Caller commits.
+    """
+    plan = (
+        ("conversations", "updated_at", conversations_days),
+        ("audit_logs", "created_at", audit_days),
+        ("query_analytics", "created_at", analytics_days),
+        ("login_attempts", "created_at", login_attempts_days),
+    )
+    counts: dict[str, int] = {}
+    for table, ts_col, days in plan:
+        if days is None:
+            continue
+        # table/column are fixed literals from `plan`, never caller input.
+        cur = conn.execute(
+            f"delete from public.{table} "
+            f"where {ts_col} < now() - make_interval(days => %s)",
+            (days,),
+        )
+        counts[table] = cur.rowcount
+    return counts
