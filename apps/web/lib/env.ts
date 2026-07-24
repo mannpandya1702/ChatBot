@@ -18,4 +18,8 @@ export const env = {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean),
+  // Number of trusted reverse proxies in front of the app. The client IP is
+  // taken this many hops from the right of X-Forwarded-For, defeating spoofing
+  // of the leftmost entry. Set to match your edge (e.g. 1 behind one nginx).
+  trustedProxyCount: Number(process.env.TRUSTED_PROXY_COUNT ?? "0"),
 };

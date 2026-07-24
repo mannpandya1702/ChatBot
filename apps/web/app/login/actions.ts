@@ -3,6 +3,8 @@ import { headers } from "next/headers";
 import { redirect } from "next/navigation";
 import { createServerSupabase } from "@/lib/supabase/server";
 import { isLockedOut, recordAttempt } from "@/lib/auth/lockout";
+import { clientIpFromHeaders } from "@/lib/auth/ip";
+import { env } from "@/lib/env";
 
 export interface LoginState {
   error?: string;
@@ -15,8 +17,7 @@ function emailFor(serviceNumber: string): string {
 
 async function clientIp(): Promise<string | null> {
   const h = await headers();
-  const xff = h.get("x-forwarded-for");
-  return xff ? xff.split(",")[0]!.trim() : h.get("x-real-ip");
+  return clientIpFromHeaders(h.get("x-forwarded-for"), h.get("x-real-ip"), env.trustedProxyCount);
 }
 
 /** Step 1: password. Enforces the 5/15min lockout, then decides MFA vs done. */

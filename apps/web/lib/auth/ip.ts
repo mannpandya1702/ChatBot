@@ -29,3 +29,27 @@ export function ipAllowed(ip: string | null, allowlist: string[]): boolean {
   if (!ip) return false; // fail closed when enabled but ip unknown
   return allowlist.some((c) => inCidr(ip, c));
 }
+
+/**
+ * Resolve the client IP from proxy headers, resistant to X-Forwarded-For
+ * spoofing. Each hop APPENDS to XFF, so the rightmost entries come from our own
+ * trusted proxies and cannot be forged; the leftmost is client-controlled. With
+ * `trustedProxyCount` trusted proxies in front, the real client sits that many
+ * entries from the right (default 0 = the rightmost entry). Never trusts the
+ * leftmost. Used for the IP allowlist gate and the audit/lockout IP.
+ */
+export function clientIpFromHeaders(
+  xff: string | null,
+  xRealIp: string | null,
+  trustedProxyCount = 0,
+): string | null {
+  if (xff) {
+    const parts = xff.split(",").map((s) => s.trim()).filter(Boolean);
+    if (parts.length > 0) {
+      const n = Number.isFinite(trustedProxyCount) ? Math.max(0, Math.floor(trustedProxyCount)) : 0;
+      const idx = Math.max(0, parts.length - 1 - n);
+      return parts[idx] ?? null;
+    }
+  }
+  return xRealIp;
+}

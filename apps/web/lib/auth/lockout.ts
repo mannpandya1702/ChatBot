@@ -7,6 +7,13 @@ import { serviceClient } from "../supabase/service";
 const MAX_FAILURES = 5;
 const WINDOW_MINUTES = 15;
 
+// The identifier is authenticated case-insensitively (email is lowercased), so
+// the lockout counter MUST normalise identically — otherwise cycling the case
+// of a service number yields a fresh 5-attempt bucket per variant.
+function norm(serviceNumber: string): string {
+  return serviceNumber.trim().toLowerCase();
+}
+
 export async function recordAttempt(
   serviceNumber: string,
   ip: string | null,
@@ -14,7 +21,7 @@ export async function recordAttempt(
 ): Promise<void> {
   const svc = serviceClient();
   await svc.from("login_attempts").insert({
-    service_number: serviceNumber,
+    service_number: norm(serviceNumber),
     ip,
     success,
   });
@@ -28,7 +35,7 @@ export async function isLockedOut(serviceNumber: string): Promise<boolean> {
   const { data } = await svc
     .from("login_attempts")
     .select("success, created_at")
-    .eq("service_number", serviceNumber)
+    .eq("service_number", norm(serviceNumber))
     .gte("created_at", since)
     .order("created_at", { ascending: false });
 

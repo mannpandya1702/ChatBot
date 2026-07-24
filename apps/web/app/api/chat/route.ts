@@ -11,17 +11,37 @@ import type { ConversationMessage } from "@/lib/chat/types";
 
 export const runtime = "nodejs";
 
+/** Read the `aal` claim from an access-token JWT without verifying it (the
+ *  token itself is validated separately by getUser). */
+function tokenAal(token: string): string | null {
+  try {
+    const part = token.split(".")[1];
+    if (!part) return null;
+    const json = Buffer.from(part.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
+    return (JSON.parse(json) as { aal?: string }).aal ?? null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Resolve the caller's access token + id from either the cookie session (the
- * browser UI, gated by the AAL2 middleware) or a Bearer token (smoke scripts).
- * The token drives an RLS-scoped client so retrieval is tier-limited.
+ * browser UI, gated by the AAL2 middleware) or a Bearer token. The token drives
+ * an RLS-scoped client so retrieval is tier-limited. The Bearer path enforces
+ * AAL2 + an active profile itself, so the endpoint is safe independent of the
+ * middleware matcher.
  */
 async function resolveAuth(req: Request): Promise<{ token: string; userId: string } | null> {
   const authz = req.headers.get("authorization") ?? "";
   if (authz.startsWith("Bearer ")) {
     const token = authz.slice(7);
-    const { data, error } = await userClient(token).auth.getUser(token);
-    return error || !data?.user ? null : { token, userId: data.user.id };
+    const uc = userClient(token);
+    const { data, error } = await uc.auth.getUser(token);
+    if (error || !data?.user) return null;
+    if (tokenAal(token) !== "aal2") return null;
+    const { data: profile } = await uc.from("profiles").select("is_active").eq("id", data.user.id).single();
+    if (!profile || (profile as { is_active: boolean }).is_active !== true) return null;
+    return { token, userId: data.user.id };
   }
   const supabase = await createServerSupabase();
   const { data: { user } } = await supabase.auth.getUser();
@@ -48,11 +68,14 @@ export async function POST(req: Request): Promise<Response> {
   }
   const { message, conversationId: convIn } = parsed.data;
 
-  const { data: underLimit } = await uc.rpc("check_rate_limit", {
+  const { data: underLimit, error: rlErr } = await uc.rpc("check_rate_limit", {
     p_limit: 20,
     p_window: "5 minutes",
   });
-  if (underLimit === false) {
+  // Fail closed: only an explicit "under the limit" proceeds; an error or null
+  // is treated as rate-limited rather than waved through.
+  if (rlErr) console.error("[chat] rate-limit check failed, denying:", rlErr.message);
+  if (underLimit !== true) {
     return NextResponse.json({ error: "rate_limited" }, { status: 429 });
   }
 

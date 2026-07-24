@@ -29,6 +29,24 @@ from .sources import fetch_supabase_storage
 app = FastAPI(title="Sainik Sahayak rag-service", version="0.1.0")
 
 
+def _validate_service_secret() -> None:
+    """Refuse to start with an unset or built-in-default shared secret: an empty
+    secret would let an empty header authenticate, and the default is published
+    in the repo. Local dev may override with RAG_ALLOW_INSECURE_SECRET=1."""
+    import os
+
+    if settings.service_secret in ("", "dev-insecure-secret-change-me") and \
+            os.getenv("RAG_ALLOW_INSECURE_SECRET") != "1":
+        raise RuntimeError(
+            "RAG_SERVICE_SECRET is unset or the built-in default — refusing to start. "
+            "Set a strong secret (e.g. `openssl rand -hex 32`); for local dev only, "
+            "export RAG_ALLOW_INSECURE_SECRET=1."
+        )
+
+
+_validate_service_secret()
+
+
 def require_secret(x_service_secret: str = Header(default="")) -> None:
     # Constant-time compare to avoid leaking the secret via timing.
     import hmac

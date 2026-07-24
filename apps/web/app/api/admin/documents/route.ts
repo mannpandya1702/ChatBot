@@ -27,7 +27,10 @@ export async function POST(req: Request): Promise<Response> {
   const title = String(form?.get("title") ?? "").trim();
   const accessTier = Number(form?.get("accessTier") ?? "1");
   if (!(file instanceof File)) return NextResponse.json({ error: "no file" }, { status: 400 });
-  if (file.type && file.type !== "application/pdf" && !file.name.toLowerCase().endsWith(".pdf")) {
+  // Require a positive PDF signal (content-type OR .pdf name) — an unknown type
+  // with a non-.pdf name is rejected here; the rag magic-byte check backstops it.
+  const looksPdf = file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+  if (!looksPdf) {
     return NextResponse.json({ error: "only PDF files are accepted" }, { status: 400 });
   }
   if (file.size > MAX_BYTES) return NextResponse.json({ error: "file exceeds 50 MB" }, { status: 400 });

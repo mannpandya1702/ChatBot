@@ -7,16 +7,18 @@
 import { createServerClient, type CookieOptions } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
 import { env } from "@/lib/env";
-import { ipAllowed } from "@/lib/auth/ip";
+import { ipAllowed, clientIpFromHeaders } from "@/lib/auth/ip";
 
 // Reachable without a completed (AAL2 + active) session.
 const PUBLIC_PREFIXES = ["/login", "/auth"];
 const ONBOARDING = "/onboarding";
 
 function clientIp(req: NextRequest): string | null {
-  const xff = req.headers.get("x-forwarded-for");
-  if (xff) return xff.split(",")[0]!.trim();
-  return req.headers.get("x-real-ip");
+  return clientIpFromHeaders(
+    req.headers.get("x-forwarded-for"),
+    req.headers.get("x-real-ip"),
+    env.trustedProxyCount,
+  );
 }
 
 export async function middleware(req: NextRequest) {

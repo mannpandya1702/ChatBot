@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { ipAllowed } from "./ip";
+import { ipAllowed, clientIpFromHeaders } from "./ip";
 
 describe("ipAllowed", () => {
   it("allows everything when the allowlist is empty (disabled)", () => {
@@ -27,5 +27,31 @@ describe("ipAllowed", () => {
   it("rejects malformed input", () => {
     expect(ipAllowed("not.an.ip", ["10.0.0.0/8"])).toBe(false);
     expect(ipAllowed("10.0.0.1", ["bad/cidr"])).toBe(false);
+  });
+});
+
+describe("clientIpFromHeaders (X-Forwarded-For spoof resistance)", () => {
+  it("falls back to x-real-ip when there is no XFF", () => {
+    expect(clientIpFromHeaders(null, "9.9.9.9")).toBe("9.9.9.9");
+    expect(clientIpFromHeaders(null, null)).toBe(null);
+  });
+
+  it("takes the rightmost (trusted) entry by default, not the client-controlled leftmost", () => {
+    // Attacker prepends a fake allowlisted IP; the proxy appends the real one.
+    expect(clientIpFromHeaders("10.0.0.1, 203.0.113.9", null)).toBe("203.0.113.9");
+    expect(clientIpFromHeaders("203.0.113.9", null)).toBe("203.0.113.9");
+  });
+
+  it("honours trustedProxyCount for multi-proxy edges", () => {
+    // client, cdn, our-nginx  → with 1 trusted proxy (nginx), the client is 'cdn'... no:
+    // parts=[client, cdn]; count=1 → index len-1-1 = 0 → client
+    expect(clientIpFromHeaders("198.51.100.7, 10.0.0.2", null, 1)).toBe("198.51.100.7");
+    // over-counting clamps to the leftmost rather than going negative
+    expect(clientIpFromHeaders("198.51.100.7, 10.0.0.2", null, 9)).toBe("198.51.100.7");
+  });
+
+  it("trims whitespace and ignores empty segments", () => {
+    expect(clientIpFromHeaders("  10.0.0.1 , 203.0.113.9 ", null)).toBe("203.0.113.9");
+    expect(clientIpFromHeaders(",,", null)).toBe(null);
   });
 });
