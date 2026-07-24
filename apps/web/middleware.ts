@@ -22,6 +22,12 @@ function clientIp(req: NextRequest): string | null {
 }
 
 export async function middleware(req: NextRequest) {
+  // Liveness probe: fully public (no IP allowlist, no auth) so container / load
+  // balancer health checks succeed regardless of the deployment's IP gate.
+  if (req.nextUrl.pathname === "/api/health") {
+    return NextResponse.next({ request: req });
+  }
+
   // 1. IP allowlist (VPN-only deployments) — enforced before anything else.
   if (!ipAllowed(clientIp(req), env.ipAllowlist)) {
     return new NextResponse("Forbidden", { status: 403 });

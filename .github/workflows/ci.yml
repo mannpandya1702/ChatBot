@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  web:
+    name: web — typecheck · test · build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - name: build (standalone)
+        run: npm run build
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: http://localhost:8000
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ci-placeholder
+          NEXT_TELEMETRY_DISABLED: "1"
+
+  db:
+    name: rag pytest + RLS matrix (Postgres)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Local Postgres 16 with a unix socket at /var/run/postgresql, matching the
+      # test harness (conftest + scripts/local-db/apply.sh connect as role 'root').
+      - name: Start Postgres
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql postgresql-contrib \
+            tesseract-ocr tesseract-ocr-hin tesseract-ocr-eng fonts-dejavu-core
+          sudo pg_ctlcluster "$(ls /etc/postgresql)" main start
+          sudo -u postgres psql -c "create role root superuser login createdb" || true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: rag pytest
+        working-directory: services/rag
+        run: |
+          python -m pip install -U pip
+          pip install -r requirements.txt pytest
+          python -m pytest -q
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: RLS matrix
+        run: |
+          npm ci
+          npm run test:rls
+
+  guard:
+    name: client-bundle secret guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: no client component may import server env / service role
+        run: |
+          set -e
+          # Fail if any "use client" file IMPORTS the server-only env or service
+          # client (match `from "…/env"` / `…/supabase/service"`, not prose).
+          hits=$(grep -rlE '^\s*"use client"' apps/web --include=*.ts --include=*.tsx \
+            | xargs grep -lE 'from "[^"]*/(env|supabase/service)"' 2>/dev/null || true)
+          if [ -n "$hits" ]; then
+            echo "::error::client component imports server-only module:"; echo "$hits"; exit 1
+          fi
+          # Fail on any hardcoded service_role JWT literal in the tree.
+          if grep -rIiE 'role"?\s*:\s*"?service_role' apps/web --include=*.ts --include=*.tsx | grep -v test; then
+            echo "::error::possible service_role reference in web source"; exit 1
+          fi
+          echo "guard OK"

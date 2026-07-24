@@ -63,13 +63,14 @@ Do everything below **inside the Ubuntu window**, in your home folder.
    sudo apt update && sudo apt install -y git
    ```
 
-2. Get this project and switch to the right branch:
+2. Get this project:
    ```bash
    cd ~
    git clone https://github.com/mannpandya1702/chatbot.git
    cd chatbot
-   git checkout claude/repository-review-5ox08x
    ```
+   If your team uses a specific release branch or tag, check it out now
+   (`git checkout <branch-or-tag>`); otherwise the default branch is fine.
    (If git asks you to log in, use your GitHub username and a **personal access
    token** as the password — GitHub no longer accepts your account password on
    the command line.)
@@ -124,7 +125,7 @@ Near the end it prints your **admin login and a one-time password** —
 **copy those somewhere safe now.** It ends with "Sainik Sahayak is up."
 
 Open a browser on the machine to **http://localhost:3000** — you should reach
-the app. (The chat/login screens are still being built — Part 8 notes this.)
+the **sign-in screen**.
 
 ---
 
@@ -187,13 +188,18 @@ search. Nothing leaves the machine.
 
 ## Part 8 — Use it
 
-- Open **http://localhost:3000** and sign in with the admin login from Part 4.
-  First login forces a password change and TOTP setup (an authenticator app
-  like Google Authenticator).
-- **Note:** the browser chat and login screens are the next thing to build
-  (Phases 3–4). Until they land, you can confirm answers from the command line —
-  ask me and I'll give you the exact `curl` test for your document. Once I build
-  the UI, asking questions happens in the browser.
+- Open **http://localhost:3000** and sign in with the admin login from Part 4
+  (service number + the one-time password). First login walks you through
+  setting a new password and enrolling an authenticator app (TOTP, e.g. Google
+  Authenticator) — required before any access.
+- **Ask questions in the chat.** Answers come only from your ingested documents,
+  each with its source; anything the documents don't cover returns a clean
+  "not found" rather than a guess.
+- **Admin console** (the "Admin" link, top-right): invite jawans and manage
+  their access, upload/re-ingest/delete documents, and see the top questions and
+  the unanswered-question gaps.
+- On the unit LAN, jawans reach it from their phones at
+  **http://\<this-PC-LAN-ip\>:3000** (see the network setup notes).
 
 ---
 

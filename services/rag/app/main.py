@@ -8,9 +8,12 @@ Endpoints (all require header X-Service-Secret == RAG_SERVICE_SECRET, spec §6):
 """
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
+
+logger = logging.getLogger("rag")
 
 from . import db
 from .config import settings
@@ -62,6 +65,14 @@ def _warm_models() -> None:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     # Runs before the server accepts traffic → doubles as a readiness gate.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    logger.info(
+        "rag-service starting (embed=%s rerank=%s ocr=%s)",
+        settings.embedding_backend, settings.rerank_backend, settings.ocr_languages,
+    )
     _warm_models()
     yield
 
@@ -107,12 +118,21 @@ def rerank(req: RerankRequest) -> RerankResponse:
 
 @app.post("/ingest", response_model=IngestResponse, dependencies=[Depends(require_secret)])
 def ingest(req: IngestRequest) -> IngestResponse:
+    logger.info("ingest start document_id=%s", req.document_id)
     with db.connect() as conn:
         doc = db.get_document(conn, req.document_id)
         if doc is None:
+            logger.warning("ingest document not found document_id=%s", req.document_id)
             raise HTTPException(status_code=404, detail="document not found")
         data = fetch_supabase_storage(doc["storage_path"])
         outcome = ingest_pdf_bytes(conn, req.document_id, data, doc["access_tier"])
+    if outcome.status == "ready":
+        logger.info(
+            "ingest ok document_id=%s pages=%s chunks=%s",
+            req.document_id, outcome.page_count, outcome.chunk_count,
+        )
+    else:
+        logger.error("ingest failed document_id=%s error=%s", req.document_id, outcome.error)
     return IngestResponse(
         document_id=req.document_id,
         status=outcome.status,
