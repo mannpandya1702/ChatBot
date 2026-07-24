@@ -27,6 +27,7 @@ async function ollamaChat(
         { role: "user", content: user },
       ],
     }),
+    signal: AbortSignal.timeout(600_000), // local generation can be slow on CPU
   });
   if (!res.ok) throw new Error(`ollama /api/chat ${res.status}`);
   const data = (await res.json()) as { message?: { content?: string } };

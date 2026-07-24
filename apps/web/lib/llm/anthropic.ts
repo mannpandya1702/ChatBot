@@ -40,6 +40,7 @@ export const anthropicClassifier: Classifier = {
       system: CLASSIFY_SYSTEM,
       prompt: classifyUserMessage(input),
       maxOutputTokens: 16,
+      temperature: 0, // deterministic, matching the Ollama path
     });
     return parseLabel(text);
   },
@@ -52,6 +53,7 @@ export const anthropicRewriter: Rewriter = {
       system: REWRITE_SYSTEM,
       prompt: rewriteUserPayload(history, latest),
       maxOutputTokens: 256,
+      temperature: 0,
     });
     return text.trim();
   },
@@ -66,6 +68,7 @@ export const anthropicGenerator: Generator = {
       system,
       prompt: userPayload,
       maxOutputTokens,
+      temperature: 0, // faithful, reproducible grounding — matches Ollama
     });
     const text = await result.text;
     return { text, model: env.generationModel };

@@ -56,7 +56,8 @@ as $$
     from public.chunks c
     where c.embedding is not null
     order by c.embedding <=> p_query_embedding
-    limit 40
+    limit 200  -- wide candidate pool: RLS tier-filtering happens after the ANN
+               -- scan, so a small pool starves lower-tier users of recall
   ),
   txt as (
     select c.id,
@@ -68,7 +69,7 @@ as $$
     where p_query_text is not null
       and length(trim(p_query_text)) > 0
       and c.content_tsv @@ websearch_to_tsquery('simple'::regconfig, p_query_text)
-    limit 40
+    limit 200  -- match the vector pool so keyword recall isn't the bottleneck
   ),
   fused as (
     select coalesce(vec.id, txt.id) as id,

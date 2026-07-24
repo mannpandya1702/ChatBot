@@ -18,6 +18,7 @@ export async function triggerIngest(documentId: string): Promise<IngestOutcome> 
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Service-Secret": env.ragServiceSecret },
     body: JSON.stringify({ document_id: documentId }),
+    signal: AbortSignal.timeout(900_000), // large PDFs: extract + OCR + embed
   });
   if (!r.ok) throw new Error(`rag /ingest ${r.status}`);
   return (await r.json()) as IngestOutcome;

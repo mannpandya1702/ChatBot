@@ -61,7 +61,7 @@ class BgeReranker(Reranker):
 
     name = "bge"
     _batch = 16
-    _max_length = 512
+    _max_length = settings.rerank_max_length
 
     def __init__(self) -> None:
         import torch  # noqa: F401 — ensure torch is present before model load

@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     rerank_model: str = "BAAI/bge-reranker-v2-m3"
     embedding_dim: int = 1024
     embed_batch_size: int = 32
+    # Reranker (query, passage) truncation window. Must exceed a max-size chunk
+    # (chunk_max_tokens) + the query, or answers in a chunk's tail get truncated
+    # away before scoring and can be wrongly refused. bge-reranker-v2-m3 supports
+    # long context, so 1024 comfortably covers a 900-token chunk.
+    rerank_max_length: int = 1024
 
     # Token counter for chunk sizing. 'auto' uses the real XLM-R tokenizer when
     # transformers is installed (production accuracy) and falls back to the

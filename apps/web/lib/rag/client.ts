@@ -12,6 +12,7 @@ export function createRagClient(): RagClient {
         method: "POST",
         headers,
         body: JSON.stringify({ texts }),
+        signal: AbortSignal.timeout(120_000),
       });
       if (!r.ok) throw new Error(`rag /embed ${r.status}`);
       return ((await r.json()) as { embeddings: number[][] }).embeddings;
@@ -21,6 +22,7 @@ export function createRagClient(): RagClient {
         method: "POST",
         headers,
         body: JSON.stringify({ query, passages, top_k: topK }),
+        signal: AbortSignal.timeout(120_000),
       });
       if (!r.ok) throw new Error(`rag /rerank ${r.status}`);
       return ((await r.json()) as {

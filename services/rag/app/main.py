@@ -8,6 +8,8 @@ Endpoints (all require header X-Service-Secret == RAG_SERVICE_SECRET, spec §6):
 """
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 
 from . import db
@@ -26,9 +28,6 @@ from .schemas import (
 )
 from .sources import fetch_supabase_storage
 
-app = FastAPI(title="Sainik Sahayak rag-service", version="0.1.0")
-
-
 def _validate_service_secret() -> None:
     """Refuse to start with an unset or built-in-default shared secret: an empty
     secret would let an empty header authenticate, and the default is published
@@ -45,6 +44,29 @@ def _validate_service_secret() -> None:
 
 
 _validate_service_secret()
+
+
+def _warm_models() -> None:
+    """Preload the embed/rerank models so the FIRST user request isn't a multi-GB
+    cold load that would blow past client timeouts. Best-effort: on failure, log
+    and fall back to lazy load on first use."""
+    import logging
+
+    for label, load in (("embedder", get_embedder), ("reranker", get_reranker)):
+        try:
+            load()
+        except Exception as exc:  # pragma: no cover — best effort
+            logging.getLogger("rag").warning("model warmup (%s) failed: %s", label, exc)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Runs before the server accepts traffic → doubles as a readiness gate.
+    _warm_models()
+    yield
+
+
+app = FastAPI(title="Sainik Sahayak rag-service", version="0.1.0", lifespan=lifespan)
 
 
 def require_secret(x_service_secret: str = Header(default="")) -> None:
