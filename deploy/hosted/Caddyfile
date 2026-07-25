@@ -1,0 +1,40 @@
+# Sainik Sahayak — public HTTPS front door.
+#
+# Caddy obtains and renews Let's Encrypt certificates automatically; there is
+# nothing to run by hand and nothing to remember before expiry.
+#
+# Two hostnames are needed because the browser talks to two things: the app
+# itself, and Supabase auth (sign-in and the 6-digit code) which lives behind
+# the Kong gateway. Both must be reachable over HTTPS or login breaks.
+#
+#   APP_DOMAIN  → the web app          e.g. sahayak.example.in
+#   API_DOMAIN  → Supabase (auth/API)  e.g. api.sahayak.example.in
+#
+# Both are read from the environment (set them in the Supabase .env).
+
+{$APP_DOMAIN} {
+	encode zstd gzip
+
+	# Standard hardening. HSTS is deliberately left off until you have confirmed
+	# the domain is permanently HTTPS — it is hard to undo in browsers.
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy same-origin
+		-Server
+	}
+
+	reverse_proxy web:3000
+}
+
+{$API_DOMAIN} {
+	encode zstd gzip
+
+	header {
+		X-Content-Type-Options nosniff
+		-Server
+	}
+
+	# Kong is the Supabase API gateway; the browser reaches auth through it.
+	reverse_proxy kong:8000
+}

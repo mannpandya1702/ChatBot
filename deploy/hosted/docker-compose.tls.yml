@@ -1,0 +1,50 @@
+# Sainik Sahayak — public HTTPS overlay.
+#
+# Adds Caddy in front of the stack so the app is reachable from anywhere over
+# HTTPS, with certificates issued and renewed automatically. Merge it AFTER the
+# main overlay:
+#
+#   cd supabase/docker
+#   docker compose --env-file .env \
+#     -f docker-compose.yml \
+#     -f /path/to/repo/deploy/airgap/docker-compose.airgap.yml \
+#     -f /path/to/repo/deploy/hosted/docker-compose.tls.yml \
+#     up -d
+#
+# Requires in .env:
+#   APP_DOMAIN=sahayak.example.in
+#   API_DOMAIN=api.sahayak.example.in
+#   WEB_PORT=127.0.0.1:3000      <- keeps the app off the public port; Caddy
+#                                   still reaches it inside the docker network
+#
+# See deploy/hosted/HOSTED.md for the full walkthrough.
+services:
+  caddy:
+    # Pin the tag: an automatic major-version jump on a certificate-issuing
+    # component is not something you want to discover during an outage.
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    ports:
+      # 80 is required for the ACME HTTP challenge as well as the HTTP→HTTPS
+      # redirect; 443 serves the site.
+      - "80:80"
+      - "443:443"
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN}
+      API_DOMAIN: ${API_DOMAIN}
+    volumes:
+      # Absolute path from .env — relative paths here would resolve against the
+      # Supabase project directory (where you run compose), not this file, so an
+      # explicit CADDYFILE removes the ambiguity entirely.
+      - ${CADDYFILE:?set CADDYFILE to the absolute path of deploy/hosted/Caddyfile}:/etc/caddy/Caddyfile:ro
+      # Certificates live here. Losing this volume means re-issuing on next
+      # start, which is fine but counts against Let's Encrypt rate limits.
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+      - kong
+
+volumes:
+  caddy_data:
+  caddy_config:
