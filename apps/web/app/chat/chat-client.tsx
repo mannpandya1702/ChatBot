@@ -1,8 +1,10 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { Button } from "@/lib/ui/button";
 import { Spinner } from "@/lib/ui/misc";
+import { ConversationSidebar, type ConversationSummary } from "./conversation-sidebar";
 
 interface Citation {
   s: number;
@@ -10,7 +12,7 @@ interface Citation {
   page_start: number | null;
   page_end: number | null;
 }
-interface Msg {
+export interface Msg {
   role: "user" | "assistant";
   content: string;
   citations?: Citation[];
@@ -35,12 +37,26 @@ function pages(c: Citation): string {
   return ` · pp. ${c.page_start}–${c.page_end}`;
 }
 
-export function ChatClient({ user }: { user: User }) {
-  const [messages, setMessages] = useState<Msg[]>([]);
+export function ChatClient({
+  user,
+  conversations,
+  activeId,
+  initialMessages,
+}: {
+  user: User;
+  conversations: ConversationSummary[];
+  activeId: string | null;
+  initialMessages: Msg[];
+}) {
+  // Seeded from the server-loaded transcript; the page remounts this component
+  // (keyed on the conversation) when you switch chats, so this stays in step.
+  const [messages, setMessages] = useState<Msg[]>(initialMessages);
   const [input, setInput] = useState("");
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [conversationId, setConversationId] = useState<string | null>(null);
+  const [conversationId, setConversationId] = useState<string | null>(activeId);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const router = useRouter();
   const endRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const isAdmin = user.role === "admin" || user.role === "super_admin";
@@ -85,11 +101,21 @@ export function ChatClient({ user }: { user: User }) {
         return;
       }
       const data = await res.json();
-      setConversationId(data.conversationId ?? conversationId);
+      const id: string | null = data.conversationId ?? conversationId;
+      setConversationId(id);
       setMessages((m) => [
         ...m,
         { role: "assistant", content: data.text, citations: data.citations, refused: data.refused },
       ]);
+      if (id && !conversationId) {
+        // First message of a fresh chat: put its id in the URL so a reload (or a
+        // later sidebar click) comes back here, and the new entry shows up in
+        // history. Both turns are already persisted, so the remount is seamless.
+        router.replace(`/chat?c=${id}`, { scroll: false });
+      } else {
+        // Existing chat: refresh so the sidebar re-sorts by latest activity.
+        router.refresh();
+      }
     } catch {
       failed = true;
       setError("Network error. Please check your connection. / नेटवर्क त्रुटि।");
@@ -107,9 +133,25 @@ export function ChatClient({ user }: { user: User }) {
   const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant");
 
   return (
-    <div className="flex h-dvh flex-col bg-background">
+    <div className="flex h-dvh bg-background">
+      <ConversationSidebar
+        conversations={conversations}
+        activeId={activeId}
+        open={sidebarOpen}
+        onClose={() => setSidebarOpen(false)}
+      />
+
+      <div className="flex min-w-0 flex-1 flex-col">
       <header className="flex items-center justify-between border-b border-border bg-card px-4 py-3">
         <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setSidebarOpen(true)}
+            aria-label="Open chat history"
+            className="-ml-1 rounded-md p-1.5 text-muted-foreground hover:bg-accent lg:hidden"
+          >
+            <MenuIcon />
+          </button>
           <span className="flex h-8 w-8 items-center justify-center rounded-md bg-primary text-sm font-bold text-primary-foreground" aria-hidden="true">सै</span>
           <div className="leading-tight">
             <div className="text-sm font-semibold">Sainik Sahayak</div>
@@ -197,7 +239,16 @@ export function ChatClient({ user }: { user: User }) {
           <div className="mt-1 text-right text-[10px] text-muted-foreground">{input.length}/{MAX}</div>
         </div>
       </footer>
+      </div>
     </div>
+  );
+}
+
+function MenuIcon() {
+  return (
+    <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+      <path d="M3 6h18M3 12h18M3 18h18" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
   );
 }
 

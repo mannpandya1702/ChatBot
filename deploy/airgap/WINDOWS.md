@@ -195,6 +195,9 @@ search. Nothing leaves the machine.
 - **Ask questions in the chat.** Answers come only from your ingested documents,
   each with its source; anything the documents don't cover returns a clean
   "not found" rather than a guess.
+- **Past chats** are listed in the sidebar on the left (tap the ☰ menu on a
+  phone). Select one to reopen it, **+ New** to start fresh, or the bin icon to
+  delete one. Each person sees only their own chats — admins cannot read them.
 - **Admin console** (the "Admin" link, top-right): invite jawans and manage
   their access, upload/re-ingest/delete documents, and see the top questions and
   the unanswered-question gaps.
