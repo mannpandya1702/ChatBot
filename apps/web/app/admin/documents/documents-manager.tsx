@@ -4,6 +4,8 @@ import { useRouter } from "next/navigation";
 import { Button } from "@/lib/ui/button";
 import { Input } from "@/lib/ui/input";
 import { Label, Card, Alert, Spinner } from "@/lib/ui/misc";
+import { UploadError, uploadDocument, type UploadProgress } from "@/lib/kb/upload-client";
+import { MAX_UPLOAD_BYTES } from "@/lib/kb/limits";
 import { deleteDocumentAction, reingestAction } from "./actions";
 
 export interface DocRow {
@@ -28,11 +30,43 @@ function StatusBadge({ status }: { status: DocRow["status"] }) {
   );
 }
 
+const PHASE_LABEL: Record<UploadProgress["phase"], string> = {
+  hashing: "Checking file…",
+  uploading: "Uploading…",
+  finishing: "Queueing for processing…",
+};
+
+function UploadProgressBar({ progress }: { progress: UploadProgress }) {
+  const percent = progress.percent;
+  return (
+    <div className="space-y-1.5" aria-live="polite">
+      <div className="flex justify-between text-xs text-muted-foreground">
+        <span>{PHASE_LABEL[progress.phase]}</span>
+        {percent !== undefined && <span>{percent}%</span>}
+      </div>
+      <div
+        className="h-1.5 overflow-hidden rounded-full bg-muted"
+        role="progressbar"
+        aria-label={PHASE_LABEL[progress.phase]}
+        aria-valuenow={percent}
+        aria-valuemin={0}
+        aria-valuemax={100}
+      >
+        <div
+          className={`h-full bg-primary transition-[width] duration-200 ${percent === undefined ? "animate-pulse" : ""}`}
+          style={{ width: percent === undefined ? "100%" : `${percent}%` }}
+        />
+      </div>
+    </div>
+  );
+}
+
 export function DocumentsManager({ documents }: { documents: DocRow[] }) {
   const router = useRouter();
   const formRef = useRef<HTMLFormElement>(null);
-  const [uploading, setUploading] = useState(false);
+  const [progress, setProgress] = useState<UploadProgress | null>(null);
   const [msg, setMsg] = useState<{ kind: "error" | "success"; text: string } | null>(null);
+  const uploading = progress !== null;
 
   // Auto-refresh while anything is still processing.
   useEffect(() => {
@@ -44,34 +78,43 @@ export function DocumentsManager({ documents }: { documents: DocRow[] }) {
   async function onUpload(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     const form = new FormData(e.currentTarget);
-    if (!(form.get("file") as File)?.size) {
+    const file = form.get("file") as File | null;
+    if (!file?.size) {
       setMsg({ kind: "error", text: "Choose a PDF to upload." });
       return;
     }
-    setUploading(true);
+    // Caught server-side too; checked here so a large file fails instantly
+    // instead of after a long hash.
+    if (file.size > MAX_UPLOAD_BYTES) {
+      setMsg({ kind: "error", text: "That file is over the 50 MB limit." });
+      return;
+    }
+
     setMsg(null);
+    setProgress({ phase: "hashing" });
     try {
-      const res = await fetch("/api/admin/documents", { method: "POST", body: form });
-      const data = await res.json();
-      if (!res.ok) {
-        setMsg({ kind: "error", text: data.error ?? "Upload failed." });
-      } else {
-        setMsg({
-          kind: data.status === "failed" ? "error" : "success",
-          text:
-            data.status === "ready"
-              ? "Uploaded and ingested."
-              : data.status === "failed"
-                ? "Uploaded, but ingestion failed — use Re-ingest once the service is up."
-                : "Uploaded; processing…",
-        });
-        formRef.current?.reset();
-        router.refresh();
-      }
-    } catch {
-      setMsg({ kind: "error", text: "Network error during upload." });
+      const result = await uploadDocument(
+        { file, title: String(form.get("title") ?? "").trim(), accessTier: Number(form.get("accessTier")) },
+        setProgress,
+      );
+      setMsg({
+        kind: result.status === "failed" ? "error" : "success",
+        text:
+          result.status === "failed"
+            ? "Uploaded, but ingestion failed — use Re-ingest once the service is up."
+            : "Uploaded. Processing runs in the background — the status below updates on its own.",
+      });
+      formRef.current?.reset();
+      router.refresh();
+    } catch (err) {
+      // UploadError carries a message written for the operator; anything else is
+      // an internal fault whose text would only confuse.
+      setMsg({
+        kind: "error",
+        text: err instanceof UploadError ? err.message : "Upload failed. Please try again.",
+      });
     } finally {
-      setUploading(false);
+      setProgress(null);
     }
   }
 
@@ -96,6 +139,7 @@ export function DocumentsManager({ documents }: { documents: DocRow[] }) {
             </select>
           </div>
           {msg && <div className="sm:col-span-2"><Alert variant={msg.kind}>{msg.text}</Alert></div>}
+          {progress && <div className="sm:col-span-2"><UploadProgressBar progress={progress} /></div>}
           <div className="sm:col-span-2">
             <Button type="submit" disabled={uploading}>{uploading && <Spinner />} Upload & ingest</Button>
           </div>

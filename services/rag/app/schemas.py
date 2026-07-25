@@ -38,11 +38,16 @@ class RerankResponse(BaseModel):
 
 class IngestRequest(BaseModel):
     document_id: str
+    # Queue the work and answer immediately (202) instead of holding the
+    # connection open for the whole extract/OCR/embed run. Callers behind a
+    # request-timeout budget — a Vercel serverless function is capped at
+    # 60s/300s — must use this and poll documents.status.
+    background: bool = False
 
 
 class IngestResponse(BaseModel):
     document_id: str
-    status: str            # 'ready' | 'failed'
+    status: str            # 'ready' | 'failed' | 'processing' (queued)
     page_count: int | None = None
     chunk_count: int | None = None
     error: str | None = None

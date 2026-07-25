@@ -46,6 +46,10 @@ class Settings(BaseSettings):
 
     # Ingestion guards.
     max_pdf_bytes: int = 50 * 1024 * 1024  # 50 MB cap
+    # Background ingests running at once. Extraction+OCR+embedding is memory
+    # hungry (models alone are ~5 GB); two concurrent scanned-PDF ingests will
+    # OOM a small box. Serialised by default — uploads queue instead of racing.
+    ingest_concurrency: int = 1
 
     # Supabase Storage (production file source).
     supabase_url: str = ""

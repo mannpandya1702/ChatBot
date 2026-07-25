@@ -47,6 +47,12 @@ services:
       # Direct Postgres (service path bypasses RLS by design — writes documents/
       # chunks only). Connects to the upstream `db` service.
       RAG_DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-postgres}
+      # Private `kb` bucket, reached through Kong on the internal network. This
+      # is how a PDF uploaded from the admin console gets to the ingester —
+      # without it, console uploads land in Storage and then fail to process,
+      # and only the `cli.py ingest /kb` path works.
+      RAG_SUPABASE_URL: http://kong:8000
+      RAG_SUPABASE_SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY}
       RAG_EMBEDDING_BACKEND: bge
       RAG_RERANK_BACKEND: bge
       RAG_TOKEN_BACKEND: auto

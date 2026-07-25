@@ -48,14 +48,24 @@ def ingest_pdf_bytes(
     document_id: str,
     data: bytes,
     access_tier: int,
+    expected_sha256: str | None = None,
 ) -> IngestOutcome:
     """Extract → chunk → embed → upsert for one already-fetched PDF. Commits on
-    success; marks the document failed (committed) on any error."""
+    success; marks the document failed (committed) on any error.
+
+    `expected_sha256` is the checksum recorded on the documents row. When the
+    file was uploaded straight from a browser to Storage, that hash is computed
+    client-side (the web tier never sees the bytes), so this is where it becomes
+    trustworthy: the digest of what we actually downloaded must match, or the
+    document is failed rather than indexed under a checksum that isn't its own.
+    """
     try:
         # Serialise same-document ingests before any work so a concurrent
         # re-index can't corrupt the chunk set (released at commit/rollback).
         db.lock_document(conn, document_id)
         validate_pdf_bytes(data)
+        if expected_sha256 and sha256_of(data) != expected_sha256:
+            raise IngestError("stored file does not match its recorded sha256")
         with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
             tmp.write(data)
             tmp.flush()
