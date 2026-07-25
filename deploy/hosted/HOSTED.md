@@ -7,6 +7,9 @@ No VPN, no unit LAN, nothing for jawans to install.
 Everything runs on **one server that you control**: the database, the search, and
 the language model. Nothing is sent to any outside service.
 
+**Want it free?** [`ORACLE.md`](ORACLE.md) does the same thing on Oracle's
+Always Free tier (4 cores, 24 GB, ₹0/month forever) with a free HTTPS address.
+
 Offline/on-premise install instead? See [`../airgap/WINDOWS.md`](../airgap/WINDOWS.md).
 
 ---

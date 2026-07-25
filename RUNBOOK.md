@@ -1,8 +1,8 @@
 # Sainik Sahayak — operations runbook
 
 Day-2 operations. First-time install is in
-[`deploy/hosted/HOSTED.md`](deploy/hosted/HOSTED.md) for a server with a public
-domain (jawans reach it from anywhere), or
+[`deploy/hosted/ORACLE.md`](deploy/hosted/ORACLE.md) (free tier, public domain) or
+[`deploy/hosted/HOSTED.md`](deploy/hosted/HOSTED.md) (any rented server), or
 [`deploy/airgap/README.md`](deploy/airgap/README.md) /
 [`deploy/airgap/WINDOWS.md`](deploy/airgap/WINDOWS.md) for an offline install.
 This file is what you keep next to the running system — it applies to both.
