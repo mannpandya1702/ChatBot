@@ -149,12 +149,58 @@ middleware.
   `requireAdmin`): **Users** — service-role listing incl. inactive, invite
   (one-time password), activate/deactivate with role-correct authorization;
   **Documents** — PDF upload (dedup by sha256) → private `kb` Storage bucket
-  (auto-created) → synchronous rag `/ingest`, with live status, re-ingest, and
+  (auto-created) → rag `/ingest`, with live status, re-ingest, and
   delete (chunks cascade); **Analytics** — top answered questions and the
   unanswered-query gap from `query_analytics` (no user linkage), refusal rate.
   Polish: `not-found`, error boundary, web manifest, chat loading state.
 - Phases 6–8 (hardening, eval, cloud deploy config): pending. Air-gap deploy
   kit shipped (`deploy/airgap/`).
+
+## Document upload path
+
+Uploads go **browser → Supabase Storage directly**, not through the app's API.
+The web tier mints a signed upload URL scoped to a single object, the browser
+`PUT`s the bytes to Storage, and a second small JSON call records the row and
+queues ingestion.
+
+This is forced by serverless hosting, and the constraint is worth stating plainly
+because it is invisible until it bites: a Vercel function accepts at most a
+**4.5 MB** request body and is killed at 60s (300s on Pro), while the document
+cap is 50 MB and OCR on a large scan runs for minutes. Posting the file to an
+API route would have failed on both counts. It is also simply better everywhere
+else — the bytes take one hop instead of two, and a slow upload never occupies a
+server process.
+
+Two properties keep that safe:
+
+- **Ingestion is asynchronous and owns the status.** `/ingest` with
+  `background: true` validates the document exists, returns `202`, and processes
+  in a worker capped by `RAG_INGEST_CONCURRENCY` (default 1 — two concurrent
+  scans would exceed the RAM of a small box). Every escape path in that worker
+  ends in `mark_failed`, because there is no caller left to record a failure;
+  the admin table polls `documents.status`. A process restart mid-job is the one
+  case that strands a row in `processing`, which is what the stale sweeper
+  (`cli.py sweep-stale`) exists for.
+- **The checksum is verified against the real bytes.** Since the web tier never
+  sees the file, `documents.sha256` is computed in the browser. The rag-service
+  re-hashes what it downloads and fails the document on a mismatch, so a file
+  swapped between signing and upload can never be indexed under another's hash.
+  The browser uses WebCrypto where available and a plain-JS SHA-256 otherwise —
+  `crypto.subtle` is absent outside secure contexts, which is exactly the
+  air-gapped LAN case (`http://10.0.0.5:3000`).
+
+## Deployment paths
+
+| Path | Web | DB / Storage / Auth | rag-service | LLM | Guide |
+|---|---|---|---|---|---|
+| Air-gapped | own box | self-hosted Supabase | own box | Ollama, local | `deploy/airgap/` |
+| Single server | own box | self-hosted Supabase | own box | Ollama, local | `deploy/hosted/` |
+| Vercel split | Vercel | hosted Supabase | one small box | Anthropic API | `deploy/vercel/` |
+
+The rag-service cannot be made serverless: BGE-M3 + the reranker + Tesseract need
+~5 GB resident for minutes at a time. Any hosted path therefore keeps one
+always-on box, which is also what keeps embeddings and OCR local to
+infrastructure the operator controls.
 
 ## Content classification handling (governance)
 

@@ -1,0 +1,33 @@
+# HTTPS front door for the rag-service, so Vercel can reach it.
+#
+# Vercel functions call this over the public internet, which means it needs a
+# real certificate — a self-signed one will be rejected and every ingest and
+# every question will fail. Caddy issues and renews from Let's Encrypt with
+# nothing to run by hand.
+#
+#   RAG_DOMAIN → e.g. rag.sahayak.example.in
+#
+# The service is not open just because it is on the internet: every endpoint
+# requires the X-Service-Secret header, checked with a constant-time compare.
+# /health is the one exception and returns no secrets.
+
+{$RAG_DOMAIN} {
+	encode zstd gzip
+
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+		-Server
+	}
+
+	# Ingestion of a large scanned PDF runs for minutes. It is queued in the
+	# background so the HTTP call itself returns in about a second, but embed and
+	# rerank on a cold model can still be slow — keep the proxy patient enough
+	# not to cut those off mid-answer.
+	reverse_proxy rag:8000 {
+		transport http {
+			read_timeout 300s
+			write_timeout 300s
+		}
+	}
+}

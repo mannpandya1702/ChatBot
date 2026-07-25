@@ -1,11 +1,17 @@
 # Sainik Sahayak — operations runbook
 
 Day-2 operations. First-time install is in
-[`deploy/hosted/ORACLE.md`](deploy/hosted/ORACLE.md) (free tier, public domain) or
-[`deploy/hosted/HOSTED.md`](deploy/hosted/HOSTED.md) (any rented server), or
+[`deploy/hosted/ORACLE.md`](deploy/hosted/ORACLE.md) (free tier, public domain),
+[`deploy/hosted/HOSTED.md`](deploy/hosted/HOSTED.md) (any rented server),
+[`deploy/vercel/VERCEL.md`](deploy/vercel/VERCEL.md) (Vercel + hosted Supabase), or
 [`deploy/airgap/README.md`](deploy/airgap/README.md) /
 [`deploy/airgap/WINDOWS.md`](deploy/airgap/WINDOWS.md) for an offline install.
-This file is what you keep next to the running system — it applies to both.
+This file is what you keep next to the running system — it applies to all of them.
+
+> On the **Vercel** install the web app has no container: read its logs in the
+> Vercel dashboard rather than with `docker compose logs web`, and let Supabase
+> handle backups instead of the scripts below. The `rag` service commands still
+> apply, from `deploy/vercel/` with `-f docker-compose.rag.yml`.
 
 Throughout, `COMPOSE` is shorthand for the merged compose invocation you run from
 the Supabase docker directory:
@@ -75,17 +81,34 @@ SUPABASE_URL="$SUPABASE_PUBLIC_URL" SUPABASE_SERVICE_ROLE_KEY="<SERVICE_ROLE_KEY
 
 ## Documents
 
-Add or update the knowledge base by dropping PDFs in `KB_DIR` and ingesting at
-the right access tier (`1` = every jawan, higher = more restricted):
+The normal path is **Admin → Documents**: choose a PDF, pick the access tier
+(`1` = every jawan, higher = more restricted), and **Upload & ingest**. Scanned
+pages are OCR'd (Hindi + English) automatically. Duplicates are rejected by
+SHA-256, so re-uploading the same file is harmless.
+
+Processing runs in the background, so the row appears as **Processing** and
+becomes **Ready** with a page and chunk count on its own — the table refreshes
+while anything is in flight. A large scanned document can take several minutes;
+uploads are handled one at a time, so a batch simply queues.
+
+| Status | Meaning |
+|---|---|
+| Processing | Queued or mid-run. Normal for minutes on a big scan. |
+| Ready | Indexed and answerable at its tier. |
+| Failed | The reason is shown on the row. **Re-ingest** retries. |
+
+**Processing that never finishes** means the ingester died mid-job — check
+`$COMPOSE logs rag`, then use **Re-ingest**, or clear the orphan with the stale
+sweep below.
+
+For an initial bulk load, the CLI reads a host folder (`KB_DIR`) directly and is
+better suited to hundreds of files:
 
 ```bash
 $COMPOSE exec rag python cli.py ingest /kb --tier 2
-# re-ingest a changed file (dedup is by SHA-256):
+# re-ingest changed files (dedup is by SHA-256):
 $COMPOSE exec rag python cli.py ingest /kb --tier 2 --reindex
 ```
-
-You can also upload/re-ingest/delete from the Admin → Documents page. Scanned
-pages are OCR'd (Hindi + English) automatically.
 
 ---
 

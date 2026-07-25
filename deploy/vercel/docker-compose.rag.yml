@@ -1,0 +1,82 @@
+# Sainik Sahayak — standalone rag-service host.
+#
+# The companion to a Vercel frontend: Vercel runs the web app, Supabase holds
+# the database, storage and auth, and this one box does the work neither can —
+# PDF extraction, Hindi/English OCR, embeddings, and reranking. Those need
+# multi-gigabyte models resident in memory, which is not something a serverless
+# function can do.
+#
+# Unlike the air-gap and hosted compose files, this one is self-contained: there
+# is no Supabase stack alongside it, because Supabase is hosted. It talks to
+# Supabase over the network like any other client.
+#
+#   cd deploy/vercel
+#   cp .env.rag.example .env && $EDITOR .env
+#   docker compose -f docker-compose.rag.yml up -d --build
+#
+# Full walkthrough: deploy/vercel/VERCEL.md
+services:
+  rag:
+    build:
+      context: ../../services/rag
+    image: sainik/rag:local
+    restart: unless-stopped
+    volumes:
+      # Optional: a host folder of PDFs for the bulk loader, read-only.
+      #   docker compose exec rag python cli.py ingest /kb --tier 1
+      # Day-to-day uploads go through the admin console instead.
+      - ${KB_DIR:-./kb}:/kb:ro
+    environment:
+      RAG_SERVICE_SECRET: "${RAG_SERVICE_SECRET:?generate one with openssl rand -hex 32}"
+      # Supabase's Postgres connection string. Use the direct connection or the
+      # *session* pooler (port 5432) — not the transaction pooler on 6543:
+      # psycopg prepares statements automatically, which that mode rejects.
+      RAG_DATABASE_URL: ${RAG_DATABASE_URL:?copy from Supabase → Settings → Database}
+      # Downloading uploaded PDFs out of the private `kb` bucket.
+      RAG_SUPABASE_URL: ${SUPABASE_URL:?}
+      RAG_SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:?}
+      RAG_EMBEDDING_BACKEND: bge
+      RAG_RERANK_BACKEND: bge
+      RAG_TOKEN_BACKEND: auto
+      RAG_OCR_LANGUAGES: hin+eng
+      # One ingest at a time. Two concurrent scans would each want the models
+      # plus a decompressed page buffer, and the box would start swapping.
+      RAG_INGEST_CONCURRENCY: ${RAG_INGEST_CONCURRENCY:-1}
+      # Models are baked into the image; no model-hub egress at runtime.
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    # Not published to the host: Caddy reaches it on the internal network, so
+    # the only way in from outside is over HTTPS.
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      # Generous: the first check happens while ~5 GB of models load.
+      start_period: 300s
+      retries: 3
+
+  caddy:
+    # Pin the tag — an automatic major-version jump on the component that issues
+    # your certificates is not a surprise you want during an outage.
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    ports:
+      # 80 is required for the ACME HTTP challenge, not just the redirect.
+      - "80:80"
+      - "443:443"
+    environment:
+      RAG_DOMAIN: ${RAG_DOMAIN:?the hostname Vercel will call, e.g. rag.example.in}
+    volumes:
+      - ./Caddyfile.rag:/etc/caddy/Caddyfile:ro
+      # Certificates. Losing this volume re-issues on next start — harmless, but
+      # it counts against Let's Encrypt rate limits.
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - rag
+
+volumes:
+  caddy_data:
+  caddy_config:

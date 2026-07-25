@@ -14,7 +14,19 @@ supabase/migrations/   schema, RLS, hybrid_search, log_event        [Phase 0 ✓
 scripts/               seed-admin, test-rls, local db harness       [Phase 0 ✓]
 golden/                eval set (golden.jsonl)                      [Phase 7]
 docs/                  ARCHITECTURE.md · SECURITY.md · RUNBOOK.md
+deploy/                airgap · hosted (one server) · vercel        [install guides]
 ```
+
+## Install
+
+| You want | Guide |
+|---|---|
+| Free, everything on one box, public HTTPS | [`deploy/hosted/ORACLE.md`](deploy/hosted/ORACLE.md) |
+| Any rented server, public HTTPS | [`deploy/hosted/HOSTED.md`](deploy/hosted/HOSTED.md) |
+| Vercel frontend + hosted Supabase | [`deploy/vercel/VERCEL.md`](deploy/vercel/VERCEL.md) |
+| Offline / classified content | [`deploy/airgap/README.md`](deploy/airgap/README.md) |
+
+Running it day to day: [`RUNBOOK.md`](RUNBOOK.md).
 
 ## Phase 0 verification
 
