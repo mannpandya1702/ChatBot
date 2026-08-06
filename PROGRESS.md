@@ -4,7 +4,7 @@ Machine-maintained build ledger for `/loop`. See `CLAUDE.md` §7 for task defini
 
 Last run: 2026-08-06
 Target phase: 5
-Result: all tasks through Phase 5 implemented. 1576 automated tests pass, `ruff` and
+Result: all tasks through Phase 5 implemented. 1622 automated tests pass, `ruff` and
 `mypy --strict` are clean. M-8 and M-9 are resolved; the remaining 8 checks need the
 Windows host and are listed at the bottom.
 
@@ -74,7 +74,11 @@ cover.
       every collaborator injected, so the conversational core is tested end to end without
       hardware. Full spoken round trip needs a microphone, see M-3.
 
-**Phase 1 gate:** `NEEDS_MANUAL_VERIFY`, see M-3.
+**Phase 1 gate:** `NEEDS_MANUAL_VERIFY`, see M-3. Note: the gate question, "what time is it",
+had no tool that could answer it. Every other tool reports the machine, and a language model has
+no clock, so the model either declined or invented one, which §5 forbids outright. `tools/sys_time.py`
+now answers it, phrased for speech: midnight and midday name themselves rather than being called
+twelve, since the output is read aloud.
 
 ## Phase 2 - System monitoring
 

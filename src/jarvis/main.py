@@ -52,6 +52,7 @@ def _register_tools(config: JarvisConfig) -> int:
     from jarvis.tools.registry import registry
 
     modules = [
+        "jarvis.tools.sys_time",
         "jarvis.tools.sys_cpu",
         "jarvis.tools.sys_memory",
         "jarvis.tools.sys_disk",
