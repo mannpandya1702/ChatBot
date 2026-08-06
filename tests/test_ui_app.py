@@ -17,7 +17,8 @@ from pathlib import Path
 
 import pytest
 
-APP = Path(__file__).resolve().parents[1] / "src" / "jarvis" / "ui" / "app"
+ROOT = Path(__file__).resolve().parents[1]
+APP = ROOT / "src" / "jarvis" / "ui" / "app"
 JS_FILES = ["src/orb.js", "src/panels.js", "src/main.js", "vite.config.js"]
 
 
@@ -218,3 +219,87 @@ class TestReconnect:
     def test_disconnected_state_is_shown(self, source: str) -> None:
         """A frozen HUD showing stale data would be worse than an honest one."""
         assert "setConnected" in source
+
+
+class TestBundleIcons:
+    """T-3.2 / M-8: `npm run tauri build` fails outright without these.
+
+    They are checked structurally rather than just for existence, because a
+    malformed .ico fails deep inside the Windows bundler with an error that does
+    not name the file.
+    """
+
+    ICONS = APP / "src-tauri" / "icons"
+
+    def test_both_icons_are_present(self) -> None:
+        for name in ("icon.png", "icon.ico"):
+            path = self.ICONS / name
+            assert path.is_file(), f"{name} is missing, the bundle cannot be built"
+            assert path.stat().st_size > 0
+
+    def test_tauri_config_points_at_them(self) -> None:
+        conf = json.loads((APP / "src-tauri" / "tauri.conf.json").read_text(encoding="utf-8"))
+        for relative in conf["bundle"]["icon"]:
+            assert (APP / "src-tauri" / relative).is_file(), f"{relative} is referenced but absent"
+
+    def test_the_tray_icon_exists_too(self) -> None:
+        conf = json.loads((APP / "src-tauri" / "tauri.conf.json").read_text(encoding="utf-8"))
+        relative = conf["app"]["trayIcon"]["iconPath"]
+        assert (APP / "src-tauri" / relative).is_file()
+
+    def test_the_png_is_a_square_rgba_image(self) -> None:
+        import struct
+
+        data = (self.ICONS / "icon.png").read_bytes()
+        assert data[:8] == b"\x89PNG\r\n\x1a\n", "not a PNG"
+        assert data[12:16] == b"IHDR"
+        width, height = struct.unpack(">II", data[16:24])
+        depth, colour_type = data[24], data[25]
+        assert width == height >= 256, "Tauri wants a large square source icon"
+        assert depth == 8
+        assert colour_type == 6, "must be RGBA, the HUD icon is transparent"
+
+    def test_the_ico_is_structurally_valid(self) -> None:
+        """Every directory entry must point at bytes that are actually there."""
+        import struct
+
+        data = (self.ICONS / "icon.ico").read_bytes()
+        reserved, kind, count = struct.unpack("<HHH", data[:6])
+        assert reserved == 0
+        assert kind == 1, "type 1 is an icon, type 2 is a cursor"
+        assert count > 0
+
+        seen = []
+        for index in range(count):
+            offset = 6 + 16 * index
+            entry = struct.unpack("<BBBBHHII", data[offset : offset + 16])
+            width, _height, _colours, _pad, _planes, bpp, size, position = entry
+            assert size > 0
+            assert position + size <= len(data), "an entry runs past the end of the file"
+            assert bpp == 32
+            seen.append(width or 256)
+
+        assert 16 in seen, "no 16 pixel entry, the title bar icon would be a scaled blur"
+        assert 256 in seen, "no 256 pixel entry, large icon view would be a scaled blur"
+        assert len(seen) == len(set(seen)), "duplicate sizes in the directory"
+
+    def test_regenerating_is_deterministic(self, tmp_path: Path) -> None:
+        """The committed files must match what the script produces today.
+
+        Otherwise the script drifts from the artefacts and nobody notices until
+        someone regenerates and gets a different icon.
+        """
+        import sys
+
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "make_icons.py"), "--out", str(tmp_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+
+        for name in ("icon.png", "icon.ico"):
+            assert (tmp_path / name).read_bytes() == (self.ICONS / name).read_bytes(), (
+                f"{name} differs from what scripts/make_icons.py produces"
+            )

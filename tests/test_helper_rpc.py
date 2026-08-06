@@ -8,6 +8,7 @@ the three named, parameterless sensor reads get through?
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -296,3 +297,57 @@ class TestHelperEntrypoint:
         source = Path(lhm_module.__file__).read_text(encoding="utf-8")
         for forbidden in ("Install-WindowsUpdate", ".Install(", "AcceptEula", "Download()"):
             assert forbidden not in source, f"{forbidden} would install updates"
+
+
+class TestVendoredSensorLibrary:
+    """M-9: the DLL the elevated helper loads, and the script that fetches it.
+
+    The three have to agree on one path, one version, and one hash, or the
+    helper reports every sensor unavailable and nothing says why.
+    """
+
+    ROOT = Path(__file__).resolve().parents[1]
+    DLL = ROOT / "vendor" / "LibreHardwareMonitorLib.dll"
+
+    def test_the_dll_is_present(self) -> None:
+        assert self.DLL.is_file(), (
+            "vendor/LibreHardwareMonitorLib.dll is missing; "
+            "run scripts/fetch_vendor.ps1 on the Windows host"
+        )
+
+    def test_it_is_a_windows_binary(self) -> None:
+        """A stray text file or an HTML error page would fail silently later."""
+        head = self.DLL.read_bytes()[:2]
+        assert head == b"MZ", f"not a PE image, starts with {head!r}"
+
+    def test_the_helper_looks_where_the_file_actually_is(self) -> None:
+        """The loader path is a string literal, so nothing else checks it."""
+        source = (self.ROOT / "src" / "jarvis" / "helper" / "lhm.py").read_text(
+            encoding="utf-8"
+        )
+        assert '"vendor" / "LibreHardwareMonitorLib.dll"' in source
+
+    def test_the_recorded_hash_matches_the_committed_file(self) -> None:
+        import hashlib
+        import re
+
+        digest = hashlib.sha256(self.DLL.read_bytes()).hexdigest()
+        readme = (self.ROOT / "vendor" / "README.md").read_text(encoding="utf-8")
+        assert digest in readme.lower(), "vendor/README.md records a different hash"
+
+        script = (self.ROOT / "scripts" / "fetch_vendor.ps1").read_text(encoding="utf-8")
+        pinned = re.findall(r"'([0-9A-Fa-f]{64})'", script)
+        assert digest.upper() in [p.upper() for p in pinned], (
+            "scripts/fetch_vendor.ps1 pins a hash that is not the committed file"
+        )
+
+    def test_the_fetch_script_verifies_what_it_downloads(self) -> None:
+        """An unverified binary that an elevated process loads is not acceptable."""
+        script = (self.ROOT / "scripts" / "fetch_vendor.ps1").read_text(encoding="utf-8")
+        assert "Get-FileHash" in script
+        assert "Remove-Item $Target" in script, "a mismatched download must not be left on disk"
+
+    def test_the_licence_is_recorded(self) -> None:
+        """§1 permits MPL-2.0 specifically, so the file has to say so."""
+        readme = (self.ROOT / "vendor" / "README.md").read_text(encoding="utf-8")
+        assert "MPL-2.0" in readme
