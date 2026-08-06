@@ -397,6 +397,83 @@ function Test-OllamaModelPresent {
     return $false
 }
 
+function Get-FreeSpaceGb {
+    <#
+        .SYNOPSIS
+            Free gigabytes on the volume holding $Path, or $null if unknown.
+    #>
+    param([Parameter(Mandatory = $true)][string] $Path)
+
+    try {
+        $qualifier = Split-Path -Qualifier $Path
+        $drive = Get-PSDrive -Name $qualifier.TrimEnd(':') -ErrorAction Stop
+        if ($null -eq $drive.Free) { return $null }
+        return [double]$drive.Free / 1GB
+    } catch {
+        return $null
+    }
+}
+
+function Get-OllamaModelSizeGb {
+    <#
+        .SYNOPSIS
+            Rough on-disk size of a model, with headroom for the partial blob.
+
+        .DESCRIPTION
+            ollama writes a "-partial" file and then renames it, so the peak
+            requirement is the model size, not double it. The margin covers
+            the manifest and the difference between the tag's advertised size
+            and what it actually unpacks to.
+    #>
+    param([Parameter(Mandatory = $true)][string] $Model)
+
+    $sizes = @{
+        'qwen3:1.7b' = 2.0
+        'qwen3:4b'   = 3.5
+        'qwen3:8b'   = 6.5
+        'qwen3:14b'  = 10.0
+        'qwen3:32b'  = 21.0
+    }
+    foreach ($key in $sizes.Keys) {
+        if ($Model -like "$key*") { return $sizes[$key] }
+    }
+    return 4.0
+}
+
+function Write-OllamaStoreHint {
+    <#
+        .SYNOPSIS
+            Explain where ollama keeps models and how to move them elsewhere.
+    #>
+    Write-Hint "ollama keeps models under $env:USERPROFILE\.ollama, not under models\."
+    Write-Hint 'to move them to a drive with room, from an ordinary prompt:'
+    Write-Hint '  setx OLLAMA_MODELS <folder on the other drive>'
+    Write-Hint 'then restart ollama and re-run this script.'
+}
+
+function Test-OllamaDiskSpace {
+    <#
+        .SYNOPSIS
+            Whether there is room for $Model. Reports the shortfall if not.
+
+        .DESCRIPTION
+            Checked before the pull rather than after. A download that dies at
+            ninety percent has already cost the time, and ollama leaves the
+            partial blob behind eating the little space that was left.
+    #>
+    param([Parameter(Mandatory = $true)][string] $Model)
+
+    $needed = Get-OllamaModelSizeGb -Model $Model
+    $free = Get-FreeSpaceGb -Path $env:USERPROFILE
+    if ($null -eq $free -or $free -ge $needed) {
+        return $true
+    }
+
+    Write-Fail "$Model needs about $needed GB, $([math]::Round($free, 1)) GB is free."
+    Write-OllamaStoreHint
+    return $false
+}
+
 function Invoke-OllamaPull {
     <#
         .SYNOPSIS
@@ -425,11 +502,20 @@ function Invoke-OllamaPull {
         return
     }
 
+    if (-not (Test-OllamaDiskSpace -Model $Model)) {
+        $script:Failed.Add("$Label $Model")
+        return
+    }
+
     Write-Host "   ollama pull $Model"
     & ollama pull $Model
     if ($LASTEXITCODE -ne 0) {
-        Write-Fail "ollama pull $Model exited with code $LASTEXITCODE."
-        Write-Hint 'is the ollama service running? try: ollama serve'
+        Write-Fail "the pull of $Model exited with code $LASTEXITCODE."
+        Write-Hint 'ollama printed the reason above. The usual causes are:'
+        Write-Hint '  out of disk space, in which case move the model store'
+        Write-Hint '  the service is not running, try: ollama serve'
+        Write-Hint '  no route to the model registry, check your connection'
+        Write-OllamaStoreHint
         $script:Failed.Add("$Label $Model")
         return
     }
