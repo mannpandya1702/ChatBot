@@ -41,27 +41,87 @@ Everything is Apache-2.0, MIT, BSD, or MPL-2.0. Nothing here costs money or requ
 
 ## Install
 
-```powershell
-git clone <your-fork> jarvis
-cd jarvis
+Everything below runs on the Windows machine JARVIS will live on, in **Windows PowerShell**.
+Press Start, type `powershell`, and open it. A normal window, not "Run as administrator":
+the assistant runs unelevated by design (§6), and only the sensor helper ever asks for
+elevation, at the moment it needs it.
 
+### 1. Prerequisites
+
+Three tools, installed once. `winget` ships with Windows 11.
+
+```powershell
+winget install --id=Git.Git -e --source winget
+winget install --id=astral-sh.uv -e --source winget
+winget install --id=Ollama.Ollama -e --source winget
+```
+
+Close PowerShell and open it again, so the new commands are on your PATH.
+
+Only for the HUD, which is optional. The voice assistant is complete without it:
+
+```powershell
+winget install --id=Rustlang.Rustup -e --source winget
+winget install --id=OpenJS.NodeJS.LTS -e --source winget
+```
+
+You do not install Python. `uv` provisions the exact 3.12 this project pins, in its own
+store, without touching any Python you already have.
+
+### 2. Get the code
+
+```powershell
+cd ~
+git clone https://github.com/<you>/ChatBot.git jarvis
+cd jarvis
+```
+
+Every command from here on assumes you are in that `jarvis` directory. If a command
+reports that a script or file cannot be found, that is almost always why: run `pwd` and
+check.
+
+### 3. Set up
+
+PowerShell refuses to run downloaded scripts under its default policy, so the scripts are
+invoked explicitly rather than as `.\script.ps1`. This changes nothing outside the single
+command it is attached to.
+
+```powershell
 # Installs dependencies, creates config.yaml, and detects your hardware tier.
-.\scripts\setup_env.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\setup_env.ps1
 
 # Pulls the Ollama model and the wake word, VAD, and TTS weights for your tier.
-.\scripts\pull_models.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\pull_models.ps1
+```
 
-# Confirm everything is reachable before you start talking to it.
+Both are idempotent: run them as many times as you like, and a second run downloads
+nothing. If either reports a missing prerequisite, it prints the exact command that
+installs it.
+
+### 4. Check before you talk to it
+
+```powershell
 uv run python -m jarvis --check
 ```
 
-Then:
+This is the one to run whenever something is wrong. It reports every dependency, model,
+and service as present or missing, and names what to do about anything that is not. A
+healthy machine ends with `Ready`.
+
+### 5. Talk to it
 
 ```powershell
 uv run python -m jarvis
 ```
 
 Say "Hey Jarvis", wait for the orb to brighten, and ask your question.
+
+Start with `--headless` if the HUD is not built yet, or to rule the UI out while
+diagnosing anything:
+
+```powershell
+uv run python -m jarvis --headless
+```
 
 ### Try it without a microphone
 
