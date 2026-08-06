@@ -486,6 +486,11 @@ _SILENCE_PEAK = 0.002
 #: Peak below this is signal, but too quiet for the wake model to work with.
 _QUIET_PEAK = 0.02
 
+#: A wake score above this means the model recognised something, even if it did
+#: not commit. The noise floor sits near zero, so anything here is a near miss
+#: worth lowering the threshold for, not a failure to hear.
+_MODEL_RESPONDED = 0.08
+
 
 def _level_bar(peak: float, width: int = 30) -> str:
     """A crude meter, so a glance says more than a float does."""
@@ -586,13 +591,22 @@ def run_mic_test(config: JarvisConfig, seconds: float) -> int:
         print("Verdict: the wake word was detected. Audio and model are both fine.")  # noqa: T201
         return 0
 
-    if best_score >= config.wake.threshold * 0.5:
+    if best_score >= _MODEL_RESPONDED:
+        # Judged against the noise floor, not against the threshold. A score
+        # well clear of zero means the model heard the phrase and was merely
+        # unsure, which is a tuning problem rather than a broken microphone.
+        suggested = max(0.2, round(best_score * 0.8, 2))
         print("Verdict: audio is good and the wake word nearly triggered.")  # noqa: T201
-        print(f"  Lower wake.threshold toward {best_score:.2f} in config.yaml,")  # noqa: T201
-        print("  or say it a little more clearly. Do not go below about 0.3.")  # noqa: T201
+        print(f"  The model scored {best_score:.2f} against a floor near zero,")  # noqa: T201
+        print("  so it recognised the phrase but was not confident enough.")  # noqa: T201
+        print(f"  Set wake.threshold to about {suggested:.2f} in config.yaml,")  # noqa: T201
+        print("  then re-run this test. Raise it again if you get false triggers.")  # noqa: T201
+        print("  A different capture path can also help: the table above lists")  # noqa: T201
+        print("  the same microphone under several host APIs, and WASAPI")  # noqa: T201
+        print("  resamples better than MME. Set audio.input_device to its index.")  # noqa: T201
         return 1
 
-    print("Verdict: audio is good but the wake word did not register.")  # noqa: T201
+    print("Verdict: audio is good but the wake word did not register at all.")  # noqa: T201
     print("  Say 'hey jarvis' as one phrase, at a normal speaking pace.")  # noqa: T201
     print("  If it still will not score, the microphone may be picking up mostly noise.")  # noqa: T201
     return 1

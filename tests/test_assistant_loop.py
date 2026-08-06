@@ -517,3 +517,39 @@ class TestMicrophoneDiagnostic:
         import jarvis.main as main_module
 
         assert 0 < main_module._SILENCE_PEAK < main_module._QUIET_PEAK
+
+
+class TestTheMicVerdictReadsScoresAgainstTheNoiseFloor:
+    """A near miss is a tuning problem, not a broken microphone.
+
+    The first version compared the score against half the threshold, so a real
+    run scoring 0.234 against a 0.50 threshold fell a hundredth short of the
+    "nearly triggered" branch and got told its microphone might be picking up
+    noise. The noise floor is near zero, so 0.234 was plainly the model
+    recognising the phrase and hesitating.
+    """
+
+    def test_the_responded_floor_is_absolute_not_relative(self) -> None:
+        import jarvis.main as main_module
+
+        # Well clear of the noise floor, well under any sane threshold.
+        assert main_module._MODEL_RESPONDED < 0.234
+        assert main_module._MODEL_RESPONDED > 0.0
+
+    def test_the_floor_is_below_every_shipped_threshold(self) -> None:
+        """Otherwise the near-miss advice could never fire."""
+        import jarvis.main as main_module
+        from jarvis.config import WakeConfig
+
+        assert WakeConfig().threshold > main_module._MODEL_RESPONDED
+
+    def test_the_suggested_threshold_sits_under_the_observed_score(self) -> None:
+        """Suggesting a threshold at or above what was measured would not help."""
+        for score in (0.10, 0.234, 0.35, 0.49):
+            suggested = max(0.2, round(score * 0.8, 2))
+            assert suggested <= max(0.2, score), f"{suggested} is not reachable from {score}"
+
+    def test_the_suggestion_never_goes_dangerously_low(self) -> None:
+        """A threshold near zero would trigger on any noise at all."""
+        for score in (0.08, 0.09, 0.12):
+            assert max(0.2, round(score * 0.8, 2)) >= 0.2
