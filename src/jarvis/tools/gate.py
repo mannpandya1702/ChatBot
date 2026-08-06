@@ -118,6 +118,9 @@ class ConfirmationRequest:
     prompt: str
     created_at: float
     expires_at: float
+    #: Enforcement deadline on the monotonic clock. A wall clock can step
+    #: backwards, which would silently stretch the §6 window.
+    deadline: float = 0.0
     resolved: bool = False
     outcome: ConfirmationOutcome | None = None
     transcript: str | None = None
@@ -137,43 +140,103 @@ def _phrase_pattern(phrases: list[str]) -> re.Pattern[str]:
     return re.compile(rf"(?<!\w)(?:{alternation})(?!\w)")
 
 
+#: Contractions, written without the apostrophe that normalisation strips.
+#: Expanded rather than matched directly so a single "not" check catches them all.
+_CONTRACTIONS = {
+    "dont": "do not",
+    "doesnt": "does not",
+    "didnt": "did not",
+    "cant": "can not",
+    "cannot": "can not",
+    "couldnt": "could not",
+    "wont": "will not",
+    "wouldnt": "would not",
+    "shouldnt": "should not",
+    "shant": "shall not",
+    "isnt": "is not",
+    "arent": "are not",
+    "wasnt": "was not",
+    "werent": "were not",
+    "aint": "is not",
+    "havent": "have not",
+    "hasnt": "has not",
+}
+
+#: Any of these makes the reply a refusal, whatever else it contains.
+#:
+#: This is the heart of §6. A gate that scans free text for an affirmative
+#: substring reads "you can't do it" as a yes, because it contains "do it".
+#: Negation is therefore decided first and decided broadly: for a control whose
+#: whole job is to stop an unwanted action, a false refusal costs the user one
+#: repeat, and a false acceptance costs them the action itself.
+_NEGATION_WORDS = frozenset(
+    {
+        "not", "never", "nah", "nope", "no", "cancel", "cancelled", "stop",
+        "abort", "aborted", "negative", "nevermind", "forget", "hold", "wait",
+        "rather", "instead", "later", "dont", "leave", "skip", "undo", "quit",
+    }
+)
+
+
+def _normalise_utterance(utterance: str) -> str:
+    """Lowercase, drop apostrophes and punctuation, expand negative contractions."""
+    text = (utterance or "").strip().lower()
+    if not text:
+        return ""
+    text = text.replace("'", "").replace("\u2019", "")
+    text = re.sub(r"[^\w\s]", " ", text)
+    words = [_CONTRACTIONS.get(word, word) for word in text.split()]
+    return " ".join(" ".join(words).split())
+
+
 def classify_response(
     utterance: str,
     config: JarvisConfig,
 ) -> ConfirmationOutcome:
     """Interpret the user's spoken reply to a confirmation prompt.
 
-    Negatives are checked first on purpose. "no, do not do it" contains the
-    affirmative phrase "do it", and the safe reading of a reply containing both
-    is refusal.
+    Negation is checked first and checked broadly, because an affirmative
+    substring search on free text is wrong in the dangerous direction: "you
+    can't do it" and "I'd rather you didn't" both contain no explicit no, and
+    the first even contains the affirmative phrase "do it".
+
+    §6 asks for an *explicit* affirmative. Anything else, including a reply that
+    merely fails to object, is not one.
 
     Args:
         utterance: What speech recognition produced.
         config: Supplies the affirmative and negative phrase lists.
 
     Returns:
-        The outcome. Anything not clearly affirmative is not a yes.
+        The outcome. Only a clean, unnegated affirmative is a yes.
     """
-    text = (utterance or "").strip().lower()
+    text = _normalise_utterance(utterance)
     if not text:
         return ConfirmationOutcome.UNCLEAR
 
-    # Normalise punctuation and contractions so "don't" matches "do not".
-    text = text.replace("'", "").replace("\u2019", "")  # ASCII and typographic
-    text = re.sub(r"\bdont\b", "do not", text)
-    text = re.sub(r"\b(cant|cannot)\b", "can not", text)
-    text = re.sub(r"[^\w\s]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-
-    negatives = list(config.gate.negatives)
-    # Explicit refusal forms that are not single words.
-    negatives.extend(["do not", "dont", "not now", "forget it", "hold off", "wait"])
-
-    if _phrase_pattern(negatives).search(text):
+    words = set(text.split())
+    if words & _NEGATION_WORDS:
         return ConfirmationOutcome.NEGATIVE
+    if _phrase_pattern(list(config.gate.negatives)).search(text):
+        return ConfirmationOutcome.NEGATIVE
+
     if _phrase_pattern(list(config.gate.affirmatives)).search(text):
         return ConfirmationOutcome.AFFIRMATIVE
     return ConfirmationOutcome.UNCLEAR
+
+
+#: Tools with bespoke phrasing above. Anything else falls to the generic branch,
+#: which already names every argument.
+_PHRASED_TOOLS = frozenset(
+    {
+        "apps.launch",
+        "apps.focus",
+        "media.control",
+        "reminders.create",
+        "reminders.delete",
+        "shell.run",
+    }
+)
 
 
 def describe_action(tool: str, arguments: dict[str, Any], config: JarvisConfig) -> str:
@@ -185,7 +248,7 @@ def describe_action(tool: str, arguments: dict[str, Any], config: JarvisConfig) 
     address = config.persona.user_address_form.strip()
     suffix = f", {address}" if address else ""
 
-    detail = ", ".join(f"{key} {value}" for key, value in sorted(arguments.items()) if value != "")
+    detail = ", ".join(f"{key} {value}" for key, value in sorted(arguments.items()))
     match tool:
         case "apps.launch":
             what = f"launch {arguments.get('name', 'that application')}"
@@ -201,7 +264,22 @@ def describe_action(tool: str, arguments: dict[str, Any], config: JarvisConfig) 
             what = f"run the command {arguments.get('command', '')}"
         case _:
             what = f"run {tool}" + (f" with {detail}" if detail else "")
-    return f"You want me to {what}{suffix}. Shall I go ahead?"
+
+    # Anything the bespoke phrasing above did not name is appended, because the
+    # user has to hear everything that changes what the call actually does. A
+    # working directory or a repeat count is not something they can infer.
+    named = {"name", "action", "when", "reminder_id", "command"}
+    extra = ", ".join(
+        f"{key.replace('_', ' ')} {value}"
+        for key, value in sorted(arguments.items())
+        if key not in named and value not in (None, "")
+    )
+    if extra and tool in _PHRASED_TOOLS:
+        what = f"{what}, with {extra}"
+
+    # Deliberately not "go ahead" or "proceed": both are affirmative phrases,
+    # so a microphone that picks up the assistant's own prompt would answer it.
+    return f"You want me to {what}{suffix}. Shall I?"
 
 
 class ConfirmationGate:
@@ -214,10 +292,16 @@ class ConfirmationGate:
         registry: ToolRegistry | None = None,
         audit_path: Path | None = None,
         clock: Callable[[], float] = time.time,
+        monotonic: Callable[[], float] | None = None,
     ) -> None:
         self._config = config
         self._registry = default_registry if registry is None else registry
         self._clock = clock
+        # Tests that drive `clock` want the deadline to move with it, so the
+        # monotonic source defaults to the injected clock when one is given.
+        self._monotonic_source = monotonic or (
+            time.monotonic if clock is time.time else clock
+        )
         self._lock = threading.RLock()
         self._pending: dict[str, ConfirmationRequest] = {}
         # Single-use execution grants, issued only by an affirmative resolve().
@@ -285,16 +369,19 @@ class ConfirmationGate:
     def _open(self, tool: str, arguments: dict[str, Any]) -> ConfirmationRequest:
         """Create a pending confirmation and start its clock."""
         now = self._clock()
+        window = self._config.gate.confirmation_timeout_s
         request = ConfirmationRequest(
             token=uuid.uuid4().hex[:16],
             tool=tool,
             arguments=dict(arguments),
             prompt=describe_action(tool, arguments, self._config),
             created_at=now,
-            expires_at=now + self._config.gate.confirmation_timeout_s,
+            expires_at=now + window,
+            deadline=self._monotonic_source() + window,
         )
         with self._lock:
-            self._expire_locked(now)
+            self._expire_locked(self._monotonic_source())
+            self._sweep_grants_locked()
             self._pending[request.token] = request
         self._audit(
             event="confirmation_requested",
@@ -308,14 +395,26 @@ class ConfirmationGate:
 
     # -- resolution --------------------------------------------------------
 
+    def _sweep_grants_locked(self) -> None:
+        """Drop expired grants. Caller holds the lock.
+
+        Without this a long-running session accumulates one dead grant per
+        confirmed action forever.
+        """
+        now = self._monotonic_source()
+        stale = [tok for tok, grant in self._grants.items() if now > float(grant["deadline"])]
+        for token in stale:
+            self._grants.pop(token, None)
+
     def resolve(self, token: str, utterance: str) -> ConfirmationOutcome:
         """Apply the user's spoken reply to a pending confirmation.
 
         An unknown, already-resolved, or expired token yields ``TIMEOUT``, which
         is a denial. There is no path here that turns a stale token into a yes.
         """
-        now = self._clock()
+        now = self._monotonic_source()
         with self._lock:
+            self._sweep_grants_locked()
             request = self._pending.get(token)
             if request is None or request.resolved:
                 self._audit(
@@ -327,7 +426,7 @@ class ConfirmationGate:
                     token=token,
                 )
                 return ConfirmationOutcome.TIMEOUT
-            if now >= request.expires_at:
+            if now >= request.deadline:
                 request.resolved = True
                 request.outcome = ConfirmationOutcome.TIMEOUT
                 self._pending.pop(token, None)
@@ -353,7 +452,7 @@ class ConfirmationGate:
                 self._grants[token] = {
                     "tool": request.tool,
                     "arguments": dict(request.arguments),
-                    "expires_at": now + _GRANT_TTL_S,
+                    "deadline": now + _GRANT_TTL_S,
                 }
 
         self._audit(
@@ -374,6 +473,10 @@ class ConfirmationGate:
             if request is not None:
                 request.resolved = True
                 request.outcome = ConfirmationOutcome.TIMEOUT
+            # Revoking the grant is the point. Reporting a timeout while
+            # leaving an already-issued grant usable would let the very next
+            # dispatch run the tool the caller just cancelled.
+            self._grants.pop(token, None)
         if request is not None:
             self._audit(
                 event="confirmation_timeout",
@@ -386,16 +489,31 @@ class ConfirmationGate:
         return ConfirmationOutcome.TIMEOUT
 
     def _expire_locked(self, now: float) -> None:
-        """Drop pending requests whose window has closed. Caller holds the lock."""
-        stale = [tok for tok, req in self._pending.items() if now >= req.expires_at]
+        """Drop pending requests whose window has closed. Caller holds the lock.
+
+        Each sweep writes a terminal audit record, so a confirmation that simply
+        timed out is not silently absent from the log.
+        """
+        stale = [tok for tok, req in self._pending.items() if now >= req.deadline]
         for token in stale:
-            self._pending.pop(token, None)
+            request = self._pending.pop(token, None)
+            self._grants.pop(token, None)
+            if request is not None:
+                self._audit(
+                    event="confirmation_timeout",
+                    tool=request.tool,
+                    arguments=request.arguments,
+                    reason="the confirmation window closed with no reply",
+                    confirmed=False,
+                    token=token,
+                )
 
     @property
     def pending_count(self) -> int:
         """How many confirmations are currently awaiting a reply."""
         with self._lock:
-            self._expire_locked(self._clock())
+            self._expire_locked(self._monotonic_source())
+            self._sweep_grants_locked()
             return len(self._pending)
 
     def is_pending(self, token: str) -> bool:
@@ -404,7 +522,7 @@ class ConfirmationGate:
             request = self._pending.get(token)
             if request is None or request.resolved:
                 return False
-            return self._clock() < request.expires_at
+            return self._monotonic_source() < request.deadline
 
     # -- execution ---------------------------------------------------------
 
@@ -436,25 +554,28 @@ class ConfirmationGate:
                     error="confirmation token is not valid for this call",
                     speakable="I could not confirm that, so I have not done it.",
                 )
+            result = self._registry.dispatch(tool, arguments, confirmed=True)
+            # Audited after the fact with the real outcome. Logging "executed"
+            # before dispatch recorded runs that never happened.
             self._audit(
-                event="executed",
+                event="executed" if result.ok else "execution_failed",
                 tool=tool,
                 arguments=arguments,
-                reason="confirmed by user",
+                reason="confirmed by user" if result.ok else (result.error or "failed"),
                 confirmed=True,
                 token=confirmation_token,
             )
-            return self._registry.dispatch(tool, arguments, confirmed=True)
+            return result
 
-        result = self.check(tool, arguments)
-        if result.decision is GateDecision.CONFIRMATION_REQUIRED:
-            assert result.confirmation is not None
-            return result.confirmation
-        if result.decision is GateDecision.DENIED:
+        verdict = self.check(tool, arguments)
+        if verdict.decision is GateDecision.CONFIRMATION_REQUIRED:
+            assert verdict.confirmation is not None
+            return verdict.confirmation
+        if verdict.decision is GateDecision.DENIED:
             return ToolResult(
                 tool=tool,
                 ok=False,
-                error=f"refused: {result.reason}",
+                error=f"refused: {verdict.reason}",
                 speakable="I am not permitted to do that.",
             )
         return self._registry.dispatch(tool, arguments, confirmed=False)
@@ -475,7 +596,7 @@ class ConfirmationGate:
                 extra={"context": {"tool": tool, "granted_for": grant["tool"]}},
             )
             return False
-        if self._clock() > float(grant["expires_at"]):
+        if self._monotonic_source() > float(grant["deadline"]):
             _log.warning("confirmation grant expired", extra={"context": {"tool": tool}})
             return False
         return True

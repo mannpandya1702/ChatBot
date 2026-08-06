@@ -321,6 +321,21 @@ class Orchestrator:
         if speak is not None:
             self._emit_speech(pending.prompt, speak, TurnLatency())
 
+        # A user talking over the confirmation prompt is interrupting, not
+        # answering. Treating their speech as the reply would let a barge-in
+        # authorise the very action they cut in to stop.
+        if self._interrupt.is_set():
+            self._gate.expire(pending.token)
+            self.bus.emit(
+                EventType.CONFIRMATION_RESOLVED, tool=pending.tool, outcome="interrupted"
+            )
+            return ToolResult(
+                tool=pending.tool,
+                ok=False,
+                error="the user interrupted before confirming",
+                speakable="I have not done that.",
+            )
+
         answer = ""
         if self._listen is not None:
             self.state.set(AssistantState.LISTENING)
@@ -329,6 +344,18 @@ class Orchestrator:
             except Exception:  # noqa: BLE001 - a listen failure is a denial
                 _log.exception("listening for a confirmation failed")
                 answer = ""
+
+        if self._interrupt.is_set():
+            self._gate.expire(pending.token)
+            self.bus.emit(
+                EventType.CONFIRMATION_RESOLVED, tool=pending.tool, outcome="interrupted"
+            )
+            return ToolResult(
+                tool=pending.tool,
+                ok=False,
+                error="the user interrupted during confirmation",
+                speakable="I have not done that.",
+            )
 
         outcome = self._gate.resolve(pending.token, answer)
         self.bus.emit(

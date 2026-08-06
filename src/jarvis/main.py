@@ -270,8 +270,16 @@ class Assistant:
         return ""
 
     def _listen_for_confirmation(self, timeout_s: float) -> str:
-        """Collect a spoken yes or no. Silence returns empty, which is a no."""
-        self._player.wait(timeout=2.0)
+        """Collect a spoken yes or no. Silence returns empty, which is a no.
+
+        Waits for the prompt to finish playing first. Opening the microphone
+        while the assistant is still speaking risks transcribing its own prompt
+        and treating that as the answer.
+        """
+        deadline = time.monotonic() + max(2.0, self._player.queued_seconds + 1.0)
+        while self._player.is_playing and time.monotonic() < deadline:
+            if not self._player.wait(timeout=0.25):
+                continue
         return self._listen(timeout_s)
 
     def _speak(self, text: str) -> None:
