@@ -236,6 +236,13 @@ class StreamingPlayer:
                 self._offset += take
                 filled += take
 
+            # Release a chunk the moment it is exhausted rather than on the
+            # next callback. Otherwise is_playing reports True, and wait()
+            # blocks, when there is nothing left to play.
+            if self._current is not None and self._offset >= self._current.size:
+                self._current = None
+                self._offset = 0
+
             if self._current is None and not self._queue:
                 self._drained.set()
 
