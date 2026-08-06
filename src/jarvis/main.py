@@ -288,6 +288,15 @@ class Assistant:
             if endpoint is None:
                 continue
 
+            _log.info(
+                "utterance endpointed",
+                extra={
+                    "context": {
+                        "seconds": round(endpoint.audio.size / self.config.audio.sample_rate, 2),
+                        **self._endpointer_state(),
+                    }
+                },
+            )
             try:
                 transcript = self._transcriber.transcribe(
                     endpoint.audio, self.config.audio.sample_rate
@@ -296,8 +305,52 @@ class Assistant:
                 _log.warning("transcription failed: %s", exc.message)
                 self.bus.emit(EventType.ERROR, message=exc.message, speakable=exc.speakable)
                 return ""
-            return str(transcript.text).strip()
+            text = str(transcript.text).strip()
+            if not text:
+                # Endpointed but nothing came back. Worth a line: from outside
+                # it is indistinguishable from never having heard anything.
+                _log.info("the transcriber returned nothing for that utterance")
+            else:
+                _log.info("heard", extra={"context": {"text": text}})
+            return text
+
+        # Timed out. Silence here is the worst outcome to debug, because the
+        # user spoke, nothing happened, and nothing said why. Report what the
+        # endpointer actually saw so the next step is obvious: no speech at all
+        # points at the microphone or the VAD threshold, speech that never
+        # ended points at trailing_silence_ms.
+        _log.info(
+            "heard no complete utterance before the listen window closed",
+            extra={
+                "context": {
+                    "timeout_s": timeout_s,
+                    "vad_threshold": self.config.vad.threshold,
+                    **self._endpointer_state(),
+                }
+            },
+        )
         return ""
+
+    def _endpointer_state(self) -> dict[str, Any]:
+        """What the endpointer saw, for a log line. Never raises.
+
+        Read defensively on purpose. This exists only to explain a turn, and a
+        diagnostic that can throw would lose the very utterance it is there to
+        describe. Anything the endpointer does not expose is simply omitted.
+        """
+        fields: dict[str, Any] = {}
+        for name in ("state", "speech_ms", "silence_ms", "frames_processed"):
+            try:
+                value = getattr(self._endpointer, name, None)
+            except Exception:  # noqa: BLE001, S112 - see the docstring
+                # Deliberately not logged. This runs while assembling a log
+                # line, so reporting the failure here risks recursing into the
+                # same problem for a field that is only ever diagnostic.
+                continue
+            if value is None:
+                continue
+            fields[name] = round(value) if isinstance(value, float) else str(value)
+        return fields
 
     def _listen_for_confirmation(self, timeout_s: float) -> str:
         """Collect a spoken yes or no. Silence returns empty, which is a no.
@@ -536,7 +589,8 @@ def run_mic_test(config: JarvisConfig, seconds: float) -> int:
 
     from jarvis.audio.devices import describe_devices
     from jarvis.audio.ring import AudioCapture
-    from jarvis.audio.wake import WakeWordDetector, float_to_int16  # noqa: F401
+    from jarvis.audio.vad import SileroVad
+    from jarvis.audio.wake import WakeWordDetector
 
     print(describe_devices())  # noqa: T201
     print()  # noqa: T201
@@ -545,9 +599,14 @@ def run_mic_test(config: JarvisConfig, seconds: float) -> int:
     frame_samples = max(1, int(config.wake.frame_samples))
     rate = config.audio.sample_rate
     detector = WakeWordDetector(config)
+    # The endpointer is the stage after the wake word, and it fails the same
+    # silent way: it either never confirms speech or never sees it end.
+    vad = SileroVad(config)
+    vad_frame = max(1, int(config.vad.frame_samples))
 
     collected: list[Any] = []
     best_score = 0.0
+    best_speech = 0.0
     peak = 0.0
 
     try:
@@ -592,11 +651,37 @@ def run_mic_test(config: JarvisConfig, seconds: float) -> int:
 
     audio = np.concatenate(collected)
     rms = float(np.sqrt(np.mean(np.square(audio))))
+
+    # Score the same audio through the endpointer's own model, in its frame
+    # size rather than the wake word's.
+    for start in range(0, audio.size - vad_frame + 1, vad_frame):
+        try:
+            best_speech = max(best_speech, float(vad.probability(audio[start : start + vad_frame])))
+        except JarvisError:
+            best_speech = -1.0
+            break
+
     print(f"\ncaptured   {audio.size / rate:.1f}s at {rate} Hz")  # noqa: T201
     print(f"peak       {peak:.4f}")  # noqa: T201
     print(f"rms        {rms:.4f}")  # noqa: T201
     print(f"wake score {best_score:.3f}  (threshold {config.wake.threshold:.2f})")  # noqa: T201
+    if best_speech >= 0.0:
+        print(  # noqa: T201
+            f"speech     {best_speech:.3f}  (vad threshold {config.vad.threshold:.2f})"
+        )
+    else:
+        print("speech     unavailable, the VAD model would not load")  # noqa: T201
     print()  # noqa: T201
+
+    if 0.0 <= best_speech < config.vad.threshold:
+        # The wake word can fire and the turn still go nowhere, silently,
+        # because the endpointer never confirms speech.
+        print("Note: the wake word may trigger, but the endpointer will not.")  # noqa: T201
+        print(f"  Speech peaked at {best_speech:.2f}, under the {config.vad.threshold:.2f}")  # noqa: T201
+        print("  threshold, so no utterance is ever completed and the turn ends")  # noqa: T201
+        print("  in silence with nothing to transcribe.")  # noqa: T201
+        print(f"  Lower vad.threshold toward {max(0.2, best_speech * 0.8):.2f}.")  # noqa: T201
+        print()  # noqa: T201
 
     if peak < _SILENCE_PEAK:
         print("Verdict: silence. Nothing is reaching the process.")  # noqa: T201

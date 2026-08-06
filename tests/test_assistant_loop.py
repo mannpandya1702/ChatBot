@@ -553,3 +553,144 @@ class TestTheMicVerdictReadsScoresAgainstTheNoiseFloor:
         """A threshold near zero would trigger on any noise at all."""
         for score in (0.08, 0.09, 0.12):
             assert max(0.2, round(score * 0.8, 2)) >= 0.2
+
+class _SilentEndpointer:
+    """Never confirms speech, which is the case that produced total silence."""
+
+    def __init__(self) -> None:
+        self.frames_processed = 0
+
+    def reset(self) -> None:
+        self.frames_processed = 0
+
+    def process(self, _frame: Any) -> Any:
+        self.frames_processed += 1
+        return None
+
+    @property
+    def state(self) -> Any:
+        from jarvis.audio.vad import SpeechState
+
+        return SpeechState.SILENCE
+
+    @property
+    def speech_ms(self) -> float:
+        return 0.0
+
+    @property
+    def silence_ms(self) -> float:
+        return float(self.frames_processed * 32)
+
+@contextlib.contextmanager
+def _capture_jarvis_logs(caplog: pytest.LogCaptureFixture) -> Any:
+    """Collect records from the jarvis logger.
+
+    ``setup_logging`` sets ``propagate = False`` on the jarvis logger so the
+    application controls its own handlers, which means caplog's root handler
+    never sees anything. Attaching directly works either way, and does not
+    depend on whether another test has configured logging first.
+    """
+    import logging
+
+    logger = logging.getLogger("jarvis.main")
+    previous = logger.level
+    logger.addHandler(caplog.handler)
+    logger.setLevel(logging.INFO)
+    try:
+        yield
+    finally:
+        logger.removeHandler(caplog.handler)
+        logger.setLevel(previous)
+
+
+class TestTheListenPathSaysWhatHappened:
+    """A turn that hears nothing must not leave the log silent too.
+
+    A real run detected the wake word, loaded the VAD, then printed nothing at
+    all until the next wake detection twenty seconds later. From outside there
+    was no way to tell whether speech was heard, whether it endpointed,
+    whether transcription ran, or what came back.
+    """
+
+    def test_a_timed_out_listen_reports_what_the_endpointer_saw(
+        self, config: JarvisConfig, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from jarvis.audio.vad import SpeechState
+
+        assistant = Assistant(config, headless=True)
+        _wire(assistant, config, ["unused"])
+        assistant.supervisor.add("turn-loop", lambda: None)
+        assistant._endpointer = _SilentEndpointer()
+
+        with _capture_jarvis_logs(caplog):
+            assert assistant._listen(timeout_s=0.1) == ""
+
+        record = next(
+            (r for r in caplog.records if "no complete utterance" in r.getMessage()), None
+        )
+        assert record is not None, "a listen that heard nothing logged nothing"
+        context = getattr(record, "context", {})
+        for key in ("state", "speech_ms", "silence_ms", "vad_threshold", "timeout_s"):
+            assert key in context, f"the timeout line does not report {key}"
+        assert context["state"] == str(SpeechState.SILENCE)
+
+    def test_the_threshold_that_matters_is_named(
+        self, config: JarvisConfig, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Naming the threshold is what turns the line into a next step."""
+        assistant = Assistant(config, headless=True)
+        _wire(assistant, config, ["unused"])
+        assistant.supervisor.add("turn-loop", lambda: None)
+        assistant._endpointer = _SilentEndpointer()
+
+        with _capture_jarvis_logs(caplog):
+            assistant._listen(timeout_s=0.1)
+
+        record = next(r for r in caplog.records if "no complete utterance" in r.getMessage())
+        assert record.context["vad_threshold"] == config.vad.threshold
+
+    def test_a_diagnostic_that_raises_does_not_lose_the_utterance(
+        self, config: JarvisConfig
+    ) -> None:
+        """The log line exists to explain a turn, not to be able to end one."""
+
+        class Exploding(_SilentEndpointer):
+            @property
+            def state(self) -> Any:
+                raise RuntimeError("this property is broken")
+
+            @property
+            def speech_ms(self) -> float:
+                raise RuntimeError("so is this one")
+
+        assistant = Assistant(config, headless=True)
+        _wire(assistant, config, ["unused"])
+        assistant.supervisor.add("turn-loop", lambda: None)
+        assistant._endpointer = Exploding()
+
+        # Must return normally rather than propagating out of the turn loop.
+        assert assistant._listen(timeout_s=0.05) == ""
+        # The broken properties are omitted rather than raising.
+        state = assistant._endpointer_state()
+        assert "state" not in state
+        assert "speech_ms" not in state
+
+    def test_the_happy_path_reports_what_it_heard(
+        self, config: JarvisConfig, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        assistant = Assistant(config, headless=True)
+        _wire(assistant, config, ["how busy is the cpu"])
+
+        answered = threading.Event()
+        assistant.bus.subscribe(lambda _e: answered.set(), [EventType.RESPONSE])
+
+        try:
+            with _capture_jarvis_logs(caplog):
+                assistant.start()
+                assert answered.wait(15), "no response was produced"
+        finally:
+            assistant.stop()
+
+        messages = " ".join(r.getMessage() for r in caplog.records)
+        assert "utterance endpointed" in messages
+        assert "heard" in messages
