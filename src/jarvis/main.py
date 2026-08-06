@@ -288,12 +288,14 @@ class Assistant:
             if endpoint is None:
                 continue
 
+            # Only the length. The endpointer zeroes its counters as it emits,
+            # so speech_ms and silence_ms read 0 here and would be worse than
+            # saying nothing. audio.vad logs the reason and the decision time.
             _log.info(
                 "utterance endpointed",
                 extra={
                     "context": {
                         "seconds": round(endpoint.audio.size / self.config.audio.sample_rate, 2),
-                        **self._endpointer_state(),
                     }
                 },
             )

@@ -628,3 +628,38 @@ class TestTheDownloaderAndTheLoadersAgree:
                 f"the feature extractors are downloaded into models\\{directory}, "
                 f"but only {sorted(features)} were found"
             )
+
+
+class TestTheTranscriptionModelIsPreFetched:
+    """Whisper weights are the largest thing that downloads on first use.
+
+    A real first run endpointed an utterance and then stalled on a several
+    hundred megabyte fetch from the HF Hub, with no progress shown, which
+    reads as a hang rather than a download.
+    """
+
+    def test_the_pull_script_fetches_it(self) -> None:
+        text = _read(PULL)
+        assert "fetch_stt_model.py" in text, "the STT model is never pre-fetched"
+
+    def test_the_fetch_script_exists_and_is_not_a_stub(self) -> None:
+        script = ROOT / "scripts" / "fetch_stt_model.py"
+        assert script.is_file()
+        assert len(script.read_text(encoding="utf-8")) > 1000
+
+    def test_the_tier_logic_is_not_duplicated_in_powershell(self) -> None:
+        """Which model to fetch must come from config, not a second copy."""
+        fetch = (ROOT / "scripts" / "fetch_stt_model.py").read_text(encoding="utf-8")
+        assert "stt_settings" in fetch, "the fetch script does not ask the config"
+
+        text = _read(PULL)
+        for model in ("small.en", "base.en", "distil-large-v3"):
+            assert model not in text, (
+                f"pull_models.ps1 names {model} directly, which duplicates the tier table"
+            )
+
+    def test_both_engines_are_handled(self) -> None:
+        """The cpu tier may resolve to either, depending on the GPU."""
+        fetch = (ROOT / "scripts" / "fetch_stt_model.py").read_text(encoding="utf-8")
+        assert "faster_whisper" in fetch
+        assert "pywhispercpp" in fetch

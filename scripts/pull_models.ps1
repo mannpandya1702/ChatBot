@@ -8,7 +8,8 @@
       2. the openWakeWord hey_jarvis model plus its shared feature extractors,
       3. the Silero VAD ONNX graph,
       4. the Kokoro-82M weights, config, and the bm_george voice,
-      5. the spaCy English model Kokoro's phonemiser downloads on first use.
+      5. the Whisper checkpoint the resolved tier transcribes with,
+      6. the spaCy English model Kokoro's phonemiser downloads on first use.
 
     Every item is guarded by an existence check, so the script is idempotent:
     a second run downloads nothing and reports each item as already present.
@@ -523,6 +524,34 @@ function Invoke-OllamaPull {
     $script:Downloaded.Add("$Label $Model")
 }
 
+function Install-SttModel {
+    <#
+    .SYNOPSIS
+        Pre-fetch the transcription model the resolved tier will use.
+
+    .DESCRIPTION
+        Whisper weights download on first use otherwise, which drops several
+        hundred megabytes into the middle of the first sentence anyone speaks:
+        the wake word fires, the utterance endpoints, and then nothing happens
+        for minutes with no progress shown. Which model to fetch is decided by
+        scripts/fetch_stt_model.py from the same config the runtime reads, so
+        the tier logic is not duplicated here.
+    #>
+    $Label = 'transcription model'
+
+    Write-Host "   uv run python scripts\fetch_stt_model.py"
+    & uv run python (Join-Path $PSScriptRoot 'fetch_stt_model.py')
+    if ($LASTEXITCODE -ne 0) {
+        Write-Fail "the transcription model could not be pre-fetched."
+        Write-Hint 'Without it the first spoken reply stalls while it downloads.'
+        Write-Hint 'It is a large file, so a slow link looks like a hang.'
+        $script:Failed.Add($Label)
+        return
+    }
+    Write-Ok $Label
+    $script:Downloaded.Add($Label)
+}
+
 function Install-SpacyEnglishModel {
     <#
     .SYNOPSIS
@@ -616,6 +645,7 @@ foreach ($item in $FileDownloads) {
         -Hint $item.Hint
 }
 
+Install-SttModel
 Install-SpacyEnglishModel
 
 # ---------------------------------------------------------------------------
