@@ -55,6 +55,7 @@ __all__ = [
     "FrameReader",
     "WakeDetection",
     "WakeListener",
+    "WakeModelLoadError",
     "WakeWordDetector",
     "float_to_int16",
 ]
@@ -78,6 +79,25 @@ _MODEL_SUFFIX = {"onnx": ".onnx", "tflite": ".tflite"}
 #: Repeated failures log in full this many times, then drop to debug level so a
 #: broken model cannot flood the log at frame rate.
 _MAX_LOGGED_ERRORS = 5
+
+#: openWakeWord's shared feature extractors, mapped to the keyword arguments it
+#: takes for each. It resolves these from its own package directory, which ships
+#: empty because upstream expects a runtime call to ``download_models()``. This
+#: project downloads them during setup instead, so the paths must be handed over
+#: explicitly (§0.1 permits model downloads at setup, not fetches while running).
+_FEATURE_MODELS = {
+    "melspectrogram": "melspec_model_path",
+    "embedding_model": "embedding_model_path",
+}
+
+
+class WakeModelLoadError(AudioError):
+    """The wake model itself would not load.
+
+    Distinct from a failure to score one frame. A missing or corrupt model file
+    does not fix itself between frames, so the listener treats this as fatal
+    rather than retrying it at frame rate.
+    """
 
 
 def float_to_int16(samples: Samples) -> npt.NDArray[np.int16]:
@@ -454,21 +474,27 @@ class WakeWordDetector:
                 ) from exc
         found = self._find_model_file()
         target = str(found) if found is not None else wake.model
+        features = self._find_feature_models()
         try:
             model = model_cls(
                 wakeword_models=[target],
                 inference_framework=wake.inference_framework,
                 vad_threshold=float(wake.vad_threshold),
+                **features,
             )
         except JarvisError:
             raise
         except Exception as exc:  # any loader failure is one error to us
-            raise AudioError(
+            missing = sorted(set(_FEATURE_MODELS.values()) - set(features))
+            raise WakeModelLoadError(
                 f"could not load wake word model {target!r}: {exc}",
                 speakable="I could not load my wake word model.",
                 context={
                     "model": target,
                     "framework": wake.inference_framework,
+                    "feature_models": features or "none found under models_dir",
+                    "feature_models_missing": missing,
+                    "models_dir": str(self._config.models_dir),
                     "error": str(exc),
                 },
             ) from exc
@@ -484,6 +510,31 @@ class WakeWordDetector:
             },
         )
         return model
+
+    def _find_feature_models(self) -> dict[str, str]:
+        """Locate the shared feature extractors, as keyword arguments.
+
+        openWakeWord looks for these inside its own package directory, which is
+        empty on a fresh install: upstream expects ``download_models()`` to be
+        called at runtime. ``scripts/pull_models.ps1`` fetches them into
+        ``models/`` during setup instead, so the paths have to be passed in.
+        Without them the loader fails naming its own packaged path, which sends
+        the reader looking in the wrong place entirely.
+
+        Returns:
+            Keyword arguments for openWakeWord. A file that is not found is
+            simply left out, so the packaged resolution still gets its chance.
+        """
+        suffix = _MODEL_SUFFIX.get(self._config.wake.inference_framework, ".onnx")
+        models_dir = self._config.models_dir
+        found: dict[str, str] = {}
+        for stem, keyword in _FEATURE_MODELS.items():
+            for root in (models_dir / "openwakeword", models_dir):
+                candidate = root / f"{stem}{suffix}"
+                if candidate.is_file():
+                    found[keyword] = str(candidate)
+                    break
+        return found
 
     def _find_model_file(self) -> Path | None:
         """Locate the wake model under ``models_dir`` before the packaged copy.
@@ -698,8 +749,10 @@ class WakeListener:
                 continue
             try:
                 detection = self._detector.process(frame)
-            except DependencyMissingError as exc:
-                # This never recovers, and retrying would log at frame rate.
+            except (DependencyMissingError, WakeModelLoadError) as exc:
+                # Neither recovers between frames: the package will not install
+                # itself and the model file will not appear. Retrying only spins
+                # at frame rate and buries the one message worth reading.
                 self._fail_fatally(exc)
                 break
             except Exception:  # noqa: BLE001 - a bad frame must not kill the thread

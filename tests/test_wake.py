@@ -879,3 +879,172 @@ def test_ambient_audio_produces_at_most_one_false_accept() -> None:
     say(f"false accepts: {len(detections)}")
 
     assert len(detections) <= 1, f"{len(detections)} false accepts in ten minutes"
+
+
+class TestSharedFeatureModels:
+    """openWakeWord needs two feature extractors it does not ship.
+
+    It resolves melspectrogram and embedding_model from inside its own package
+    directory, which is empty on a fresh install because upstream expects a
+    runtime download_models() call. pull_models.ps1 fetches them during setup
+    instead, so their paths have to be handed over. Without that the loader
+    failed naming its own packaged path, which sent the reader looking in
+    site-packages rather than at the models directory.
+    """
+
+    @staticmethod
+    def _place(cfg: JarvisConfig, *names: str) -> Path:
+        root = cfg.models_dir / "openwakeword"
+        root.mkdir(parents=True, exist_ok=True)
+        for name in names:
+            (root / name).write_bytes(b"stub")
+        return root
+
+    def test_both_extractor_paths_are_passed_to_openwakeword(
+        self, cfg: JarvisConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = self._place(cfg, "melspectrogram.onnx", "embedding_model.onnx")
+        recorder: dict[str, Any] = {}
+        monkeypatch.setattr(
+            wake_module, "require_module", lambda *a, **k: fake_openwakeword(recorder)
+        )
+
+        detector = WakeWordDetector(tune(cfg, frame_samples=160, inference_framework="onnx"))
+        detector.process(ramp(160))
+
+        assert recorder["melspec_model_path"] == str(root / "melspectrogram.onnx")
+        assert recorder["embedding_model_path"] == str(root / "embedding_model.onnx")
+
+    def test_they_are_also_found_directly_under_the_models_directory(
+        self, cfg: JarvisConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg.models_dir.mkdir(parents=True, exist_ok=True)
+        (cfg.models_dir / "melspectrogram.onnx").write_bytes(b"stub")
+        recorder: dict[str, Any] = {}
+        monkeypatch.setattr(
+            wake_module, "require_module", lambda *a, **k: fake_openwakeword(recorder)
+        )
+
+        detector = WakeWordDetector(tune(cfg, frame_samples=160, inference_framework="onnx"))
+        detector.process(ramp(160))
+
+        assert recorder["melspec_model_path"] == str(cfg.models_dir / "melspectrogram.onnx")
+
+    def test_absent_extractors_are_left_out_rather_than_passed_empty(
+        self, cfg: JarvisConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A blank path would defeat openWakeWord's own resolution."""
+        recorder: dict[str, Any] = {}
+        monkeypatch.setattr(
+            wake_module, "require_module", lambda *a, **k: fake_openwakeword(recorder)
+        )
+
+        detector = WakeWordDetector(tune(cfg, frame_samples=160))
+        detector.process(ramp(160))
+
+        assert "melspec_model_path" not in recorder
+        assert "embedding_model_path" not in recorder
+
+    def test_the_framework_decides_the_extension(
+        self, cfg: JarvisConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._place(cfg, "melspectrogram.onnx", "melspectrogram.tflite")
+        recorder: dict[str, Any] = {}
+        monkeypatch.setattr(
+            wake_module, "require_module", lambda *a, **k: fake_openwakeword(recorder)
+        )
+
+        detector = WakeWordDetector(tune(cfg, frame_samples=160, inference_framework="tflite"))
+        detector.process(ramp(160))
+
+        assert recorder["melspec_model_path"].endswith(".tflite")
+
+    def test_a_load_failure_names_the_models_directory_and_what_is_missing(
+        self, cfg: JarvisConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The original error pointed at site-packages, which is not where to look."""
+        monkeypatch.setattr(
+            wake_module, "require_module", lambda *a, **k: fake_openwakeword({}, boom=True)
+        )
+        detector = WakeWordDetector(tune(cfg, frame_samples=160))
+
+        with pytest.raises(wake_module.WakeModelLoadError) as info:
+            detector.process(ramp(160))
+
+        assert str(cfg.models_dir) in str(info.value.context["models_dir"])
+        assert info.value.context["feature_models_missing"] == [
+            "embedding_model_path",
+            "melspec_model_path",
+        ]
+
+    def test_the_pull_script_downloads_both_extractors(self) -> None:
+        """The paths are only useful if setup actually fetches the files."""
+        script = (
+            Path(__file__).resolve().parents[1] / "scripts" / "pull_models.ps1"
+        ).read_text(encoding="utf-8")
+        for stem in wake_module._FEATURE_MODELS:
+            assert f"{stem}.onnx" in script, f"{stem} is never downloaded"
+
+
+class TestAnUnloadableModelStopsRatherThanSpinning:
+    """A missing model file does not appear between frames.
+
+    Retrying the load on every frame produced 515 failures in 47 seconds on a
+    real run, with the one message worth reading buried near the top.
+    """
+
+    def test_a_load_failure_is_fatal_to_the_listener(
+        self, cfg: JarvisConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            wake_module, "require_module", lambda *a, **k: fake_openwakeword({}, boom=True)
+        )
+        reader = ScriptedReader([ramp(160)] * 50)
+        detector = WakeWordDetector(tune(cfg, frame_samples=160))
+        listener = WakeListener(cfg, reader, None, detector)
+
+        listener.start()
+        assert wait_until(lambda: not listener.is_running, timeout=5), "the loop never exited"
+        listener.stop()
+
+        assert listener.errors <= 2, f"retried {listener.errors} times on an unloadable model"
+
+    def test_the_failure_reaches_the_bus_with_something_speakable(
+        self, cfg: JarvisConfig, bus: EventBus, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen: list[Any] = []
+        bus.subscribe(seen.append, [EventType.ERROR])
+        monkeypatch.setattr(
+            wake_module, "require_module", lambda *a, **k: fake_openwakeword({}, boom=True)
+        )
+        detector = WakeWordDetector(tune(cfg, frame_samples=160))
+        listener = WakeListener(cfg, ScriptedReader([ramp(160)] * 50), bus, detector)
+
+        listener.start()
+        assert wait_until(lambda: len(seen) > 0, timeout=5)
+        listener.stop()
+
+        assert seen[0].payload["speakable"] == "I could not load my wake word model."
+
+    def test_a_transient_scoring_failure_still_keeps_going(
+        self, cfg: JarvisConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only load failures are fatal. A bad frame must not kill the listener."""
+
+        class Flaky:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def predict(self, _chunk: Any) -> dict[str, float]:
+                self.calls += 1
+                if self.calls < 3:
+                    raise RuntimeError("one bad frame")
+                return {"hey_jarvis": 0.0}
+
+        detector = WakeWordDetector(tune(cfg, frame_samples=160), Flaky())
+        listener = WakeListener(cfg, ScriptedReader([ramp(160)] * 10), None, detector)
+
+        listener.start()
+        assert wait_until(lambda: listener.errors >= 2, timeout=5)
+        assert listener.is_running, "a transient frame error must not stop the listener"
+        listener.stop()
