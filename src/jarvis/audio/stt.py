@@ -381,6 +381,10 @@ class _BaseTranscriber:
         engine, model_name, device, compute_type = config.stt_settings()
         self._config = config
         self._model = model
+        #: A caller-supplied model is theirs, not ours to discard and rebuild.
+        #: Falling back to the CPU means reloading, so it applies only when this
+        #: object owns the model's lifecycle.
+        self._owns_model = model is None
         self._clock: Callable[[], float] = clock or time.perf_counter
         self._engine = engine
         self._model_name = model_name
@@ -443,6 +447,47 @@ class _BaseTranscriber:
 
     # -- the contract ------------------------------------------------------
 
+    def _fall_back_to_cpu(self, exc: BaseException) -> bool:
+        """Move to the CPU after a missing CUDA library, once.
+
+        A card that nvidia-smi can see is not the same as a working CUDA
+        runtime: ctranslate2 also needs cuBLAS and cuDNN 9 on the library path,
+        and their absence only shows up here, at the first transcription. Left
+        alone this fails identically on every turn, which makes the assistant
+        permanently deaf to a problem the CPU could simply absorb.
+
+        The remediation is still logged in full, because running Whisper on the
+        processor is a real cost and the user should know it is happening.
+
+        Returns:
+            True when the caller should retry.
+        """
+        if not self._owns_model or self._device == "cpu":
+            return False
+        if not _is_cuda_library_failure(exc):
+            return False
+        with self._lock:
+            if self._device == "cpu":  # another thread already moved us
+                return True
+            _log.warning(
+                "falling back to the CPU for transcription: %s. %s",
+                exc,
+                _CUDA_REMEDIATION,
+                extra={
+                    "context": {
+                        "engine": self.engine_name,
+                        "model": self._model_name,
+                        "was_device": self._device,
+                        "now_device": "cpu",
+                        "remediation": _CUDA_REMEDIATION,
+                    }
+                },
+            )
+            self._device = "cpu"
+            self._compute_type = "int8"
+            self._model = None
+        return True
+
     def transcribe(self, audio: Samples, sample_rate: int = WHISPER_SAMPLE_RATE) -> Transcript:
         """Recognise ``audio``.
 
@@ -500,7 +545,17 @@ class _BaseTranscriber:
             # from DependencyMissingError intact.
             raise
         except Exception as exc:
-            raise self._wrap_failure(exc, action="transcription") from exc
+            if self._fall_back_to_cpu(exc):
+                try:
+                    with self._lock:
+                        model = self._ensure_model()
+                        raw = self._run(model, samples)
+                except JarvisError:
+                    raise
+                except Exception as retry_exc:
+                    raise self._wrap_failure(retry_exc, action="transcription") from retry_exc
+            else:
+                raise self._wrap_failure(exc, action="transcription") from exc
         elapsed_s = max(0.0, self._clock() - started)
 
         text = " ".join(segment.text for segment in raw.segments).strip()

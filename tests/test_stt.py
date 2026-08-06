@@ -1163,3 +1163,115 @@ def test_real_model_transcribes_the_fixture_wav_within_budget() -> None:
     say(f"transcript: {result.text!r}\nWER: {wer:.3f}  RTF: {result.rtf:.3f}")
     assert wer <= 0.2, f"word error rate {wer:.3f} is too high for clean speech"
     assert result.rtf < 1.0, f"RTF {result.rtf:.3f} means transcription trails real time"
+
+
+# ---------------------------------------------------------------------------
+# Falling back to the CPU when CUDA turns out to be unusable
+# ---------------------------------------------------------------------------
+
+
+class _CudaOnlyFailure:
+    """Fails on cuda, works on cpu, like a machine missing cuBLAS.
+
+    nvidia-smi seeing a card is not the same as ctranslate2 being able to use
+    it: cuBLAS and cuDNN 9 also have to be on the library path, and their
+    absence only surfaces at the first transcription.
+    """
+
+    def __init__(self, device: str) -> None:
+        self.device = device
+
+    def transcribe(self, audio: Any, **kwargs: Any) -> tuple[Any, FakeInfo]:
+        if self.device == "cuda":
+            raise OSError(CUDNN_MESSAGE)
+        return iter([FakeSegment("the processor is fine", 0.0, 1.0)]), FakeInfo()
+
+
+def _cuda_transcriber(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[FasterWhisperTranscriber, list[str]]:
+    """A transcriber that owns its model and loads per the current device."""
+    transcriber = FasterWhisperTranscriber(gpu_config(tmp_path))
+    loaded: list[str] = []
+
+    def _load(self: FasterWhisperTranscriber = transcriber) -> Any:
+        loaded.append(self._device)
+        return _CudaOnlyFailure(self._device)
+
+    monkeypatch.setattr(transcriber, "_load_model", _load)
+    return transcriber, loaded
+
+
+def test_a_missing_cuda_library_falls_back_to_the_processor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Failing identically on every turn would make the assistant deaf."""
+    transcriber, loaded = _cuda_transcriber(tmp_path, monkeypatch)
+
+    with caplog.at_level("WARNING", logger="jarvis.audio.stt"):
+        transcript = transcriber.transcribe(speech(1.0))
+
+    assert transcript.text == "the processor is fine"
+    assert loaded == ["cuda", "cpu"], f"expected a reload on the cpu, got {loaded}"
+    assert any("falling back to the CPU" in r.getMessage() for r in caplog.records)
+
+
+def test_the_fallback_says_how_to_get_the_gpu_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Running Whisper on the CPU is a real cost, so it is not done silently."""
+    transcriber, _ = _cuda_transcriber(tmp_path, monkeypatch)
+
+    with caplog.at_level("WARNING", logger="jarvis.audio.stt"):
+        transcriber.transcribe(speech(1.0))
+
+    record = next(r for r in caplog.records if "falling back" in r.getMessage())
+    assert "nvidia-cudnn-cu12" in record.context["remediation"]
+    assert record.context["was_device"] == "cuda"
+    assert record.context["now_device"] == "cpu"
+
+
+def test_the_fallback_happens_once_not_every_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transcriber, loaded = _cuda_transcriber(tmp_path, monkeypatch)
+
+    for _ in range(3):
+        transcriber.transcribe(speech(1.0))
+
+    assert loaded == ["cuda", "cpu"], "the gpu was retried after falling back"
+
+
+def test_an_injected_model_is_not_replaced(tmp_path: Path) -> None:
+    """A caller-supplied model is theirs. There is nothing to fall back to."""
+    transcriber = FasterWhisperTranscriber(
+        gpu_config(tmp_path), FakeWhisperModel(raises=OSError(CUDNN_MESSAGE))
+    )
+
+    with pytest.raises(SttError) as info:
+        transcriber.transcribe(speech(1.0))
+
+    assert "CUDA support library is missing" in info.value.message
+
+
+def test_an_unrelated_failure_does_not_move_to_the_processor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a missing CUDA library is a reason to change device."""
+    transcriber = FasterWhisperTranscriber(gpu_config(tmp_path))
+    loaded: list[str] = []
+
+    class _AlwaysBroken:
+        def transcribe(self, audio: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("the audio was malformed")
+
+    def _load(self: FasterWhisperTranscriber = transcriber) -> Any:
+        loaded.append(self._device)
+        return _AlwaysBroken()
+
+    monkeypatch.setattr(transcriber, "_load_model", _load)
+
+    with pytest.raises(SttError):
+        transcriber.transcribe(speech(1.0))
+
+    assert loaded == ["cuda"], "an unrelated error should not have moved the device"
