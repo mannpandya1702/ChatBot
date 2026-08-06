@@ -81,6 +81,9 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/jarvis"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"src/jarvis/py.typed" = "jarvis/py.typed"
+
 # ---------------------------------------------------------------------------
 # Tooling
 # ---------------------------------------------------------------------------
@@ -174,6 +177,8 @@ module = [
     "mss.*",
     "torch.*",
     "silero_vad.*",
+    "PIL.*",
+    "ctranslate2.*",
 ]
 ignore_missing_imports = true
 
