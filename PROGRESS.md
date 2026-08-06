@@ -114,7 +114,10 @@ cover.
       past the tolerance. `turn_total` is composed from its components and skipped outright when
       any is unavailable, rather than summing a partial set and understating the total.
 - [x] T-5.2 `DONE` - `util/resilience.py`. Supervisor with a finite restart budget, health report,
-      and reverse-order graceful shutdown on SIGINT.
+      and reverse-order graceful shutdown on SIGINT. Shutdown no longer overwrites the two states
+      that matter: a worker that ignores the stop request is reported `STALLED` rather than as a
+      clean stop it never reached, and a worker that burned its restart budget stays `FAILED`
+      across shutdown instead of being reset to `STOPPED`.
 - [x] T-5.3 `DONE` - `README.md` with install, tiers, the full tool catalogue, and troubleshooting
       covering cuDNN, PortAudio, Defender, admin prompts, and the Python pin.
 - [x] T-5.4 `DONE` - `scripts/install_autostart.ps1`. Non-elevated, and it removes the task and

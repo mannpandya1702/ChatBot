@@ -80,7 +80,10 @@ class TestRestart:
             if len(attempts) < 3:
                 raise RuntimeError("boom")
             started.set()
-            time.sleep(5)
+            # Stay alive until asked to stop. A bare sleep here would outlive
+            # the test, and the thread would then log into a closed stream.
+            while not supervisor.should_stop("flaky"):
+                time.sleep(0.01)
 
         supervisor = Supervisor(poll_interval_s=0.02)
         supervisor.add("flaky", flaky, max_restarts=5)
@@ -175,7 +178,12 @@ class TestRestart:
 class TestHealth:
     def test_healthy_when_everything_runs(self) -> None:
         supervisor = Supervisor(poll_interval_s=0.05)
-        supervisor.add("looper", lambda: time.sleep(2))
+
+        def looper() -> None:
+            while not supervisor.should_stop("looper"):
+                time.sleep(0.01)
+
+        supervisor.add("looper", looper)
         try:
             supervisor.start()
             time.sleep(0.1)
@@ -221,6 +229,114 @@ class TestHealth:
             assert _wait_for(lambda: supervisor.health().workers["flaky"]["restarts"] > 0, 10)
         finally:
             supervisor.stop(timeout=1)
+
+
+class TestShutdownIsHonest:
+    """A health check that lies about shutdown is worse than none at all."""
+
+    def test_a_worker_that_ignores_the_stop_request_is_reported_stalled(self) -> None:
+        """A live thread must never be recorded as a clean stop.
+
+        Reporting STOPPED for a thread that is still touching a device is the
+        one failure the supervisor exists to surface, so it is the one it must
+        not paper over.
+        """
+        release = threading.Event()
+        supervisor = Supervisor(poll_interval_s=0.05)
+        supervisor.add("wedged", lambda: release.wait(30))
+        try:
+            supervisor.start()
+            assert _wait_for(lambda: supervisor.health().workers["wedged"]["alive"], timeout=5)
+
+            supervisor.stop(timeout=0.5)
+
+            report = supervisor.health()
+            assert report.workers["wedged"]["state"] == WorkerState.STALLED
+            assert report.workers["wedged"]["alive"] is True
+            assert report.stalled == ["wedged"]
+            assert report.healthy is False
+        finally:
+            # Release the worker and reap it inside the test. Left to exit on
+            # its own it would log after pytest closed the capture stream.
+            release.set()
+            supervisor.stop(timeout=5)
+
+    def test_a_stall_is_published_to_the_bus(self, bus: EventBus) -> None:
+        """§5: fail loud in logs, fail soft in voice."""
+        seen: list[Event] = []
+        bus.subscribe(seen.append, [EventType.ERROR])
+        release = threading.Event()
+        supervisor = Supervisor(bus, poll_interval_s=0.05)
+        supervisor.add("wedged", lambda: release.wait(30))
+        try:
+            supervisor.start()
+            assert _wait_for(lambda: supervisor.health().workers["wedged"]["alive"], timeout=5)
+            supervisor.stop(timeout=0.5)
+
+            assert _wait_for(lambda: len(seen) > 0, timeout=5)
+            assert "wedged" in seen[0].payload.get("workers", [])
+            assert seen[0].payload.get("speakable")
+        finally:
+            # Release the worker and reap it inside the test. Left to exit on
+            # its own it would log after pytest closed the capture stream.
+            release.set()
+            supervisor.stop(timeout=5)
+
+    def test_a_clean_stop_is_still_reported_stopped(self) -> None:
+        """The stall path must not misclassify a worker that did stop."""
+        supervisor = Supervisor(poll_interval_s=0.05)
+
+        def looper() -> None:
+            while not supervisor.should_stop("looper"):
+                time.sleep(0.01)
+
+        supervisor.add("looper", looper)
+        supervisor.start()
+        time.sleep(0.1)
+        supervisor.stop(timeout=5)
+
+        report = supervisor.health()
+        assert report.workers["looper"]["state"] == WorkerState.STOPPED
+        assert report.stalled == []
+        assert report.healthy is True
+
+    def test_shutdown_does_not_erase_a_permanent_failure(self) -> None:
+        """A worker that burned its restart budget is still broken afterwards."""
+        supervisor = Supervisor(poll_interval_s=0.01)
+
+        def always_fails() -> None:
+            raise RuntimeError("permanent fault")
+
+        worker = supervisor.add("doomed", always_fails, max_restarts=1)
+        try:
+            supervisor.start()
+            assert _wait_for(lambda: worker.state is WorkerState.FAILED, timeout=15)
+        finally:
+            supervisor.stop(timeout=1)
+
+        report = supervisor.health()
+        assert worker.state is WorkerState.FAILED
+        assert report.failed == ["doomed"]
+        assert report.healthy is False
+
+    def test_the_report_still_serialises_with_a_stall(self) -> None:
+        import json
+
+        release = threading.Event()
+        supervisor = Supervisor(poll_interval_s=0.05)
+        supervisor.add("wedged", lambda: release.wait(30))
+        try:
+            supervisor.start()
+            assert _wait_for(lambda: supervisor.health().workers["wedged"]["alive"], timeout=5)
+            supervisor.stop(timeout=0.5)
+            payload = json.loads(json.dumps(supervisor.health().to_dict()))
+            assert payload["stalled"] == ["wedged"]
+            assert payload["healthy"] is False
+        finally:
+            # Release the worker and reap it inside the test. Left to exit on
+            # its own it would log after pytest closed the capture stream.
+            release.set()
+            supervisor.stop(timeout=5)
 
 
 class TestShutdownCoordinator:

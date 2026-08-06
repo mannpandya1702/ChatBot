@@ -41,6 +41,10 @@ class WorkerState(StrEnum):
     RESTARTING = "restarting"
     #: Exhausted its restart budget. Never restarted again without intervention.
     FAILED = "failed"
+    #: Asked to stop but still running when the shutdown deadline passed. The
+    #: thread is a daemon so it cannot hold the interpreter open, but it is
+    #: still touching whatever it owned, so shutdown must not pretend otherwise.
+    STALLED = "stalled"
 
 
 @dataclass
@@ -78,10 +82,18 @@ class HealthReport:
     healthy: bool
     workers: dict[str, dict[str, Any]]
     failed: list[str]
+    #: Workers that ignored a stop request. Separate from ``failed`` because the
+    #: remedy differs: a failed worker needs a fix, a stalled one needs a kill.
+    stalled: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-serialisable form, suitable for a health endpoint."""
-        return {"healthy": self.healthy, "workers": self.workers, "failed": self.failed}
+        return {
+            "healthy": self.healthy,
+            "workers": self.workers,
+            "failed": self.failed,
+            "stalled": self.stalled,
+        }
 
 
 class Supervisor:
@@ -249,17 +261,45 @@ class Supervisor:
                 return
 
     def stop(self, timeout: float = 5.0) -> None:
-        """Ask every worker to stop and wait for them, then stop the monitor."""
+        """Ask every worker to stop and wait for them, then stop the monitor.
+
+        Two states survive shutdown rather than being overwritten with STOPPED.
+        A worker that exhausted its restart budget stays FAILED, because a
+        permanent fault is still a permanent fault after a restart. A worker
+        that is still running when the deadline passes becomes STALLED rather
+        than being recorded as a clean stop it never reached: reporting a live
+        thread as stopped is the one lie that hides exactly the fault the
+        supervisor exists to surface.
+        """
         self._stop.set()
         with self._lock:
             workers = list(self._workers.values())
         for worker in workers:
             worker._stop.set()
         deadline = time.monotonic() + timeout
+        stalled: list[str] = []
         for worker in workers:
             if worker.thread is not None:
                 worker.thread.join(max(0.0, deadline - time.monotonic()))
-            worker.state = WorkerState.STOPPED
+            if worker.alive:
+                worker.state = WorkerState.STALLED
+                stalled.append(worker.name)
+            elif worker.state is not WorkerState.FAILED:
+                worker.state = WorkerState.STOPPED
+
+        if stalled:
+            _log.error(
+                "workers ignored the stop request",
+                extra={"context": {"workers": stalled, "timeout_s": timeout}},
+            )
+            if self._bus is not None:
+                self._bus.emit(
+                    EventType.ERROR,
+                    message=f"workers still running after shutdown: {', '.join(stalled)}",
+                    speakable="Some of my background tasks would not shut down.",
+                    workers=stalled,
+                )
+
         if self._monitor is not None:
             self._monitor.join(max(0.0, deadline - time.monotonic()))
             self._monitor = None
@@ -297,7 +337,13 @@ class Supervisor:
                 for worker in self._workers.values()
             }
         failed = [name for name, row in workers.items() if row["state"] == WorkerState.FAILED]
-        return HealthReport(healthy=not failed, workers=workers, failed=failed)
+        stalled = [name for name, row in workers.items() if row["state"] == WorkerState.STALLED]
+        return HealthReport(
+            healthy=not failed and not stalled,
+            workers=workers,
+            failed=failed,
+            stalled=stalled,
+        )
 
 
 class ShutdownCoordinator:
