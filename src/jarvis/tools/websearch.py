@@ -97,6 +97,19 @@ def _same_origin(first: httpx.URL, second: httpx.URL) -> bool:
     return first.host == second.host and first.port == second.port
 
 
+def _redirect_refusal(response: httpx.Response) -> str:
+    """Say why an unfollowed redirect stopped the search, accurately.
+
+    Off-host and redirect-loop are different faults and read differently to
+    someone trying to fix their instance, so they are not collapsed into one
+    message.
+    """
+    target = response.headers.get("location")
+    if target and not _same_origin(response.url.join(target), response.url):
+        return "the SearXNG instance redirected the search to a different address"
+    return "the SearXNG instance kept redirecting the search"
+
+
 def _get_following_same_host_redirects(
     client: httpx.Client, url: str, params: dict[str, str | int]
 ) -> httpx.Response:
@@ -181,7 +194,7 @@ def web_search(params: SearchInput) -> SearchOutput:
         if response.is_redirect:
             return SearchOutput(
                 available=False,
-                reason="the SearXNG instance redirected the search to a different address",
+                reason=_redirect_refusal(response),
                 query=params.query,
             )
     except httpx.ConnectError:

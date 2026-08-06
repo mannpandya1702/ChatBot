@@ -332,6 +332,7 @@ class TestTheQueryStaysOnTheConfiguredHost:
         result = web_search(SearchInput(query="x"))
 
         assert result.available is False
+        assert "kept redirecting" in (result.reason or ""), "a loop is not an off-host hop"
         assert len(seen) <= websearch_module._MAX_REDIRECTS + 1
 
     def test_the_client_does_not_auto_follow_redirects(self) -> None:
