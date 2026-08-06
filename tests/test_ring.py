@@ -1279,3 +1279,103 @@ def test_manual_real_microphone_capture(cfg: JarvisConfig) -> None:
     assert heard.size >= cfg.audio.sample_rate // 2
     assert capture.ring.filled == capture.ring.capacity
     assert rms_level(heard) > 0.0, "the microphone delivered pure digital silence"
+
+
+class TestASampleRateRefusalExplainsItself:
+    """PortAudio says "Invalid sample rate" and nothing else.
+
+    That is a dead end: it names neither the rate the device wanted nor a
+    device that would work. WASAPI and WDM-KS refuse to resample in shared
+    mode, so a 48 kHz device will not open at the 16 kHz the wake word and STT
+    both require, and the obvious next move is to pick a different device.
+    """
+
+    def test_the_error_names_the_device_and_its_native_rate(
+        self, capture_config: JarvisConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from jarvis.audio import devices as devices_module
+        from jarvis.audio.devices import DeviceInfo
+
+        catalogue = [
+            DeviceInfo(15, "Microphone Array (WASAPI)", 2, 0, 48_000.0, 2),
+            DeviceInfo(1, "Microphone Array (MME)", 4, 0, 44_100.0, 0, is_default_input=True),
+        ]
+        monkeypatch.setattr(devices_module, "list_devices", lambda: catalogue)
+        monkeypatch.setattr(devices_module, "supports_input_rate", lambda *a, **k: False)
+
+        def _explode(_spec: Any) -> Any:
+            raise RuntimeError("Error opening InputStream: Invalid sample rate")
+
+        capture = AudioCapture(capture_config, stream_factory=_explode)
+        capture_config.audio.input_device = 15
+
+        with pytest.raises(AudioError) as info:
+            capture.start()
+
+        message = str(info.value)
+        assert "48000 Hz" in message, "the device's native rate is not named"
+        assert "15" in message
+        assert "resample" in message.lower()
+
+    def test_it_lists_devices_that_would_work(
+        self, capture_config: JarvisConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from jarvis.audio import devices as devices_module
+        from jarvis.audio.devices import DeviceInfo
+
+        catalogue = [
+            DeviceInfo(15, "Microphone Array (WASAPI)", 2, 0, 48_000.0, 2),
+            DeviceInfo(31, "Microphone Array 3", 4, 0, 16_000.0, 3),
+        ]
+        monkeypatch.setattr(devices_module, "list_devices", lambda: catalogue)
+        monkeypatch.setattr(
+            devices_module, "supports_input_rate", lambda index, *a, **k: index == 31
+        )
+
+        def _explode(_spec: Any) -> Any:
+            raise RuntimeError("Invalid sample rate")
+
+        capture_config.audio.input_device = 15
+        capture = AudioCapture(capture_config, stream_factory=_explode)
+
+        with pytest.raises(AudioError) as info:
+            capture.start()
+
+        assert "31: Microphone Array 3" in str(info.value)
+
+    def test_with_no_usable_device_it_says_to_use_the_default(
+        self, capture_config: JarvisConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The MME default resamples, which is why it works when others do not."""
+        from jarvis.audio import devices as devices_module
+        from jarvis.audio.devices import DeviceInfo
+
+        monkeypatch.setattr(
+            devices_module, "list_devices", lambda: [DeviceInfo(15, "X", 2, 0, 48_000.0, 2)]
+        )
+        monkeypatch.setattr(devices_module, "supports_input_rate", lambda *a, **k: False)
+
+        def _explode(_spec: Any) -> Any:
+            raise RuntimeError("Invalid sample rate")
+
+        capture_config.audio.input_device = 15
+        capture = AudioCapture(capture_config, stream_factory=_explode)
+
+        with pytest.raises(AudioError) as info:
+            capture.start()
+
+        assert "unset" in str(info.value).lower()
+
+    def test_an_unrelated_failure_is_not_dressed_up_as_a_rate_problem(
+        self, capture_config: JarvisConfig
+    ) -> None:
+        def _explode(_spec: Any) -> Any:
+            raise RuntimeError("Device unavailable")
+
+        capture = AudioCapture(capture_config, stream_factory=_explode)
+
+        with pytest.raises(AudioError) as info:
+            capture.start()
+
+        assert "Device unavailable" in str(info.value)
+        assert "resample" not in str(info.value).lower()

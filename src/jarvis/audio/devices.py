@@ -33,6 +33,8 @@ __all__ = [
     "find_output_device",
     "is_auto_spec",
     "list_devices",
+    "supports_input_rate",
+    "why_the_rate_failed",
 ]
 
 _log = logging.getLogger(__name__)
@@ -482,4 +484,75 @@ def describe_devices(
         "  ".join(row[column].ljust(widths[column]) for column in range(len(headers))).rstrip()
         for row in rows
     )
+    return "\n".join(lines)
+
+
+def supports_input_rate(index: int, sample_rate: int, channels: int = 1) -> bool:
+    """Whether PortAudio will open ``index`` for capture at ``sample_rate``.
+
+    Args:
+        index: PortAudio device index.
+        sample_rate: Rate in hertz.
+        channels: Capture channels.
+
+    Returns:
+        True when the combination opens. Never raises: an unanswerable question
+        is reported as unsupported.
+    """
+    try:
+        sounddevice = require_module("sounddevice", feature="audio devices")
+        sounddevice.check_input_settings(
+            device=index, samplerate=sample_rate, channels=channels
+        )
+    except Exception:  # noqa: BLE001 - any refusal means the same thing here
+        return False
+    return True
+
+
+def why_the_rate_failed(spec: str | int | None, sample_rate: int, channels: int = 1) -> str:
+    """Explain a sample rate refusal, and name devices that would work.
+
+    PortAudio reports only "Invalid sample rate", which is a dead end: it does
+    not say what the device wanted or which other device would do. WASAPI in
+    particular refuses to resample in shared mode, so a device whose native
+    rate is 48 kHz simply will not open at the 16 kHz the wake word and STT
+    both require.
+
+    Returns:
+        A multi-line explanation. Never raises.
+    """
+    lines: list[str] = []
+    try:
+        devices = list_devices()
+    except Exception:  # noqa: BLE001 - diagnostics must not add a second failure
+        return f"the device would not open at {sample_rate} Hz"
+
+    chosen = None
+    if isinstance(spec, int):
+        chosen = next((d for d in devices if d.index == spec), None)
+    if chosen is not None:
+        lines.append(
+            f"device {chosen.index} ({chosen.name}) reports a native rate of "
+            f"{chosen.default_samplerate:.0f} Hz and refused {sample_rate} Hz."
+        )
+        lines.append(
+            "WASAPI and WDM-KS will not resample, so a device must accept the rate directly."
+        )
+    else:
+        lines.append(f"no input device accepted {sample_rate} Hz.")
+
+    usable = [
+        device
+        for device in devices
+        if device.is_input and supports_input_rate(device.index, sample_rate, channels)
+    ]
+    if usable:
+        lines.append(f"These inputs do accept {sample_rate} Hz:")
+        lines.extend(f"  {device.index}: {device.name}" for device in usable[:5])
+        lines.append("Set audio.input_device to one of those, or to null for the system default.")
+    else:
+        lines.append(
+            "No input device accepts it directly. Leave audio.input_device unset: "
+            "the MME default resamples, which is why it works when a specific device does not."
+        )
     return "\n".join(lines)

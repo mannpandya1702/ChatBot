@@ -630,10 +630,26 @@ class AudioCapture:
         except JarvisError:
             raise
         except Exception as exc:
+            # PortAudio reports "Invalid sample rate" and nothing else, which
+            # is a dead end. WASAPI and WDM-KS refuse to resample in shared
+            # mode, so a 48 kHz device simply will not open at the 16 kHz the
+            # wake word and STT both need. Say which device, what it wanted,
+            # and which ones would work.
+            detail = ""
+            if "sample rate" in str(exc).lower():
+                from jarvis.audio.devices import why_the_rate_failed
+
+                detail = "\n" + why_the_rate_failed(
+                    spec.device, spec.sample_rate, spec.channels
+                )
             raise AudioError(
-                f"could not open the audio input device: {exc}",
+                f"could not open the audio input device: {exc}{detail}",
                 speakable="I could not open the microphone.",
-                context={"device": spec.device, "error": str(exc)},
+                context={
+                    "device": spec.device,
+                    "sample_rate": spec.sample_rate,
+                    "error": str(exc),
+                },
             ) from exc
         try:
             stream.start()
