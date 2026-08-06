@@ -26,7 +26,7 @@ from typing import Any
 
 from jarvis.config import JarvisConfig, load_config, set_config
 from jarvis.state import AssistantState, EventBus, EventType
-from jarvis.util.errors import JarvisError
+from jarvis.util.errors import AudioError, DependencyMissingError, JarvisError
 from jarvis.util.logging import setup_logging
 from jarvis.util.resilience import ShutdownCoordinator, Supervisor
 
@@ -250,6 +250,7 @@ class Assistant:
         self._endpointer.reset()
         frame_samples = self.config.vad.frame_samples
         deadline = time.monotonic() + timeout_s
+        errors = 0
 
         self._orchestrator.state.set(AssistantState.LISTENING)
         while time.monotonic() < deadline:
@@ -261,8 +262,28 @@ class Assistant:
                 continue
             try:
                 endpoint = self._endpointer.process(frame)
+            except (DependencyMissingError, AudioError) as exc:
+                # Neither recovers between frames: the package will not install
+                # itself and the checkpoint will not appear. Retrying logged a
+                # full traceback per frame, roughly thirty a second, which
+                # buried the one line worth reading.
+                _log.error(
+                    "cannot endpoint speech: %s",
+                    exc.message,
+                    extra={"context": {"error": type(exc).__name__, **exc.context}},
+                )
+                self.bus.emit(
+                    EventType.ERROR, message=exc.message, speakable=exc.speakable
+                )
+                return ""
             except Exception:  # noqa: BLE001 - a bad frame must not end listening
-                _log.exception("the endpointer failed on a frame")
+                errors += 1
+                if errors <= _MAX_FRAME_ERRORS:
+                    _log.exception("the endpointer failed on a frame")
+                elif errors == _MAX_FRAME_ERRORS + 1:
+                    _log.error("further endpointer errors this turn will be logged at debug")
+                else:
+                    _log.debug("the endpointer failed on a frame (%d this turn)", errors)
                 continue
             if endpoint is None:
                 continue
@@ -479,6 +500,10 @@ def run_check(config: JarvisConfig) -> int:
     print("\nReady.")  # noqa: T201
     return 0
 
+
+#: Frame errors logged in full per turn before dropping to debug. A wedged
+#: endpointer produces one per frame, about thirty a second.
+_MAX_FRAME_ERRORS = 5
 
 #: Peak below this over a whole recording means nothing reached the process.
 _SILENCE_PEAK = 0.002

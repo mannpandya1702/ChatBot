@@ -461,15 +461,25 @@ class SileroVad:
     def find_model_file(self) -> Path | None:
         """Locate ``silero_vad.onnx`` under the models directory.
 
-        Checked in order: the directory itself, then the ``silero_vad`` and
-        ``vad`` subdirectories a downloader might create, then any versioned
-        variant such as ``silero_vad_v5.onnx``, newest sorting name winning.
+        Checked in order: the directory itself, then the subdirectories a
+        downloader might create, then any versioned variant such as
+        ``silero_vad_v5.onnx``, newest sorting name winning.
+
+        ``silero`` is the one ``scripts/pull_models.ps1`` actually writes into.
+        It was missing from this list, so a correctly downloaded model reported
+        itself as absent, and the error told the reader to run the very script
+        that had already put the file there.
 
         Returns:
             The checkpoint, or None when nothing matches.
         """
         models_dir = self._config.models_dir
-        roots = (models_dir, models_dir / "silero_vad", models_dir / "vad")
+        roots = (
+            models_dir,
+            models_dir / "silero",
+            models_dir / "silero_vad",
+            models_dir / "vad",
+        )
         for root in roots:
             exact = root / _MODEL_FILENAME
             if exact.is_file():

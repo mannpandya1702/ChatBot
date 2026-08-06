@@ -552,3 +552,79 @@ def test_pull_models_reports_what_it_skipped_versus_downloaded() -> None:
         assert bucket in text, f"{bucket} tally missing from the summary"
     assert "Already present:" in text
     assert "exit 1" in text, "a failed download must be reported through the exit code"
+
+
+class TestTheDownloaderAndTheLoadersAgree:
+    """Every directory the script writes into must be one the code looks in.
+
+    Two real first-run failures came from exactly this mismatch and nothing
+    caught either. pull_models.ps1 put the Silero checkpoint in models\\silero
+    while vad.py searched models\\silero_vad and models\\vad, so a correctly
+    downloaded model reported itself missing and told the reader to run the
+    script that had already downloaded it. openWakeWord's feature extractors
+    had the same shape of problem.
+    """
+
+    @staticmethod
+    def _download_dirs() -> set[str]:
+        """First path segment of every Relative= entry in the script."""
+        text = _read(PULL)
+        found = set()
+        for match in re.finditer(r"Relative\s*=\s*'([^']+)'", text):
+            parts = match.group(1).replace("/", "\\").split("\\")
+            if len(parts) > 1:
+                found.add(parts[0])
+        return found
+
+    def test_the_script_declares_the_directories_we_expect(self) -> None:
+        """Guards the parser itself, so a rename cannot make this class vacuous."""
+        assert self._download_dirs() >= {"openwakeword", "silero", "kokoro"}
+
+    def test_every_silero_download_directory_is_searched_by_the_vad(
+        self, tmp_path: Path
+    ) -> None:
+        from jarvis.audio.vad import SileroVad
+        from jarvis.config import load_config
+
+        config = load_config(tmp_path / "absent.yaml", paths={"models_dir": str(tmp_path)})
+        detector = SileroVad(config)
+
+        for directory in self._download_dirs():
+            if "silero" not in directory:
+                continue
+            target = tmp_path / directory / "silero_vad.onnx"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"stub")
+            found = detector.find_model_file()
+            target.unlink()
+            assert found is not None, (
+                f"pull_models.ps1 downloads into models\\{directory}, "
+                "which SileroVad.find_model_file never looks in"
+            )
+
+    def test_every_wake_download_directory_is_searched_by_the_detector(
+        self, tmp_path: Path
+    ) -> None:
+        from jarvis.audio.wake import WakeWordDetector
+        from jarvis.config import load_config
+
+        config = load_config(tmp_path / "absent.yaml", paths={"models_dir": str(tmp_path)})
+        detector = WakeWordDetector(config)
+
+        for directory in self._download_dirs():
+            if "wake" not in directory:
+                continue
+            root = tmp_path / directory
+            root.mkdir(parents=True, exist_ok=True)
+            (root / "hey_jarvis_v0.1.onnx").write_bytes(b"stub")
+            (root / "melspectrogram.onnx").write_bytes(b"stub")
+            (root / "embedding_model.onnx").write_bytes(b"stub")
+
+            assert detector._find_model_file() is not None, (
+                f"the wake model is downloaded into models\\{directory}, which is not searched"
+            )
+            features = detector._find_feature_models()
+            assert len(features) == 2, (
+                f"the feature extractors are downloaded into models\\{directory}, "
+                f"but only {sorted(features)} were found"
+            )
