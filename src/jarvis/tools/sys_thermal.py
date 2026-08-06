@@ -86,7 +86,8 @@ class ThermalOutput(ToolOutput):
     )
     sensor_count: int = Field(default=0, description="How many temperature sensors were found.")
     sensors: list[SensorReading] = Field(
-        default_factory=list, description="Individual sensors, only when all were requested."
+        default_factory=list,
+        description="Up to 5 individual sensors, only when all sensors were requested.",
     )
 
 

@@ -198,8 +198,9 @@ def top_processes(params: ProcessListInput) -> ProcessListOutput:
     description=(
         "Check whether a named program is running and how much CPU and memory it is using. "
         "Use this for questions like is Chrome running, is Spotify open, or how much memory "
-        "is Discord using. Matching is case insensitive and matches partial names. "
-        "Read-only, it never stops or changes a process."
+        "is Discord using. Matching is case insensitive and matches partial names. CPU is a "
+        "percent of total capacity, memory is in megabytes, and uptime is in seconds. "
+        "Returns at most 5 matching instances. Read-only, it never stops or changes a process."
     ),
     category=ToolCategory.SYSTEM,
     read_only=True,
