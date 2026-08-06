@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Jarvis</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <!-- Arc-reactor framing (T-3.4). The whole shell is click-through except
+         where an element opts back in with pointer-events, so the HUD floats
+         over the desktop without stealing clicks. -->
+    <main id="hud">
+      <div id="drag-handle" class="interactive" title="Drag to move"></div>
+
+      <section id="orb-stage">
+        <div class="reactor-ring outer"></div>
+        <div class="reactor-ring inner"></div>
+        <canvas id="orb"></canvas>
+        <div id="state-label" data-state="idle">standing by</div>
+        <div id="connection" class="visible">connecting</div>
+      </section>
+
+      <section id="panel">
+        <div id="metrics">
+          <canvas class="spark" id="spark-cpu"></canvas>
+          <canvas class="spark" id="spark-mem"></canvas>
+          <canvas class="spark" id="spark-gpu"></canvas>
+          <canvas class="spark" id="spark-net"></canvas>
+        </div>
+
+        <div id="speech">
+          <div id="transcript"></div>
+          <div id="response"></div>
+          <div id="tool"></div>
+          <div id="confirmation"></div>
+        </div>
+
+        <div id="history"></div>
+      </section>
+    </main>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>
