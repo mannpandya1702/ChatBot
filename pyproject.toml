@@ -120,7 +120,8 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101", "S105", "S106", "S108", "ANN", "S603", "S607"]
+# S604: ruff reads our shell={...} config kwarg as subprocess shell=True.
+"tests/**" = ["S101", "S105", "S106", "S108", "ANN", "S603", "S604", "S607"]
 "scripts/**" = ["S603", "S607", "T201"]
 "src/jarvis/tools/shell.py" = ["S603"]  # subprocess use is the point, and is hardened
 
