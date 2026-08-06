@@ -107,7 +107,10 @@ class StreamingPlayer:
         self._owns_sink = sink is None
 
         self._lock = threading.Lock()
-        self._queue: deque[Samples] = deque()
+        # Chunks carry the generation they were queued in. stop() bumps it, so
+        # audio synthesised for a turn the user cut off cannot start playing a
+        # moment later, which is what made barge-in feel like it had not worked.
+        self._queue: deque[tuple[int, Samples]] = deque()
         self._current: Samples | None = None
         self._offset = 0
         self._generation = 0
@@ -133,7 +136,7 @@ class StreamingPlayer:
     def queued_seconds(self) -> float:
         """How much audio is waiting, in seconds."""
         with self._lock:
-            pending = sum(chunk.size for chunk in self._queue)
+            pending = sum(chunk.size for _generation, chunk in self._queue)
             if self._current is not None:
                 pending += self._current.size - self._offset
         return pending / float(self._sample_rate)
@@ -200,13 +203,31 @@ class StreamingPlayer:
 
     # -- queueing ----------------------------------------------------------
 
-    def play(self, chunk: Samples) -> None:
-        """Queue a chunk. Never blocks."""
+    @property
+    def generation(self) -> int:
+        """Current playback generation. Bumped by every :meth:`stop`."""
+        with self._lock:
+            return self._generation
+
+    def play(self, chunk: Samples, *, generation: int | None = None) -> None:
+        """Queue a chunk. Never blocks.
+
+        Args:
+            chunk: float32 mono audio.
+            generation: The generation this audio belongs to, from
+                :attr:`generation` before synthesis started. A chunk from a
+                superseded generation is discarded, so audio that was still
+                being synthesised when the user interrupted never reaches the
+                speaker.
+        """
         audio = np.asarray(chunk, dtype=np.float32).reshape(-1)
         if audio.size == 0:
             return
         with self._lock:
-            self._queue.append(audio)
+            if generation is not None and generation != self._generation:
+                _log.debug("dropped audio from a superseded generation")
+                return
+            self._queue.append((self._generation, audio))
             self._drained.clear()
 
     def _next_block(self, frames: int) -> Samples:
@@ -227,7 +248,10 @@ class StreamingPlayer:
                         if filled == 0:
                             self._drained.set()
                         break
-                    self._current = self._queue.popleft()
+                    queued_generation, chunk = self._queue.popleft()
+                    if queued_generation != self._generation:
+                        continue
+                    self._current = chunk
                     self._offset = 0
 
                 available = self._current.size - self._offset

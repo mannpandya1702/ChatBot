@@ -170,6 +170,10 @@ class UiServer:
         self._ready = threading.Event()
         self._queue: queue.Queue[Event] | None = None
         self._unsubscribe: Any = None
+        # A one-slot handoff from the server thread to start(). A list rather
+        # than an optional attribute because the write happens on another
+        # thread, which a type checker cannot see.
+        self._error: list[BaseException] = []
         self._port = config.ui.port
 
     # -- lifecycle ---------------------------------------------------------
@@ -195,12 +199,33 @@ class UiServer:
             return
         self._stop.clear()
         self._ready.clear()
+        self._error.clear()
+        # Release any subscription from a previous failed start, otherwise each
+        # attempt leaves a queue behind that fills and is never drained.
+        if self._unsubscribe is not None:
+            self._unsubscribe()
         self._queue, self._unsubscribe = self._bus.subscribe_queue()
         self._thread = threading.Thread(target=self._run, name="jarvis-ui", daemon=True)
         self._thread.start()
         if not self._ready.wait(timeout):
+            self._cleanup_failed_start()
             msg = "the UI server did not start in time"
             raise TimeoutError(msg)
+        if self._error:
+            # _run sets _ready on failure so start() cannot hang, which means
+            # the flag alone does not mean success. Without this check a HUD
+            # that could not bind its port is reported as running.
+            error = self._error[0]
+            self._cleanup_failed_start()
+            raise error
+
+    def _cleanup_failed_start(self) -> None:
+        """Release the bus subscription after a start that did not succeed."""
+        if self._unsubscribe is not None:
+            self._unsubscribe()
+            self._unsubscribe = None
+        self._queue = None
+        self._thread = None
 
     def stop(self, timeout: float = 5.0) -> None:
         """Stop the server and release the port."""
@@ -233,9 +258,10 @@ class UiServer:
         asyncio.set_event_loop(loop)
         try:
             loop.run_until_complete(self._serve())
-        except Exception:  # noqa: BLE001 - report and unblock start(), never hang
+        except Exception as exc:  # noqa: BLE001 - report and unblock start(), never hang
             _log.exception("UI server failed")
-            self._ready.set()  # unblock start() so it raises rather than hanging
+            self._error.append(exc)
+            self._ready.set()  # unblock start(), which then re-raises this
         finally:
             with contextlib.suppress(Exception):
                 loop.run_until_complete(loop.shutdown_asyncgens())

@@ -299,6 +299,27 @@ class TestLifecycle:
         alive = {t.name for t in threading.enumerate() if t.name.startswith("jarvis-")}
         assert alive == set(), f"threads still running after stop: {alive}"
 
+    def test_a_signal_shutdown_stops_the_loops_first(self, config: JarvisConfig) -> None:
+        """Shutdown steps run in reverse, so the flag-setter must be last
+        registered. Otherwise a SIGINT tears down capture and the player
+        underneath a turn worker that is still using them."""
+        assistant = Assistant(config, headless=True)
+        _wire(assistant, config, [""])
+        assistant.start()
+        try:
+            # Exactly what the signal handler does: the coordinator only.
+            assistant.shutdown.shutdown()
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                alive = {t.name for t in threading.enumerate() if t.name.startswith("jarvis-")}
+                if not alive:
+                    break
+                time.sleep(0.1)
+            alive = {t.name for t in threading.enumerate() if t.name.startswith("jarvis-")}
+            assert alive == set(), f"a bare coordinator shutdown left {alive} running"
+        finally:
+            assistant.stop()
+
     def test_double_stop_is_safe(self, config: JarvisConfig) -> None:
         assistant = Assistant(config, headless=True)
         _wire(assistant, config, [""])

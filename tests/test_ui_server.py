@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -254,6 +255,49 @@ class TestUiServer:
                 await self._recv(first)
             async with websockets.connect(url) as second:
                 assert (await self._recv(second))["type"] == "state"
+
+    async def test_a_bind_failure_is_raised_not_swallowed(
+        self, ui_config: JarvisConfig, bus: EventBus
+    ) -> None:
+        """_run sets the ready flag on failure so start() cannot hang, which
+        means the flag alone does not mean success. A HUD that could not bind
+        must not be reported as running."""
+        occupied = UiServer(ui_config, bus)
+        occupied.start()
+        try:
+            from jarvis.config import load_config
+
+            clashing = load_config(
+                Path(ui_config.paths.log_dir).parent / "absent.yaml",
+                ui={"port": occupied.port, "host": "127.0.0.1"},
+            )
+            second = UiServer(clashing, bus)
+            with pytest.raises(OSError):
+                second.start()
+            assert second.is_running is False
+        finally:
+            occupied.stop()
+
+    async def test_a_failed_start_does_not_leak_a_subscription(
+        self, ui_config: JarvisConfig, bus: EventBus
+    ) -> None:
+        """Each failed attempt used to leave a queue behind that fills forever."""
+        from jarvis.config import load_config
+
+        occupied = UiServer(ui_config, bus)
+        occupied.start()
+        try:
+            clashing = load_config(
+                Path(ui_config.paths.log_dir).parent / "absent.yaml",
+                ui={"port": occupied.port, "host": "127.0.0.1"},
+            )
+            before = bus.subscriber_count
+            for _ in range(3):
+                with pytest.raises(OSError):
+                    UiServer(clashing, bus).start()
+            assert bus.subscriber_count <= before + 1
+        finally:
+            occupied.stop()
 
     async def test_double_start_is_safe(self, ui_config: JarvisConfig, bus: EventBus) -> None:
         server = UiServer(ui_config, bus)

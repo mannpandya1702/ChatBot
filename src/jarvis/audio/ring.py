@@ -315,10 +315,13 @@ class RingReader:
         buffer = self._buffer
         oldest = buffer._oldest_locked()
         if self._generation != buffer._generation:
-            # clear() is a deliberate flush by the consumer side, not data loss.
+            # clear() is a deliberate flush by the consumer side, not data loss,
+            # so absorb the flush without counting it. Absorbing only up to the
+            # flush point rather than returning here means samples lost to
+            # lapping after the flush are still counted below, keeping the
+            # invariant read + dropped == produced true across a clear().
             self._generation = buffer._generation
-            self._cursor = max(self._cursor, oldest)
-            return
+            self._cursor = max(self._cursor, buffer._base)
         if self._cursor < oldest:
             self._dropped += oldest - self._cursor
             self._cursor = oldest

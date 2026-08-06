@@ -177,6 +177,9 @@ class Assistant:
         self.supervisor.add("metrics", self._metrics_loop)
         self.supervisor.start()
         self.shutdown.register("supervisor", self.supervisor.stop)
+        # Registered last so it runs first: shutdown steps run in reverse.
+        # The loops must be told to stop before anything they use is closed.
+        self.shutdown.register("stop-flag", self._request_stop)
 
         greeting = self.config.orchestrator.greeting.strip()
         if greeting:
@@ -194,10 +197,16 @@ class Assistant:
             },
         )
 
-    def stop(self) -> None:
-        """Stop everything, in reverse order of construction."""
+    def _request_stop(self) -> None:
+        """Ask every loop to exit. Safe to call more than once."""
         self._stop.set()
         self._wake_event.set()
+        if self._orchestrator is not None:
+            self._orchestrator.interrupt()
+
+    def stop(self) -> None:
+        """Stop everything, in reverse order of construction."""
+        self._request_stop()
         self.bus.emit(EventType.SHUTDOWN)
         self.shutdown.shutdown()
         self.bus.close()
@@ -244,7 +253,7 @@ class Assistant:
 
         self._orchestrator.state.set(AssistantState.LISTENING)
         while time.monotonic() < deadline:
-            if self._stop.is_set():
+            if self._stop.is_set() or self.supervisor.should_stop("turn-loop"):
                 return ""
             frame = reader.read(frame_samples)
             if frame is None:
@@ -283,19 +292,29 @@ class Assistant:
         return self._listen(timeout_s)
 
     def _speak(self, text: str) -> None:
-        """Synthesise and queue one chunk, watching for barge-in."""
+        """Synthesise and queue one chunk, watching for barge-in.
+
+        The generation is captured before synthesis and handed back to the
+        player, so a chunk that was still being synthesised when the user
+        interrupted is discarded rather than starting to play a moment after
+        the barge-in stopped everything else.
+        """
         if not text.strip() or not self.config.tts.enabled:
             return
+        if self._stop.is_set() or self._orchestrator.interrupted:
+            return
+
+        generation = self._player.generation
         try:
             audio = self._synth.synthesize(text)
         except JarvisError as exc:
             _log.warning("synthesis failed: %s", exc.message)
             return
-        if audio.size == 0:
+        if audio.size == 0 or self._orchestrator.interrupted:
             return
 
         self._orchestrator.state.set(AssistantState.SPEAKING)
-        self._player.play(audio)
+        self._player.play(audio, generation=generation)
         if self.config.orchestrator.barge_in:
             self._watch_for_barge_in()
 

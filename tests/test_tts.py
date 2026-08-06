@@ -353,6 +353,36 @@ class TestStreamingPlayer:
         with StreamingPlayer(cfg, sink=sink):
             assert sink.started is True
 
+    def test_audio_from_a_cancelled_turn_is_discarded(self, cfg: JarvisConfig) -> None:
+        """The barge-in race.
+
+        A chunk still being synthesised when the user interrupts would otherwise
+        be queued a moment after stop() cleared everything, so the assistant
+        resumes talking over the person who just cut it off.
+        """
+        player, _sink = self._player(cfg)
+        generation = player.generation
+        player.play(np.ones(1000, dtype=np.float32))
+
+        player.stop()  # the user interrupts
+
+        # The synthesiser finishes and hands over audio from the dead turn.
+        player.play(np.ones(1000, dtype=np.float32), generation=generation)
+        assert player.is_playing is False, "audio from a cancelled turn started playing"
+        assert not player._next_block(256).any()
+
+    def test_audio_from_the_current_generation_still_plays(self, cfg: JarvisConfig) -> None:
+        player, _sink = self._player(cfg)
+        player.stop()
+        player.play(np.ones(500, dtype=np.float32), generation=player.generation)
+        assert player.is_playing is True
+
+    def test_generation_advances_on_every_stop(self, cfg: JarvisConfig) -> None:
+        player, _sink = self._player(cfg)
+        first = player.generation
+        player.stop()
+        assert player.generation != first
+
     def test_playback_can_resume_after_a_stop(self, cfg: JarvisConfig) -> None:
         """A barge-in must not permanently disable the speaker."""
         player, _sink = self._player(cfg)
