@@ -104,6 +104,16 @@ class TierProfile:
     supports_vision: bool
 
 
+#: VRAM a card needs before transcription is moved onto it while the LLM stays
+#: on the CPU (§2). faster-whisper small.en at int8 occupies well under a
+#: gigabyte, so this is deliberately low: the point is to use a card the LLM
+#: cannot, not to compete with it.
+_STT_GPU_MIN_VRAM_GB = 2.0
+
+#: What such a card runs. The same model the gpu-6 tier uses, since the two
+#: cases differ in how much VRAM is spare, not in what Whisper needs.
+_STT_SMALL_GPU_MODEL = "small.en"
+
 TIER_PROFILES: dict[Tier, TierProfile] = {
     Tier.CPU: TierProfile(
         tier=Tier.CPU,
@@ -689,15 +699,37 @@ class JarvisConfig(BaseSettings):
         return TIER_PROFILES[self.effective_tier()]
 
     def stt_settings(self) -> tuple[SttEngine, str, str, str]:
-        """Resolved ``(engine, model, device, compute_type)`` for STT."""
+        """Resolved ``(engine, model, device, compute_type)`` for STT.
+
+        The ``cpu`` tier covers two different machines: one with no GPU at all,
+        and one whose GPU is too small for the LLM but perfectly able to run a
+        small Whisper model. §2 says as much, that a card below 6 GB "is treated
+        as cpu for the LLM but may still run faster-whisper if CUDA is
+        present", so transcription is moved onto the card when there is one.
+        The LLM stays on the CPU, which is what the tier is really about.
+
+        Anything set explicitly in ``stt`` wins, so this never overrides a
+        deliberate choice, and ``build_transcriber`` still falls back to
+        whisper.cpp if faster-whisper turns out not to be installed.
+        """
         profile = self.tier_profile()
         engine = self.stt.engine if self.stt.engine is not SttEngine.AUTO else profile.stt_engine
-        return (
-            engine,
-            self.stt.model or profile.stt_model,
-            self.stt.device or profile.stt_device,
-            self.stt.compute_type or profile.stt_compute_type,
-        )
+        model = self.stt.model or profile.stt_model
+        device = self.stt.device or profile.stt_device
+        compute_type = self.stt.compute_type or profile.stt_compute_type
+
+        if (
+            self.stt.engine is SttEngine.AUTO
+            and profile.tier is Tier.CPU
+            and self.hardware.cuda_available
+            and (self.hardware.gpu_vram_gb or 0.0) >= _STT_GPU_MIN_VRAM_GB
+        ):
+            engine = SttEngine.FASTER_WHISPER
+            model = self.stt.model or _STT_SMALL_GPU_MODEL
+            device = self.stt.device or "cuda"
+            compute_type = self.stt.compute_type or "int8"
+
+        return (engine, model, device, compute_type)
 
     def llm_model(self) -> str:
         """Resolved LLM model name."""

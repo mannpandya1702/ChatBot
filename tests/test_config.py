@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
@@ -332,3 +333,85 @@ class TestWriteHardware:
         cfg = load_config(target)
         assert cfg.hardware.tier is Tier.GPU_16
         assert cfg.llm_model() == "qwen3:14b"
+
+
+class TestASmallCardStillTranscribes:
+    """§2: a card below 6 GB is cpu for the LLM but may still run faster-whisper.
+
+    The cpu tier covers two different machines: one with no GPU at all, and one
+    whose GPU is too small for the LLM yet perfectly able to run a small
+    Whisper model. Treating them identically left a working card idle while
+    whisper.cpp ground away on the processor.
+    """
+
+    @staticmethod
+    def _config(**hardware: Any) -> JarvisConfig:
+        base = {"tier": "cpu", "cuda_available": True, "gpu_vram_gb": 4.0}
+        return load_config("/nonexistent.yaml", hardware={**base, **hardware})
+
+    def test_a_four_gigabyte_card_transcribes_on_the_gpu(self) -> None:
+        engine, model, device, compute = self._config().stt_settings()
+
+        assert engine is SttEngine.FASTER_WHISPER
+        assert model == "small.en"
+        assert device == "cuda"
+        assert compute == "int8"
+
+    def test_the_llm_still_runs_on_the_processor(self) -> None:
+        """The tier is about the LLM, and 4 GB cannot host it."""
+        config = self._config()
+        assert config.effective_tier() is Tier.CPU
+        assert config.llm_model() == TIER_PROFILES[Tier.CPU].llm_model
+
+    def test_no_gpu_still_means_whisper_cpp(self) -> None:
+        engine, model, device, _ = self._config(cuda_available=False).stt_settings()
+
+        assert engine is SttEngine.WHISPERCPP
+        assert model == "base.en"
+        assert device == "cpu"
+
+    def test_a_card_too_small_even_for_whisper_stays_on_the_processor(self) -> None:
+        engine, _, device, _ = self._config(gpu_vram_gb=1.0).stt_settings()
+
+        assert engine is SttEngine.WHISPERCPP
+        assert device == "cpu"
+
+    def test_unknown_vram_is_not_assumed_to_be_enough(self) -> None:
+        engine, _, _, _ = self._config(gpu_vram_gb=None).stt_settings()
+        assert engine is SttEngine.WHISPERCPP
+
+    @pytest.mark.parametrize(
+        ("override", "field"),
+        [
+            ({"engine": "whispercpp"}, 0),
+            ({"model": "tiny.en"}, 1),
+            ({"device": "cpu"}, 2),
+            ({"compute_type": "float32"}, 3),
+        ],
+    )
+    def test_an_explicit_setting_always_wins(self, override: dict, field: int) -> None:
+        """This upgrades a default. It must never override a deliberate choice."""
+        config = load_config(
+            "/nonexistent.yaml",
+            hardware={"tier": "cpu", "cuda_available": True, "gpu_vram_gb": 4.0},
+            stt=override,
+        )
+        chosen = config.stt_settings()[field]
+        expected = next(iter(override.values()))
+        assert str(chosen) == str(expected)
+
+    def test_the_gpu_tiers_are_untouched(self) -> None:
+        """The upgrade applies to the cpu tier only."""
+        for tier in (Tier.GPU_6, Tier.GPU_8, Tier.GPU_12):
+            config = load_config(
+                "/nonexistent.yaml",
+                hardware={"tier": str(tier), "cuda_available": True, "gpu_vram_gb": 8.0},
+            )
+            profile = TIER_PROFILES[tier]
+            engine, model, device, compute = config.stt_settings()
+            assert (engine, model, device, compute) == (
+                profile.stt_engine,
+                profile.stt_model,
+                profile.stt_device,
+                profile.stt_compute_type,
+            )

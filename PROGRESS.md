@@ -4,7 +4,7 @@ Machine-maintained build ledger for `/loop`. See `CLAUDE.md` §7 for task defini
 
 Last run: 2026-08-06
 Target phase: 5
-Result: all tasks through Phase 5 implemented. 1566 automated tests pass, `ruff` and
+Result: all tasks through Phase 5 implemented. 1576 automated tests pass, `ruff` and
 `mypy --strict` are clean. M-8 and M-9 are resolved; the remaining 8 checks need the
 Windows host and are listed at the bottom.
 
@@ -30,6 +30,11 @@ cover.
 - [x] T-0.3 `DONE` - `util/logging.py`, `util/latency.py`, `util/errors.py`, `util/platform.py`.
 - [x] T-0.4 `DONE` - `scripts/verify_cuda.py`. Detects GPU, VRAM, CUDA, and cuDNN, resolves the
       tier, and names the `cudnn_ops64_9.dll` remediation specifically.
+      Note: §2 says a card below 6 GB is treated as `cpu` for the LLM but may still run
+      faster-whisper if CUDA is present. That sentence was never implemented, so a 4 GB laptop
+      card sat idle while whisper.cpp ran on the processor. `stt_settings()` now moves
+      transcription onto such a card, small.en at int8, while the LLM stays on the CPU where the
+      tier puts it. Anything set explicitly under `stt` still wins.
 - [x] T-0.5 `DONE` - `scripts/setup_env.ps1`, `scripts/pull_models.ps1`. Idempotent. The tier to
       model mapping is checked against `TIER_PROFILES` by a test that parses the script.
       `pull_models.ps1` now also pre-fetches the spaCy model Kokoro's phonemiser needs: misaki
