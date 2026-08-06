@@ -103,8 +103,41 @@ class TestTauriWindow:
         assert "https://" not in csp
         assert "*" not in csp.split("connect-src")[1].split(";")[0]
 
-    def test_frontend_dist_points_at_the_sources(self, conf: dict) -> None:
-        assert conf["build"]["frontendDist"]
+    def test_frontend_dist_points_at_the_build_output(self, conf: dict) -> None:
+        """T-3.2: the shipped HUD has to be the bundled one, not the sources.
+
+        orb.js imports 'three' by bare specifier, which no browser can resolve.
+        Pointing frontendDist at src/ shipped that import verbatim, so the built
+        HUD loaded a blank window.
+        """
+        dist = conf["build"]["frontendDist"]
+        assert dist == "../dist", f"frontendDist is {dist!r}, which skips bundling"
+
+        vite = (APP / "vite.config.js").read_text(encoding="utf-8")
+        assert "outDir: '../dist'" in vite, "vite and tauri disagree about the output directory"
+
+    def test_the_bundler_runs_before_the_build(self, conf: dict) -> None:
+        """Without this, frontendDist points at a directory nothing populated."""
+        assert conf["build"]["beforeBuildCommand"] == "npm run build"
+
+    def test_dev_mode_serves_through_vite(self, conf: dict) -> None:
+        assert conf["build"]["beforeDevCommand"] == "npm run dev"
+        assert conf["build"]["devUrl"] == "http://localhost:5173"
+
+    def test_the_dev_url_matches_the_vite_port(self, conf: dict) -> None:
+        vite = (APP / "vite.config.js").read_text(encoding="utf-8")
+        port = conf["build"]["devUrl"].rsplit(":", 1)[1]
+        assert f"port: {port}" in vite
+
+    def test_the_sources_still_use_a_bare_specifier(self) -> None:
+        """Guards the reason the bundler is mandatory rather than optional.
+
+        If this ever stops being true the import was inlined by hand, and the
+        frontendDist assertion above should be revisited rather than silently
+        left pointing at a build step nothing needs.
+        """
+        source = (APP / "src" / "orb.js").read_text(encoding="utf-8")
+        assert "from 'three'" in source
 
 
 class TestOrb:

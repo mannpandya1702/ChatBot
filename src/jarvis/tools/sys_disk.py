@@ -67,7 +67,19 @@ class DiskOutput(ToolOutput):
         default_factory=list,
         description="Up to 5 volumes, fullest first, so the one at risk is mentioned first.",
     )
-    total_free_gb: float = Field(description="Combined free space across all volumes.")
+    volume_count: int = Field(
+        default=0,
+        description=(
+            "How many volumes are mounted in total. When this is more than 5, the volumes "
+            "list holds only the fullest 5 but the totals still cover every one."
+        ),
+    )
+    total_free_gb: float = Field(
+        description="Combined free space across every mounted volume, in gigabytes."
+    )
+    total_capacity_gb: float = Field(
+        default=0.0, description="Combined capacity of every mounted volume, in gigabytes."
+    )
     read_mb_per_s: float | None = Field(
         default=None, description="Read throughput in megabytes per second, when sampled."
     )
@@ -104,7 +116,13 @@ def _describe_volume(percent: float, free_gb: float) -> str:
 
 
 def _volumes() -> list[VolumeUsage]:
-    """Enumerate mounted volumes, skipping ones that cannot be read."""
+    """Every readable mounted volume, fullest first.
+
+    Returns all of them, not the spoken five. The list the model sees is capped
+    by the caller; the totals are computed here over the whole set, because a
+    machine with more than five volumes would otherwise be told it has less
+    free space than it does.
+    """
     rows: list[VolumeUsage] = []
     for part in psutil.disk_partitions(all=False):
         # Optical drives and unmounted card readers raise on Windows.
@@ -126,7 +144,7 @@ def _volumes() -> list[VolumeUsage]:
             )
         )
     rows.sort(key=lambda row: row.percent_used, reverse=True)
-    return rows[:_MAX_VOLUMES]
+    return rows
 
 
 def _throughput(interval_s: float) -> tuple[float | None, float | None]:
@@ -227,8 +245,11 @@ def disk_status(params: DiskInput) -> DiskOutput:
             read_rate, write_rate = _throughput(0.5)
 
         return DiskOutput(
-            volumes=volumes,
+            # Speak the fullest five, but total across all of them.
+            volumes=volumes[:_MAX_VOLUMES],
+            volume_count=len(volumes),
             total_free_gb=round(sum(v.free_gb for v in volumes), 2),
+            total_capacity_gb=round(sum(v.total_gb for v in volumes), 2),
             read_mb_per_s=read_rate,
             write_mb_per_s=write_rate,
             smart_status=smart_health() if params.include_smart else None,

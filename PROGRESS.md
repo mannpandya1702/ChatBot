@@ -65,7 +65,9 @@ cover.
 - [x] T-2.3 `DONE` - `tools/sys_memory.py`.
 - [x] T-2.4 `DONE` - `tools/sys_disk.py`. `Win32_Product` is never called, enforced by a test that
       parses the module's AST rather than grepping, so the docstring explaining the ban does not
-      trip it.
+      trip it. `total_free_gb` now sums every mounted volume rather than only the five that
+      survive the spoken cap, and `volume_count` says how many there are, so a machine with more
+      than five volumes is no longer told it has less free space than it does.
 - [x] T-2.5 `DONE` - `tools/sys_gpu.py`. Per-sensor degradation: a card that does not report fan
       speed still yields temperature and clocks.
 - [x] T-2.6 `DONE` - `tools/sys_network.py`.
@@ -88,7 +90,10 @@ cover.
       Note: fixed a shutdown ordering defect where stopping the loop from outside left
       `Server._close` as a never-awaited coroutine.
 - [x] T-3.2 `DONE` - Tauri scaffold. Frameless, transparent, always on top, click-through with a
-      toggle, no taskbar entry, tray with show/hide/quit. Build needs Windows, see M-6.
+      toggle, no taskbar entry, tray with show/hide/quit. `frontendDist` now points at the vite
+      build output rather than the raw sources, with `beforeBuildCommand` wired in: shipping the
+      sources meant shipping `orb.js`'s bare `import ... from 'three'`, which no browser can
+      resolve, so the built HUD loaded a blank window. Build needs Windows, see M-6.
 - [x] T-3.3 `DONE` - Three.js orb, 2000 points, additive blending, per-particle drift, a palette
       per state. The update loop allocates nothing, enforced by a test. Visual check M-7.
 - [x] T-3.4 `DONE` - HUD panels, sparklines, rolling transcript, arc-reactor framing, draggable.
@@ -100,13 +105,20 @@ cover.
 - [x] T-4.1 `DONE` - `tools/gate.py`. Shipped before any mutating tool. Confirmation grants are
       single use and bound to the exact tool and arguments they were issued for.
 - [x] T-4.2 `DONE` - `tools/apps.py`. Launch resolves names only; paths, command lines, and any
-      resolution landing on a shell or script host are refused.
+      resolution landing on a shell or script host are refused. The shell refusal now matches the
+      words of the resolved name with its extension stripped, and separately checks what a
+      shortcut points at: matching executable names alone let the stock Start Menu entries
+      "Windows PowerShell.lnk", "Command Prompt.lnk", and "Windows Terminal.lnk" straight
+      through, which handed the model a shell with none of the §6 hardening on it.
 - [x] T-4.3 `DONE` - `tools/media.py`.
 - [x] T-4.4 `DONE` - `tools/files.py`. Everything CLI with a budgeted scandir fallback.
 - [x] T-4.5 `DONE` - `tools/vision.py`. Auto-disables below 6 GB VRAM.
 - [x] T-4.6 `DONE` - `tools/reminders.py`. The scheduler sleeps until the next due time.
-- [x] T-4.7 `DONE` - `tools/websearch.py`. Makes no outbound request until configured.
-- [x] T-4.8 `DONE` - `tools/shell.py`. All ten §6 rules, 83 red-team tests.
+- [x] T-4.7 `DONE` - `tools/websearch.py`. Makes no outbound request until configured. Redirects
+      are followed manually and only while they stay on the configured host, so a redirect cannot
+      carry the user's query to an address they never named (§0.1).
+- [x] T-4.8 `DONE` - `tools/shell.py`. All ten §6 rules, 83 red-team tests. The default allowlist
+      no longer lists PowerShell cmdlets, which §6 makes unreachable; see deviation 6.
 
 ## Phase 5 - Hardening
 
@@ -222,3 +234,16 @@ Recorded here rather than silently applied.
 
 5. **The 8-tasks-per-run stop condition** was lifted, as the operator asked for an end-to-end
    build in one run.
+
+6. **§6 makes PowerShell cmdlets unreachable, so they left the `shell.run` allowlist.** The two
+   rules are mutually exclusive as written. Reaching a cmdlet such as `Get-Date` means invoking
+   `powershell.exe -Command Get-Date`, and §6 blocks `-Command` (along with `-File` and `-enc`)
+   as a mandatory hardening rule. The shipped allowlist held ten `Get-*` cmdlets plus `ver`, a
+   `cmd.exe` builtin: eleven of sixteen entries were accepted by the allowlist and then refused
+   by the argument rule, and the tool description advertised `Get-Date` as an example of
+   something it could run. The default is now the five standalone executables that do run
+   (`systeminfo`, `ipconfig`, `hostname`, `whoami`, `tasklist`), and a test asserts no entry is a
+   cmdlet. The §6 rule was **not** relaxed to make cmdlets work, per §10. If cmdlet access is
+   wanted, that is a change to §6 and needs an explicit decision: the safe shape would be a
+   separate fixed-argv cmdlet allowlist that never takes a model-authored string, but that is a
+   contract amendment, not an implementation detail.

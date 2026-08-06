@@ -262,3 +262,82 @@ class TestRegistration:
         result = registry.dispatch("websearch.search", {"query": "x"})
         assert result.ok is True
         json.dumps(result.data)
+
+
+class TestTheQueryStaysOnTheConfiguredHost:
+    """§0.1: network access is permitted to the configured instance only.
+
+    Following a redirect off-host would send the user's search terms to an
+    address they never configured, which is exactly the leak the fully-local
+    constraint exists to prevent.
+    """
+
+    @staticmethod
+    def _redirect_to(location: str) -> Any:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "localhost" and "/search" in request.url.path:
+                return httpx.Response(302, headers={"location": location})
+            return httpx.Response(200, json={"results": []})
+
+        return handler
+
+    @pytest.mark.parametrize(
+        "location",
+        [
+            "https://search.evil.test/search",
+            "http://192.0.2.44:8080/search",
+            "//exfiltrate.test/search",
+        ],
+    )
+    def test_a_redirect_to_another_host_is_not_followed(
+        self, location: str, enabled: JarvisConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen = _install(monkeypatch, self._redirect_to(location), enabled)
+
+        result = web_search(SearchInput(query="something private"))
+
+        assert result.available is False
+        assert "different address" in (result.reason or "")
+        hosts = {request.url.host for request in seen}
+        assert hosts == {"localhost"}, f"the query reached {hosts - {'localhost'}}"
+        for request in seen:
+            assert "something private" not in str(request.url) or request.url.host == "localhost"
+
+    def test_a_redirect_on_the_same_host_is_followed(
+        self, enabled: JarvisConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An http to https upgrade on the same host is legitimate."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.scheme == "http":
+                return httpx.Response(
+                    302, headers={"location": "https://localhost:8080/search?q=x&format=json"}
+                )
+            return httpx.Response(200, json={"results": [{"title": "T", "url": "u"}]})
+
+        seen = _install(monkeypatch, handler, enabled)
+        result = web_search(SearchInput(query="x"))
+
+        assert result.available is True
+        assert {request.url.host for request in seen} == {"localhost"}
+        assert len(seen) == 2
+
+    def test_a_redirect_loop_terminates(
+        self, enabled: JarvisConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(302, headers={"location": "http://localhost:8080/search"})
+
+        seen = _install(monkeypatch, handler, enabled)
+        result = web_search(SearchInput(query="x"))
+
+        assert result.available is False
+        assert len(seen) <= websearch_module._MAX_REDIRECTS + 1
+
+    def test_the_client_does_not_auto_follow_redirects(self) -> None:
+        """The guard lives in the request path, so httpx must not pre-empt it."""
+        client = websearch_module._client()
+        try:
+            assert client.follow_redirects is False
+        finally:
+            client.close()

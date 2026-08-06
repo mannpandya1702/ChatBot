@@ -8,6 +8,7 @@ Every one asserts that nothing ran.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -597,3 +598,57 @@ class TestVerdictShape:
         verdict = validate_command("Get-Date", None, config)
         assert verdict.allowed is False
         assert "not found on the path" in verdict.reason
+
+
+class TestTheDefaultAllowlistCanActuallyRun:
+    """An allowlist entry that is always refused is a false advertisement.
+
+    The shipped list held ten PowerShell cmdlets. Reaching a cmdlet means
+    powershell.exe -Command, and §6 blocks -Command, so every one of them was
+    accepted by the allowlist and then refused by rule 4. The tool description
+    named Get-Date as an example of something it could run.
+    """
+
+    def test_no_entry_is_a_powershell_cmdlet(self) -> None:
+        from jarvis.config import load_defaults
+
+        allowlist = load_defaults().shell.allowlist
+        cmdlets = [name for name in allowlist if "-" in name]
+        assert cmdlets == [], (
+            f"{cmdlets} are cmdlets, which §6 makes unreachable because it blocks -Command"
+        )
+
+    def test_every_entry_is_a_bare_executable_name(self) -> None:
+        from jarvis.config import load_defaults
+
+        for name in load_defaults().shell.allowlist:
+            assert name == Path(name).name, f"{name} carries a path"
+            assert name.isascii() and name.replace(".", "").isalnum(), name
+
+    def test_the_description_only_names_runnable_examples(self) -> None:
+        from jarvis.config import load_defaults
+        from jarvis.tools.registry import registry
+
+        spec = registry.get("shell.run")
+        assert spec is not None
+        allowlist = {name.lower() for name in load_defaults().shell.allowlist}
+        # Pull the "such as X or Y" examples out of the description and check
+        # each one is something the allowlist actually permits.
+        match = re.search(r"such as ([\w-]+) or ([\w-]+)", spec.description)
+        assert match is not None, "the description no longer names examples"
+        for example in match.groups():
+            assert example.lower() in allowlist, f"{example} is advertised but not allowlisted"
+
+    def test_a_cmdlet_is_still_refused_if_someone_adds_one(
+        self, tmp_path: Path
+    ) -> None:
+        """Removing them from the default is not the safety control; rule 4 is."""
+        from jarvis.config import load_config
+
+        config = load_config(
+            tmp_path / "absent.yaml",
+            shell={"enabled": True, "allowlist": ["Get-Date"]},
+            tools={"enable_shell": True},
+        )
+        verdict = validate_command("Get-Date", None, config)
+        assert verdict.allowed is False

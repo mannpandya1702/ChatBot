@@ -373,8 +373,8 @@ def _truncate(text: str, limit: int) -> tuple[str, bool]:
     name="shell.run",
     description=(
         "Run a single allowlisted read-only command and return its output. "
-        "Only commands on the configured allowlist are permitted, such as Get-Date or "
-        "systeminfo. Pipes, redirection, chaining, and command substitution are refused. "
+        "Only commands on the configured allowlist are permitted, such as systeminfo or "
+        "ipconfig. Pipes, redirection, chaining, and command substitution are refused. "
         "This tool changes system state in principle, so it always requires the user to "
         "confirm out loud first, and it is disabled unless explicitly turned on in the "
         "configuration. Output is truncated to 4 kilobytes."

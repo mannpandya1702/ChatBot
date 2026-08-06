@@ -8,6 +8,9 @@ from pathlib import Path
 
 import pytest
 
+from jarvis.tools.registry import ToolCategory as _ToolCategory
+from jarvis.tools.registry import ToolInput as _ToolInput
+from jarvis.tools.registry import ToolOutput as _ToolOutput
 from jarvis.util import platform as plat
 from jarvis.util.errors import (
     ConfigError,
@@ -327,3 +330,79 @@ class _FakeClock:
 
     def __call__(self) -> float:
         return self.now
+
+
+class _RedactIn(_ToolInput):
+    """Input for the redaction dispatch test. Module level so get_type_hints resolves it."""
+
+
+class _RedactOut(_ToolOutput):
+    """Output for the redaction dispatch test."""
+
+    ok: bool = True
+
+
+class TestRedaction:
+    """Error text that travels to the model must not carry the user with it."""
+
+    def test_windows_home_path_is_removed(self) -> None:
+        from jarvis.util.errors import redact
+
+        text = r"FileNotFoundError: 'C:\Users\mann\AppData\Roaming\jarvis\config.yaml'"
+        result = redact(text)
+        assert "mann" not in result
+        assert "AppData" not in result
+        assert "<path>" in result
+        assert "FileNotFoundError" in result, "the model still needs the failure kind"
+
+    def test_posix_home_paths_are_removed(self) -> None:
+        from jarvis.util.errors import redact
+
+        for text in ("/home/mann/notes/private.txt", "/Users/mann/Desktop/tax.pdf"):
+            result = redact(f"OSError: could not open {text}")
+            assert "mann" not in result
+            assert "<path>" in result
+
+    def test_url_credentials_are_removed(self) -> None:
+        from jarvis.util.errors import redact
+
+        result = redact("ConnectError: http://admin:hunter2@localhost:8080/search failed")
+        assert "hunter2" not in result
+        assert "admin" not in result
+        assert "localhost:8080" in result, "the host itself is not a secret"
+
+    def test_system_paths_are_left_alone(self) -> None:
+        """Over-redacting would strip the detail that makes an error useful."""
+        from jarvis.util.errors import redact
+
+        text = r"OSError: C:\Windows\System32\drivers\etc\hosts is not readable"
+        assert redact(text) == text
+
+    def test_ordinary_text_is_unchanged(self) -> None:
+        from jarvis.util.errors import redact
+
+        text = "ToolExecutionError: the sensor bus did not respond within 5 seconds"
+        assert redact(text) == text
+
+    def test_a_failing_tool_does_not_hand_the_model_a_user_path(self) -> None:
+        """The end-to-end path: dispatch, then what for_llm actually sends."""
+        from jarvis.tools.registry import ToolRegistry, tool
+
+        isolated = ToolRegistry()
+
+        @tool(
+            name="demo.explode",
+            description="A tool that fails, used to check what failure text travels.",
+            category=_ToolCategory.SYSTEM,
+            read_only=True,
+            target=isolated,
+        )
+        def _explode(params: _RedactIn) -> _RedactOut:
+            raise FileNotFoundError(
+                2, "No such file or directory", r"C:\Users\mann\secrets\token.txt"
+            )
+
+        payload = str(isolated.dispatch("demo.explode", {}).for_llm())
+        assert "mann" not in payload
+        assert "secrets" not in payload
+        assert "FileNotFoundError" in payload

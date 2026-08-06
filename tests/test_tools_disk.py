@@ -53,6 +53,75 @@ class TestDiskStatus:
             assert volume.total_gb >= volume.used_gb
             assert 0 <= volume.percent_used <= 100
 
+
+class TestTotalsCoverEveryVolume:
+    """§5 forbids inventing metrics, and an understated total is an invented one.
+
+    The spoken list is capped at 5, but the totals are not: a machine with more
+    volumes than that was being told it had less free space than it really did.
+    """
+
+    @staticmethod
+    def _fake_volumes(count: int) -> Any:
+        from jarvis.tools.sys_disk import VolumeUsage
+
+        def _make() -> list[VolumeUsage]:
+            return [
+                VolumeUsage(
+                    mount=f"V{index}:",
+                    filesystem="NTFS",
+                    total_gb=100.0,
+                    used_gb=float(index),
+                    free_gb=10.0,
+                    # Descending, so _volumes' fullest-first order is preserved.
+                    percent_used=float(90 - index),
+                    status="healthy",
+                )
+                for index in range(count)
+            ]
+
+        return _make
+
+    def test_free_space_sums_every_volume_not_just_the_spoken_five(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(sys_disk, "_volumes", self._fake_volumes(8))
+
+        result = disk_status(DiskInput(include_throughput=False, include_smart=False))
+
+        assert len(result.volumes) == 5, "the spoken list is still capped"
+        assert result.volume_count == 8
+        assert result.total_free_gb == pytest.approx(80.0), "8 volumes at 10 GB each"
+        assert result.total_capacity_gb == pytest.approx(800.0)
+
+    def test_the_totals_match_the_list_when_it_is_not_capped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(sys_disk, "_volumes", self._fake_volumes(3))
+
+        result = disk_status(DiskInput(include_throughput=False, include_smart=False))
+
+        assert result.volume_count == 3
+        assert len(result.volumes) == 3
+        assert result.total_free_gb == pytest.approx(
+            sum(v.free_gb for v in result.volumes)
+        )
+
+    def test_no_volumes_reports_zero_rather_than_failing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(sys_disk, "_volumes", lambda: [])
+
+        result = disk_status(DiskInput(include_throughput=False, include_smart=False))
+
+        assert result.volume_count == 0
+        assert result.total_free_gb == 0.0
+
+    def test_the_real_totals_are_at_least_the_listed_ones(self) -> None:
+        result = disk_status(DiskInput(include_throughput=False, include_smart=False))
+        assert result.total_free_gb >= sum(v.free_gb for v in result.volumes) - 0.01
+        assert result.volume_count >= len(result.volumes)
+
     def test_throughput_is_opt_in(self) -> None:
         result = disk_status(DiskInput())
         assert result.read_mb_per_s is None

@@ -30,6 +30,7 @@ from jarvis.util.errors import (
     PlatformUnsupportedError,
     SafetyViolationError,
     as_speakable,
+    redact,
 )
 from jarvis.util.platform import is_windows
 
@@ -338,11 +339,17 @@ class ToolRegistry:
 
 
 def _fail(spec: ToolSpec, exc: BaseException, started: float) -> ToolResult:
-    """Build the failure result for a tool that raised."""
+    """Build the failure result for a tool that raised.
+
+    The message is redacted because this result travels: it goes to the model
+    as the tool message and is persisted into conversation memory, so a stray
+    home directory path in an OSError would be replayed on every later turn.
+    The unredacted traceback is already in the log, which stays on the machine.
+    """
     return ToolResult(
         tool=spec.name,
         ok=False,
-        error=f"{type(exc).__name__}: {exc}",
+        error=redact(f"{type(exc).__name__}: {exc}"),
         speakable=as_speakable(exc),
         duration_ms=(time.perf_counter() - started) * 1000.0,
     )

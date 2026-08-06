@@ -93,6 +93,117 @@ class TestLaunchSafety:
         assert "only open applications by name" in excinfo.value.speakable
 
 
+class TestStartMenuCannotSmuggleAShell:
+    """The Start Menu reaches shells under display names, not executable names.
+
+    Checking only the executable name let "Windows PowerShell.lnk" through,
+    which handed the model a shell with none of the §6 hardening on it.
+    """
+
+    @staticmethod
+    def _start_menu(tmp_path: Path, *names: str) -> Path:
+        programs = tmp_path / "Microsoft/Windows/Start Menu/Programs"
+        programs.mkdir(parents=True, exist_ok=True)
+        for name in names:
+            (programs / name).write_bytes(b"")
+        return tmp_path
+
+    @pytest.mark.parametrize(
+        ("shortcut", "asked_for"),
+        [
+            ("Windows PowerShell.lnk", "powershell"),
+            ("Windows PowerShell ISE.lnk", "powershell ise"),
+            ("Windows PowerShell (x86).lnk", "powershell (x86)"),
+            ("Command Prompt.lnk", "command prompt"),
+            ("Windows Terminal.lnk", "windows terminal"),
+            ("Developer Command Prompt.lnk", "developer command prompt"),
+            ("Registry Editor.lnk", "registry editor"),
+            ("Python 3.12.lnk", "python 3.12"),
+        ],
+    )
+    def test_a_shell_shortcut_is_refused(
+        self,
+        shortcut: str,
+        asked_for: str,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        root = self._start_menu(tmp_path, shortcut)
+        monkeypatch.setattr(apps_module, "is_windows", lambda: True)
+        monkeypatch.setattr(apps_module.shutil, "which", lambda _n: None)
+        monkeypatch.setenv("APPDATA", str(root))
+        monkeypatch.setenv("PROGRAMDATA", str(root))
+
+        with pytest.raises(SafetyViolationError):
+            resolve_application(asked_for)
+
+    @pytest.mark.parametrize(
+        ("shortcut", "asked_for"),
+        [
+            ("Adobe Photoshop.lnk", "photoshop"),
+            ("PowerToys.lnk", "powertoys"),
+            ("Slack.lnk", "slack"),
+            ("Blender.lnk", "blender"),
+        ],
+    )
+    def test_an_ordinary_application_still_resolves(
+        self,
+        shortcut: str,
+        asked_for: str,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The word check must not swallow names that merely look similar."""
+        root = self._start_menu(tmp_path, shortcut)
+        monkeypatch.setattr(apps_module, "is_windows", lambda: True)
+        monkeypatch.setattr(apps_module.shutil, "which", lambda _n: None)
+        monkeypatch.setenv("APPDATA", str(root))
+        monkeypatch.setenv("PROGRAMDATA", str(root))
+
+        resolved = resolve_application(asked_for)
+        assert resolved is not None
+        assert Path(resolved).name == shortcut
+
+    def test_a_shortcut_pointing_at_a_shell_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A shortcut's name is a display name, so the target is checked too."""
+        root = self._start_menu(tmp_path, "Innocent Helper.lnk")
+        monkeypatch.setattr(apps_module, "is_windows", lambda: True)
+        monkeypatch.setattr(apps_module.shutil, "which", lambda _n: None)
+        monkeypatch.setenv("APPDATA", str(root))
+        monkeypatch.setenv("PROGRAMDATA", str(root))
+        # The name passes; only the target gives it away.
+        assert apps_module._forbidden_reason("Innocent Helper.lnk") is None
+        monkeypatch.setattr(
+            apps_module,
+            "_shortcut_target",
+            lambda _p: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        )
+
+        with pytest.raises(SafetyViolationError):
+            resolve_application("innocent helper")
+
+    def test_an_unreadable_shortcut_target_still_falls_back_to_the_name(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Failing to read the target may never turn a refusal into a launch."""
+        root = self._start_menu(tmp_path, "Command Prompt.lnk")
+        monkeypatch.setattr(apps_module, "is_windows", lambda: True)
+        monkeypatch.setattr(apps_module.shutil, "which", lambda _n: None)
+        monkeypatch.setenv("APPDATA", str(root))
+        monkeypatch.setenv("PROGRAMDATA", str(root))
+        monkeypatch.setattr(apps_module, "_shortcut_target", lambda _p: None)
+
+        with pytest.raises(SafetyViolationError):
+            resolve_application("command prompt")
+
+    def test_the_tool_description_matches_the_behaviour(self) -> None:
+        """§5: the description drives tool choice, so it must be true."""
+        spec = next(s for s in registry if s.name == "apps.launch")
+        assert "shell" in spec.description.lower()
+
+
 class TestOffWindows:
     def test_launch_reports_platform(self) -> None:
         result = launch_app(AppLaunchInput(name="notepad"))

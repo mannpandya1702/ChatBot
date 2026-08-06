@@ -430,12 +430,15 @@ class ShellConfig(_Section):
 
     enabled: bool = False
     #: Allowlist first. A command not on this list is refused outright.
+    #:
+    #: Standalone executables only. PowerShell cmdlets such as Get-Date cannot
+    #: appear here: reaching a cmdlet means invoking powershell.exe -Command,
+    #: and §6 blocks -Command as a mandatory hardening rule. Listing them
+    #: anyway just advertised commands that were always refused. Everything
+    #: here is read-only and resolvable on PATH on Windows 11.
     allowlist: list[str] = Field(
         default_factory=lambda: [
-            "Get-Date", "Get-Uptime", "Get-ComputerInfo", "Get-Process",
-            "Get-Service", "Get-Volume", "Get-PSDrive", "Get-NetAdapter",
-            "Get-HotFix", "Get-WindowsUpdateLog", "systeminfo", "ipconfig",
-            "hostname", "whoami", "tasklist", "ver",
+            "systeminfo", "ipconfig", "hostname", "whoami", "tasklist",
         ]
     )
     #: Secondary layer only (§6). The allowlist is the primary control.

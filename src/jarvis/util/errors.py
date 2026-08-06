@@ -7,6 +7,7 @@ aloud without exposing a stack trace or raw JSON.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 __all__ = [
@@ -22,6 +23,7 @@ __all__ = [
     "ToolExecutionError",
     "TtsError",
     "as_speakable",
+    "redact",
 ]
 
 
@@ -172,3 +174,24 @@ def as_speakable(exc: BaseException) -> str:
     if isinstance(exc, JarvisError):
         return exc.speakable
     return "Something went wrong on my end."
+
+
+#: Home directory paths, which name the user, and URL userinfo, which carries
+#: credentials. Both turn up verbatim in ordinary OSError and httpx messages.
+_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"[A-Za-z]:\\+Users\\+[^\\\"'\s]+(?:\\+[^\"'\s]*)?"), "<path>"),
+    (re.compile(r"/(?:home|Users)/[^/\"'\s]+(?:/[^\"'\s]*)?"), "<path>"),
+    (re.compile(r"(?<=://)[^/@\s]+:[^/@\s]+@"), "<credentials>@"),
+)
+
+
+def redact(text: str) -> str:
+    """Strip user-identifying paths and URL credentials from error text.
+
+    The full text still reaches the log file, which is local. This is for the
+    copies that travel: the tool error handed to the model, which is persisted
+    into the conversation memory and re-sent on every later turn.
+    """
+    for pattern, replacement in _REDACTIONS:
+        text = pattern.sub(replacement, text)
+    return text

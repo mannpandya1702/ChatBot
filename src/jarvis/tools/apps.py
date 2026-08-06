@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -75,6 +76,41 @@ _FORBIDDEN_TARGETS = frozenset(
         "bash.exe", "wsl.exe", "sh.exe", "python.exe", "certutil.exe",
     }
 )
+
+#: Words that mark a target as a shell, a script host, or a general-purpose
+#: interpreter. Matched against the words of the resolved name with the
+#: extension stripped, because the Start Menu reaches the same executables
+#: under display names: "Windows PowerShell.lnk", "Command Prompt.lnk",
+#: "Windows Terminal.lnk". Matching whole words rather than substrings keeps
+#: "Photoshop" and "PowerToys" launchable.
+_FORBIDDEN_WORDS = frozenset(
+    {
+        "cmd", "command", "prompt", "console", "shell", "powershell", "pwsh",
+        "terminal", "wt", "conhost", "wscript", "cscript", "mshta", "rundll32",
+        "regsvr32", "regedit", "registry", "wmic", "bash", "zsh", "wsl", "sh",
+        "python", "python3", "py", "perl", "ruby", "node", "certutil", "ise",
+    }
+)
+
+
+def _forbidden_reason(target: str) -> str | None:
+    """Say why a resolved target may not be launched, or None if it may be.
+
+    Checks the full file name against the executable set and, separately, the
+    words of the name with its extension removed. The second check is what
+    catches a Start Menu shortcut, whose name is a display name rather than an
+    executable name.
+    """
+    name = Path(target).name.lower()
+    if name in _FORBIDDEN_TARGETS:
+        return name
+
+    stem = Path(target).stem.lower()
+    words = {word for word in re.split(r"[^a-z0-9]+", stem) if word}
+    hit = words & _FORBIDDEN_WORDS
+    if hit:
+        return sorted(hit)[0]
+    return None
 
 
 class WindowInfo(ToolOutput):
@@ -173,12 +209,39 @@ def resolve_application(name: str) -> str | None:
     if target is None:
         return None
 
-    if Path(target).name.lower() in _FORBIDDEN_TARGETS:
+    # Check the name, then what a shortcut actually resolves to. Both must pass.
+    reason = _forbidden_reason(target)
+    if reason is None:
+        pointed_at = _shortcut_target(target)
+        if pointed_at is not None:
+            reason = _forbidden_reason(pointed_at)
+    if reason is not None:
         raise SafetyViolationError(
-            f"apps.launch will not start {target}",
+            f"apps.launch will not start {target} (matched {reason!r})",
             speakable="I am not permitted to open that.",
         )
     return target
+
+
+def _shortcut_target(path: str) -> str | None:
+    """Best-effort read of what a ``.lnk`` actually points at.
+
+    A shortcut's file name is a display name, so it can say "Notepad" and point
+    at a shell. Reading the real target closes that gap. Windows-only and
+    best-effort: when the COM call is unavailable or fails, the caller still has
+    the name check, so this can only ever add a refusal, never permit one.
+    """
+    if not is_windows() or not path.lower().endswith(".lnk"):
+        return None
+    try:
+        import win32com.client  # §0b: Windows-only, imported lazily
+
+        shell = win32com.client.Dispatch("WScript.Shell")
+        target = str(shell.CreateShortCut(path).Targetpath or "").strip()
+    except Exception:  # noqa: BLE001 - a failed read must not block a launch
+        _log.debug("could not read the target of %s", path, exc_info=True)
+        return None
+    return target or None
 
 
 def _find_start_menu_shortcut(needle: str) -> str | None:

@@ -197,10 +197,11 @@ gate:
 # ---------------------------------------------------------------------------
 shell:
   enabled: false
-  allowlist: [Get-Date, Get-Uptime, Get-ComputerInfo, Get-Process, Get-Service,
-              Get-Volume, Get-PSDrive, Get-NetAdapter, Get-HotFix,
-              Get-WindowsUpdateLog, systeminfo, ipconfig, hostname, whoami,
-              tasklist, ver]
+  # Standalone executables only. A PowerShell cmdlet (Get-Date and friends)
+  # cannot go here: running one means powershell.exe -Command, and -Command is
+  # blocked below as a mandatory safety rule. A cmdlet on this list would be
+  # accepted by the allowlist and then refused, every time.
+  allowlist: [systeminfo, ipconfig, hostname, whoami, tasklist]
   blocked_commands: [rm, del, rmdir, format, diskpart, shutdown, restart, reg,
                      regedit, net, netsh, takeown, icacls, sc, bcdedit,
                      vssadmin, cipher]

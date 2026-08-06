@@ -66,13 +66,62 @@ class SearchOutput(ToolOutput):
     )
 
 
+#: How many same-host redirects to follow. A SearXNG instance behind a proxy
+#: may legitimately bounce http to https on the same host; more hops than this
+#: is a loop or a misconfiguration.
+_MAX_REDIRECTS = 3
+
+
 def _client() -> httpx.Client:
-    """HTTP client for the configured SearXNG instance."""
+    """HTTP client for the configured SearXNG instance.
+
+    Redirects are followed manually rather than by httpx, so that a hop to a
+    different host can be refused. §0.1 permits network access to the SearXNG
+    instance the user configured and to nothing else, and httpx following a
+    redirect off-host would send the user's query to an address they never
+    named.
+    """
     return httpx.Client(
         timeout=httpx.Timeout(_TIMEOUT_S, connect=5.0),
-        follow_redirects=True,
+        follow_redirects=False,
         headers={"User-Agent": "jarvis-local-assistant"},
     )
+
+
+def _same_origin(first: httpx.URL, second: httpx.URL) -> bool:
+    """Whether two URLs address the same host and port.
+
+    The scheme is allowed to change so an http to https upgrade still works;
+    the host and the effective port are not.
+    """
+    return first.host == second.host and first.port == second.port
+
+
+def _get_following_same_host_redirects(
+    client: httpx.Client, url: str, params: dict[str, str | int]
+) -> httpx.Response:
+    """GET ``url``, following redirects only while they stay on the same host.
+
+    Returns:
+        The final response. A redirect pointing at another host is returned
+        as-is, unfollowed, so the caller reports it rather than chasing it.
+    """
+    response = client.get(url, params=params)
+    for _ in range(_MAX_REDIRECTS):
+        if not response.is_redirect:
+            return response
+        target = response.headers.get("location")
+        if not target:
+            return response
+        destination = response.url.join(target)
+        if not _same_origin(destination, response.url):
+            _log.warning(
+                "refusing a search redirect to another host",
+                extra={"context": {"from": response.url.host, "to": destination.host}},
+            )
+            return response
+        response = client.get(destination)
+    return response
 
 
 @tool(
@@ -126,7 +175,15 @@ def web_search(params: SearchInput) -> SearchOutput:
 
     try:
         with _client() as client:
-            response = client.get(f"{base_url.rstrip('/')}/search", params=request)
+            response = _get_following_same_host_redirects(
+                client, f"{base_url.rstrip('/')}/search", request
+            )
+        if response.is_redirect:
+            return SearchOutput(
+                available=False,
+                reason="the SearXNG instance redirected the search to a different address",
+                query=params.query,
+            )
     except httpx.ConnectError:
         return SearchOutput(
             available=False,
