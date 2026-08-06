@@ -1,0 +1,55 @@
+# User-specific configuration. Never commit. config.example.yaml is the template.
+config/config.yaml
+
+# Downloaded model artifacts.
+models/
+*.onnx
+*.gguf
+*.bin
+*.pt
+*.pth
+*.safetensors
+
+# Runtime logs and audit trails.
+logs/
+*.log
+*.jsonl
+
+# Local databases.
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+.coverage
+htmlcov/
+
+# Benchmarks write here at runtime.
+bench/results.json
+
+# Node / Tauri
+node_modules/
+src/jarvis/ui/app/dist/
+src/jarvis/ui/app/src-tauri/target/
+src/jarvis/ui/app/src-tauri/gen/
+
+# Helper build output
+jarvis-helper.exe
+scripts/build/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

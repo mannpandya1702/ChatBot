@@ -1,0 +1,269 @@
+# JARVIS configuration template.
+#
+# Copy this file to config/config.yaml and edit. config.yaml is gitignored and is
+# the only place machine-specific values or secrets belong (CLAUDE.md §0.6).
+#
+# Every value below is optional. Deleting a key restores its default, so the
+# smallest valid config.yaml is an empty file. Values shown are the defaults
+# unless the comment says otherwise.
+#
+# Environment variables override this file. They are prefixed JARVIS_ and nested
+# with a double underscore, for example:
+#   JARVIS_LLM__MODEL=qwen3:14b
+#   JARVIS_LOGGING__LEVEL=DEBUG
+
+# ---------------------------------------------------------------------------
+# Directories. Relative paths resolve against the repository root.
+# ---------------------------------------------------------------------------
+paths:
+  data_dir: data
+  log_dir: logs
+  models_dir: models
+  vendor_dir: vendor
+
+# ---------------------------------------------------------------------------
+# Hardware. Leave tier as "auto" and run scripts/verify_cuda.py once; it detects
+# the machine and writes the resolved values back into this file.
+# Tiers: cpu | gpu-6 | gpu-8 | gpu-12 | gpu-16 | gpu-24  (CLAUDE.md §2)
+# ---------------------------------------------------------------------------
+hardware:
+  tier: auto
+  gpu_model: null
+  gpu_vram_gb: null
+  cpu_model: null
+  ram_gb: null
+  windows_version: null
+  cuda_available: null
+  cuda_version: null
+  driver_version: null
+
+# ---------------------------------------------------------------------------
+# Audio capture and playback.
+# Device may be an exact Windows device name or a sounddevice index.
+# null means "use the system default".
+# ---------------------------------------------------------------------------
+audio:
+  input_device: null
+  output_device: null
+  sample_rate: 16000        # Hz. Wake word, VAD, and STT all expect 16 kHz.
+  channels: 1
+  block_samples: 512        # 32 ms at 16 kHz, one Silero VAD frame.
+  ring_seconds: 2.0         # Circular pre-roll buffer depth.
+  output_sample_rate: 24000 # Kokoro synthesises at 24 kHz.
+  dtype: float32
+
+# ---------------------------------------------------------------------------
+# Wake word (openWakeWord).
+# ---------------------------------------------------------------------------
+wake:
+  enabled: true
+  model: hey_jarvis
+  threshold: 0.5            # Raise toward 0.7 if you get false accepts.
+  cooldown_s: 2.0
+  preroll_s: 1.0            # Audio replayed into STT from before the trigger.
+  frame_samples: 1280       # 80 ms at 16 kHz, what openWakeWord expects.
+  vad_threshold: 0.0        # openWakeWord's own noise gate. 0 disables it.
+  inference_framework: onnx
+
+# ---------------------------------------------------------------------------
+# Endpointing (Silero VAD). Budget: decision within 250 ms (CLAUDE.md §3).
+# ---------------------------------------------------------------------------
+vad:
+  threshold: 0.5
+  min_speech_ms: 250
+  trailing_silence_ms: 500
+  max_utterance_s: 30.0
+  speech_pad_ms: 100
+  frame_samples: 512
+  barge_in_threshold: 0.7   # Higher than `threshold` so leaked TTS audio does
+  barge_in_min_speech_ms: 200  # not make the assistant interrupt itself.
+
+# ---------------------------------------------------------------------------
+# Speech to text. null fields inherit from the hardware tier profile.
+# engine: auto | faster-whisper | whispercpp
+# ---------------------------------------------------------------------------
+stt:
+  engine: auto
+  model: null               # e.g. distil-large-v3, small.en, base.en
+  device: null              # cuda | cpu
+  compute_type: null        # int8 | float16
+  language: en
+  beam_size: 1
+  vad_filter: false
+  condition_on_previous_text: false
+  min_audio_ms: 200
+  download_root: null
+
+# ---------------------------------------------------------------------------
+# Text to speech (Kokoro-82M). Voices: bm_george, bm_fable, bm_lewis, bm_daniel.
+# ---------------------------------------------------------------------------
+tts:
+  enabled: true
+  voice: bm_george
+  lang_code: b              # "b" is British English, matching the bm_* voices.
+  speed: 1.0
+  sample_rate: 24000
+  min_chunk_chars: 24
+  max_chunk_chars: 240
+  stop_latency_ms: 100
+
+# ---------------------------------------------------------------------------
+# Local LLM via Ollama. model null inherits from the hardware tier profile.
+# ---------------------------------------------------------------------------
+llm:
+  base_url: http://localhost:11434
+  model: null               # e.g. qwen3:8b
+  temperature: 0.6
+  top_p: 0.95
+  num_ctx: 8192
+  num_predict: 512
+  keep_alive: 10m
+  request_timeout_s: 120.0
+  connect_timeout_s: 5.0
+  max_tool_iterations: 4
+  tool_json_retries: 2
+  think: false              # Qwen3 thinking mode costs time to first token.
+
+# ---------------------------------------------------------------------------
+# Conversation memory, persisted to SQLite so context survives a restart.
+# ---------------------------------------------------------------------------
+memory:
+  enabled: true
+  db_path: data/memory.db
+  max_tokens: 3000
+  max_messages: 40
+  keep_recent: 8
+  summary_model: null       # null uses the main model.
+  session_id: default
+
+# ---------------------------------------------------------------------------
+# Persona. Drives the system prompt.
+# ---------------------------------------------------------------------------
+persona:
+  assistant_name: Jarvis
+  wake_word: hey_jarvis
+  user_address_form: sir    # Empty string for no form of address.
+  response_style: "terse, one or two spoken sentences unless asked to elaborate"
+  extra_instructions: null
+
+# ---------------------------------------------------------------------------
+# HUD WebSocket broadcaster and Tauri window.
+# ---------------------------------------------------------------------------
+ui:
+  enabled: true
+  host: 127.0.0.1
+  port: 8765
+  broadcast_hz: 30.0
+  hud_position: bottom-right   # top-left | top-center | top-right |
+                               # bottom-left | bottom-center | bottom-right
+  accent_color: "#22d3ee"
+  metrics_history: 60
+
+# ---------------------------------------------------------------------------
+# Elevated sidecar. Required for CPU temperatures, fan speeds, and the pending
+# Windows Update query. The main process stays non-elevated (CLAUDE.md §6).
+# ---------------------------------------------------------------------------
+helper:
+  enabled: true
+  pipe_name: jarvis-helper
+  exe_path: null            # null looks for jarvis-helper.exe next to the repo.
+  cache_ttl_s: 5.0
+  autostart: true
+  connect_timeout_s: 3.0
+  request_timeout_s: 10.0
+
+# ---------------------------------------------------------------------------
+# Confirmation gate for mutating tools. Timeout equals denial (CLAUDE.md §6).
+# ---------------------------------------------------------------------------
+gate:
+  confirmation_timeout_s: 15.0
+  # Quoted deliberately: bare yes/no are booleans in YAML, not strings.
+  affirmatives: ["yes", "yeah", "yep", "yup", "confirm", "confirmed", "do it",
+                 "go ahead", "affirmative", "please do", "proceed", "ok do it"]
+  negatives: ["no", "nope", "cancel", "stop", "abort", "negative",
+              "never mind", "nevermind"]
+  mutating_allowlist:
+    - apps.launch
+    - apps.focus
+    - media.control
+    - reminders.create
+    - reminders.delete
+    - shell.run
+  audit_log: logs/gate_audit.jsonl
+
+# ---------------------------------------------------------------------------
+# shell.run hardening. Every field here is a safety control (CLAUDE.md §6).
+# Disabled by default. Turn on tools.enable_shell as well to use it.
+# ---------------------------------------------------------------------------
+shell:
+  enabled: false
+  allowlist: [Get-Date, Get-Uptime, Get-ComputerInfo, Get-Process, Get-Service,
+              Get-Volume, Get-PSDrive, Get-NetAdapter, Get-HotFix,
+              Get-WindowsUpdateLog, systeminfo, ipconfig, hostname, whoami,
+              tasklist, ver]
+  blocked_commands: [rm, del, rmdir, format, diskpart, shutdown, restart, reg,
+                     regedit, net, netsh, takeown, icacls, sc, bcdedit,
+                     vssadmin, cipher]
+  blocked_operators: ["&", "&&", "|", "||", ";", "`", "$(", ">", ">>", "<", "\n", "\r"]
+  blocked_powershell_args: ["-enc", "-encodedcommand", "-command", "-e", "-ec",
+                            "-nop", "-noprofile", "-windowstyle",
+                            "-executionpolicy", "-file"]
+  max_command_length: 512
+  timeout_s: 30.0
+  max_output_bytes: 4096
+  working_dir_allowlist: []    # Empty means no working directory may be chosen.
+  audit_log: logs/shell_audit.jsonl
+
+# ---------------------------------------------------------------------------
+# Tool feature switches.
+# ---------------------------------------------------------------------------
+tools:
+  enable_shell: false
+  enable_vision: true        # Auto-disables on tiers with under 6 GB VRAM.
+  enable_websearch: false    # Requires searxng_url below.
+  enable_home_assistant: false
+  searxng_url: null          # e.g. http://localhost:8080
+  home_assistant_url: null   # e.g. http://homeassistant.local:8123
+  home_assistant_token: null # Secret. This file only, never CLAUDE.md.
+  everything_cli_path: null  # Path to es.exe. null probes PATH, then falls back
+                             # to os.scandir.
+  vision_model: qwen3-vl:8b
+  vision_fallback_model: moondream
+  max_results: 5
+  sample_interval_s: 0.5
+  reminders_db_path: data/reminders.db
+
+# ---------------------------------------------------------------------------
+# Logging. JSON lines to file, readable text to console.
+# ---------------------------------------------------------------------------
+logging:
+  level: INFO
+  console: true
+  console_level: null        # null follows `level`.
+  json_file: jarvis.jsonl
+  max_bytes: 10485760
+  backup_count: 5
+
+# ---------------------------------------------------------------------------
+# Latency instrumentation and budgets in milliseconds (CLAUDE.md §3).
+# ---------------------------------------------------------------------------
+latency:
+  enabled: true
+  budgets_ms:
+    vad_endpoint: 250.0
+    stt: 200.0
+    llm_first_token: 400.0
+    tts_first_audio: 300.0
+    turn_total: 1200.0
+  regression_tolerance: 0.15
+  results_path: bench/results.json
+
+# ---------------------------------------------------------------------------
+# Turn loop behaviour.
+# ---------------------------------------------------------------------------
+orchestrator:
+  idle_timeout_s: 30.0
+  barge_in: true
+  always_listening: false    # true skips the wake word. Useful for desk testing.
+  greeting: ""
+  max_turn_seconds: 120.0
