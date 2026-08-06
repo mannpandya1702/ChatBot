@@ -361,7 +361,8 @@ class UiConfig(_Section):
 
     enabled: bool = True
     host: str = "127.0.0.1"
-    port: int = Field(default=8765, ge=1, le=65_535)
+    #: 0 asks the OS for any free port, which tests use to avoid collisions.
+    port: int = Field(default=8765, ge=0, le=65_535)
     broadcast_hz: float = Field(default=30.0, ge=1.0, le=120.0)
     hud_position: Literal[
         "top-left", "top-center", "top-right",
