@@ -403,7 +403,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run_check(config: JarvisConfig) -> int:
-    """Report readiness without starting the assistant."""
+    """Report readiness without starting the assistant.
+
+    Only the things the voice loop cannot run without count towards readiness.
+    A capability the resolved tier deliberately turns off is reported, because
+    it is worth knowing, but it is not a failure and no amount of re-running
+    the setup scripts would change it.
+    """
     from jarvis.brain.llm import OllamaClient
     from jarvis.util.platform import has_cuda, has_module, is_windows
 
@@ -415,25 +421,45 @@ def run_check(config: JarvisConfig) -> int:
     except Exception:  # noqa: BLE001
         ollama_up = False
 
-    rows = [
-        ("platform", "Windows" if is_windows() else sys.platform),
-        ("hardware tier", str(config.effective_tier())),
-        ("llm model", config.llm_model()),
-        ("ollama reachable", "yes" if ollama_up else "no"),
-        ("cuda", "yes" if has_cuda() else "no"),
-        ("sounddevice", "yes" if has_module("sounddevice") else "no"),
-        ("openwakeword", "yes" if has_module("openwakeword") else "no"),
-        ("faster-whisper", "yes" if has_module("faster_whisper") else "no"),
-        ("kokoro", "yes" if has_module("kokoro") else "no"),
-        ("tools offered", str(tools)),
-        ("vision available", "yes" if config.vision_available() else "no"),
-        ("shell tool", "enabled" if config.shell.enabled else "disabled"),
+    tier = str(config.effective_tier())
+    faster_whisper = has_module("faster_whisper")
+    whispercpp = has_module("pywhispercpp")
+
+    if faster_whisper or whispercpp:
+        engine = "faster-whisper" if faster_whisper else "whisper.cpp"
+        stt = f"yes, {engine}"
+    else:
+        stt = "no"
+
+    if config.vision_available():
+        vision = "yes"
+    elif not config.tier_profile().supports_vision:
+        # §2: the VLM wants about 6 GB of VRAM. Below that the tool turns
+        # itself off by design, so say that rather than implying a fault.
+        vision = f"off, the {tier} tier has too little VRAM"
+    else:
+        vision = "off in the configuration"
+
+    #: (label, value, counts towards readiness)
+    rows: list[tuple[str, str, bool]] = [
+        ("platform", "Windows" if is_windows() else sys.platform, False),
+        ("hardware tier", tier, False),
+        ("llm model", config.llm_model(), False),
+        ("ollama reachable", "yes" if ollama_up else "no", True),
+        ("cuda", "yes" if has_cuda() else "no", False),
+        ("sounddevice", "yes" if has_module("sounddevice") else "no", True),
+        ("openwakeword", "yes" if has_module("openwakeword") else "no", True),
+        ("speech to text", stt, True),
+        ("kokoro", "yes" if has_module("kokoro") else "no", True),
+        ("tools offered", str(tools), False),
+        ("vision", vision, False),
+        ("shell tool", "enabled" if config.shell.enabled else "disabled", False),
     ]
-    width = max(len(name) for name, _ in rows)
-    for name, value in rows:
+    width = max(len(name) for name, _, _ in rows)
+    for name, value, _required in rows:
         print(f"{name:<{width}}  {value}")  # noqa: T201
 
-    missing = [name for name, value in rows if value == "no" and name != "cuda"]
+    missing = [name for name, value, required in rows if required and value == "no"]
     if missing:
         print(f"\nNot ready: {', '.join(missing)}")  # noqa: T201
         print("Run scripts\\setup_env.ps1 and scripts\\pull_models.ps1.")  # noqa: T201

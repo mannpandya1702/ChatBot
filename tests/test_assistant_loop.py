@@ -379,3 +379,91 @@ class TestLifecycle:
             assert assistant.supervisor.health().healthy is True
         finally:
             assistant.stop()
+
+
+class TestReadinessCheck:
+    """`--check` is what a user runs when something is wrong, so it must be right.
+
+    It reported "Not ready: vision available" on a cpu tier and told the reader
+    to re-run the setup scripts. Vision turns itself off below 6 GB of VRAM by
+    design (§2), so that was a healthy machine being called broken, with a
+    remedy that could never have worked.
+    """
+
+    @staticmethod
+    def _run(config: JarvisConfig, capsys: pytest.CaptureFixture[str]) -> tuple[int, str]:
+        import jarvis.main as main_module
+
+        code = main_module.run_check(config)
+        return code, capsys.readouterr().out
+
+    def test_a_tier_that_cannot_host_vision_is_not_a_failure(
+        self, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import jarvis.main as main_module
+        from jarvis.config import load_defaults
+
+        config = load_defaults()
+        assert not config.vision_available(), "the cpu tier should not host the VLM"
+
+        # Everything the voice loop actually needs is present.
+        monkeypatch.setattr(main_module, "_register_tools", lambda _c: 14)
+        monkeypatch.setattr("jarvis.util.platform.has_module", lambda _n: True)
+        monkeypatch.setattr(
+            "jarvis.brain.llm.OllamaClient.is_available", lambda _self: True
+        )
+
+        code, out = self._run(config, capsys)
+
+        assert "Ready." in out
+        assert code == 0, "a tier-disabled capability must not fail the check"
+        assert "Not ready" not in out
+
+    def test_the_vision_row_says_why_rather_than_just_no(
+        self, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A bare "no" sent the reader to a script that cannot help."""
+        import jarvis.main as main_module
+        from jarvis.config import load_defaults
+
+        monkeypatch.setattr(main_module, "_register_tools", lambda _c: 14)
+        _code, out = self._run(load_defaults(), capsys)
+
+        vision = next(line for line in out.splitlines() if line.startswith("vision"))
+        assert "VRAM" in vision or "configuration" in vision, vision
+
+    def test_a_genuinely_missing_engine_still_fails(
+        self, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The check must still catch what it exists to catch."""
+        import jarvis.main as main_module
+        from jarvis.config import load_defaults
+
+        monkeypatch.setattr(main_module, "_register_tools", lambda _c: 14)
+        monkeypatch.setattr("jarvis.util.platform.has_module", lambda _n: False)
+
+        code, out = self._run(load_defaults(), capsys)
+
+        assert code == 1
+        assert "Not ready" in out
+        for required in ("sounddevice", "openwakeword", "kokoro", "speech to text"):
+            assert required in out
+
+    def test_either_transcription_engine_satisfies_the_check(
+        self, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The cpu tier uses whisper.cpp, so requiring faster-whisper would be wrong."""
+        import jarvis.main as main_module
+        from jarvis.config import load_defaults
+
+        monkeypatch.setattr(main_module, "_register_tools", lambda _c: 14)
+        monkeypatch.setattr(
+            "jarvis.util.platform.has_module",
+            lambda name: name != "faster_whisper",
+        )
+
+        _code, out = self._run(load_defaults(), capsys)
+
+        stt = next(line for line in out.splitlines() if line.startswith("speech to text"))
+        assert "whisper.cpp" in stt
+        assert "speech to text" not in out.split("Not ready:")[-1] if "Not ready" in out else True
