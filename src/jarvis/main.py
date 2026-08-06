@@ -399,6 +399,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Run a single turn from this text and print the reply. No microphone needed.",
     )
+    parser.add_argument(
+        "--mic-test",
+        nargs="?",
+        type=float,
+        const=6.0,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "Record from the configured microphone, report the level, and score the wake "
+            "word against it. Use this when the assistant hears nothing."
+        ),
+    )
     return parser
 
 
@@ -468,6 +480,124 @@ def run_check(config: JarvisConfig) -> int:
     return 0
 
 
+#: Peak below this over a whole recording means nothing reached the process.
+_SILENCE_PEAK = 0.002
+
+#: Peak below this is signal, but too quiet for the wake model to work with.
+_QUIET_PEAK = 0.02
+
+
+def _level_bar(peak: float, width: int = 30) -> str:
+    """A crude meter, so a glance says more than a float does."""
+    filled = min(width, round(peak * width * 2))
+    return "#" * filled + "." * (width - filled)
+
+
+def run_mic_test(config: JarvisConfig, seconds: float) -> int:
+    """Record from the configured microphone and report what actually arrived.
+
+    The wake word failing is ambiguous from the outside: a muted microphone, a
+    device that captures silence, and speech the model simply scores low all
+    look identical in the log as ``detections=0 errors=0``. This separates
+    them, by measuring the signal and then scoring the same audio the listener
+    would have seen.
+    """
+    import numpy as np
+
+    from jarvis.audio.devices import describe_devices
+    from jarvis.audio.ring import AudioCapture
+    from jarvis.audio.wake import WakeWordDetector, float_to_int16  # noqa: F401
+
+    print(describe_devices())  # noqa: T201
+    print()  # noqa: T201
+
+    capture = AudioCapture(config)
+    frame_samples = max(1, int(config.wake.frame_samples))
+    rate = config.audio.sample_rate
+    detector = WakeWordDetector(config)
+
+    collected: list[Any] = []
+    best_score = 0.0
+    peak = 0.0
+
+    try:
+        capture.start()
+    except JarvisError as exc:
+        print(f"could not open the microphone: {exc.message}", file=sys.stderr)  # noqa: T201
+        return 1
+
+    try:
+        reader = capture.reader()
+        print(f"Speak now. Say your wake word a few times. Listening for {seconds:.0f}s.\n")  # noqa: T201
+        deadline = time.monotonic() + seconds
+        next_report = time.monotonic() + 0.5
+        window_peak = 0.0
+
+        while time.monotonic() < deadline:
+            frame = reader.read(frame_samples)
+            if frame is None:
+                time.sleep(0.005)
+                continue
+            collected.append(frame)
+            window_peak = max(window_peak, float(np.abs(frame).max()))
+            peak = max(peak, window_peak)
+            try:
+                detector.process(frame)
+                best_score = max(best_score, max(detector.scores.values(), default=0.0))
+            except JarvisError as exc:
+                print(f"\nwake model unavailable: {exc.message}")  # noqa: T201
+                break
+
+            now = time.monotonic()
+            if now >= next_report:
+                print(f"  {_level_bar(window_peak)}  peak {window_peak:.3f}")  # noqa: T201
+                window_peak = 0.0
+                next_report = now + 0.5
+    finally:
+        capture.stop()
+
+    if not collected:
+        print("\nNo audio blocks arrived at all. The stream opened but delivered nothing.")  # noqa: T201
+        return 1
+
+    audio = np.concatenate(collected)
+    rms = float(np.sqrt(np.mean(np.square(audio))))
+    print(f"\ncaptured   {audio.size / rate:.1f}s at {rate} Hz")  # noqa: T201
+    print(f"peak       {peak:.4f}")  # noqa: T201
+    print(f"rms        {rms:.4f}")  # noqa: T201
+    print(f"wake score {best_score:.3f}  (threshold {config.wake.threshold:.2f})")  # noqa: T201
+    print()  # noqa: T201
+
+    if peak < _SILENCE_PEAK:
+        print("Verdict: silence. Nothing is reaching the process.")  # noqa: T201
+        print("  Windows privacy: Settings, Privacy and security, Microphone,")  # noqa: T201
+        print("    turn on 'Let desktop apps access your microphone'.")  # noqa: T201
+        print("  Check the microphone is not muted and is the Windows default input.")  # noqa: T201
+        print("  Or name a specific device in config.yaml under audio.input_device,")  # noqa: T201
+        print("    using a name or index from the table above.")  # noqa: T201
+        return 1
+
+    if peak < _QUIET_PEAK:
+        print("Verdict: signal present but very quiet.")  # noqa: T201
+        print("  Raise the input level in Windows sound settings, or move closer.")  # noqa: T201
+        return 1
+
+    if best_score >= config.wake.threshold:
+        print("Verdict: the wake word was detected. Audio and model are both fine.")  # noqa: T201
+        return 0
+
+    if best_score >= config.wake.threshold * 0.5:
+        print("Verdict: audio is good and the wake word nearly triggered.")  # noqa: T201
+        print(f"  Lower wake.threshold toward {best_score:.2f} in config.yaml,")  # noqa: T201
+        print("  or say it a little more clearly. Do not go below about 0.3.")  # noqa: T201
+        return 1
+
+    print("Verdict: audio is good but the wake word did not register.")  # noqa: T201
+    print("  Say 'hey jarvis' as one phrase, at a normal speaking pace.")  # noqa: T201
+    print("  If it still will not score, the microphone may be picking up mostly noise.")  # noqa: T201
+    return 1
+
+
 def run_once(config: JarvisConfig, text: str) -> int:
     """Run a single text turn and print the reply.
 
@@ -514,6 +644,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.check:
         return run_check(config)
+    if args.mic_test is not None:
+        return run_mic_test(config, max(1.0, float(args.mic_test)))
     if args.say:
         return run_once(config, args.say)
 

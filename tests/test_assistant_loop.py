@@ -467,3 +467,53 @@ class TestReadinessCheck:
         stt = next(line for line in out.splitlines() if line.startswith("speech to text"))
         assert "whisper.cpp" in stt
         assert "speech to text" not in out.split("Not ready:")[-1] if "Not ready" in out else True
+
+
+class TestMicrophoneDiagnostic:
+    """`detections=0 errors=0` has three different causes that look identical.
+
+    A muted microphone, a device that opens but captures silence, and speech
+    the model simply scores below threshold all produce the same line in the
+    log. --mic-test separates them by measuring the signal and then scoring
+    the same audio the listener would have seen.
+    """
+
+    def test_the_flag_is_accepted_with_and_without_a_duration(self) -> None:
+        import jarvis.main as main_module
+
+        parser = main_module.build_parser()
+        assert parser.parse_args(["--mic-test"]).mic_test == pytest.approx(6.0)
+        assert parser.parse_args(["--mic-test", "3"]).mic_test == pytest.approx(3.0)
+        assert parser.parse_args([]).mic_test is None
+
+    def test_it_degrades_instead_of_raising_without_an_audio_stack(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """This is what a user runs when audio is already broken."""
+        import jarvis.main as main_module
+        from jarvis.config import load_defaults
+
+        code = main_module.run_mic_test(load_defaults(), 1.0)
+        out = capsys.readouterr()
+
+        assert code == 1
+        assert "sounddevice" in (out.out + out.err)
+
+    @pytest.mark.parametrize(
+        ("peak", "expected"),
+        [(0.0, 0), (0.25, 15), (0.5, 30), (5.0, 30)],
+    )
+    def test_the_level_bar_saturates_rather_than_overflowing(
+        self, peak: float, expected: int
+    ) -> None:
+        import jarvis.main as main_module
+
+        bar = main_module._level_bar(peak, width=30)
+        assert len(bar) == 30
+        assert bar.count("#") == expected
+
+    def test_the_silence_threshold_sits_below_the_quiet_one(self) -> None:
+        """Otherwise the silence verdict would swallow the quiet one."""
+        import jarvis.main as main_module
+
+        assert 0 < main_module._SILENCE_PEAK < main_module._QUIET_PEAK
