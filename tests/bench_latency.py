@@ -316,10 +316,21 @@ def _budgets_from(config: JarvisConfig) -> dict[Stage, float]:
     return out
 
 
+#: Absolute increase below which a percentage regression is ignored.
+#:
+#: The VAD stage runs in about a tenth of a millisecond, where ordinary
+#: scheduling jitter of four hundredths of a millisecond is a 37 percent
+#: "regression". Failing CI on that teaches everyone to ignore CI. A stage has
+#: to lose at least this much wall clock before the percentage means anything,
+#: and it is far below every §3 budget, the smallest of which is 250 ms.
+REGRESSION_FLOOR_MS = 5.0
+
+
 def check_regression(
     current: dict[str, Any],
     previous: dict[str, Any] | None,
     tolerance: float,
+    floor_ms: float = REGRESSION_FLOOR_MS,
 ) -> list[str]:
     """Report stages whose p95 regressed beyond ``tolerance``.
 
@@ -327,6 +338,8 @@ def check_regression(
         current: This run's stage summaries, keyed by stage name.
         previous: The previous run's, or None on a first run.
         tolerance: Allowed fractional increase, for example 0.15 for 15 percent.
+        floor_ms: Absolute increase a stage must exceed before the percentage
+            is considered at all. Guards against noise on sub-millisecond stages.
 
     Returns:
         Human-readable regression descriptions, empty when nothing regressed.
@@ -344,6 +357,8 @@ def check_regression(
         new = float(row.get("p95_ms", 0.0))
         if old <= 0:
             continue
+        if new - old <= floor_ms:
+            continue
         change = (new - old) / old
         if change > tolerance:
             failures.append(
@@ -354,10 +369,50 @@ def check_regression(
     return failures
 
 
-def check_budgets(current: dict[str, Any]) -> list[str]:
-    """Report stages whose p95 exceeds its §3 budget."""
+#: The tier the §3 budget table was written for. Its own heading says
+#: "gpu-12 target", so the absolute numbers describe that machine and no other.
+BUDGET_TIER = "gpu-12"
+
+#: Tiers at least as capable as the one the budgets describe. On these a miss
+#: is a real failure; below them it is just a slower machine.
+BUDGET_TIERS = frozenset({"gpu-12", "gpu-16", "gpu-24"})
+
+
+def budgets_apply_to(tier: str) -> bool:
+    """Whether the §3 absolute budgets are meaningful on this tier.
+
+    Regression checking stays meaningful everywhere, because it compares a
+    machine against its own previous run. The absolute budgets do not: holding
+    a cpu tier to a number written for a 12 GB GPU reports a failure that no
+    amount of correct code could fix.
+    """
+    return tier in BUDGET_TIERS
+
+
+def check_budgets(current: dict[str, Any], tier: str = BUDGET_TIER) -> list[str]:
+    """Report stages whose p95 exceeds its §3 budget.
+
+    Args:
+        current: Stage summaries from this run.
+        tier: The resolved hardware tier. Off-tier, this returns nothing and
+            the caller reports the misses as advisory instead.
+    """
+    if not budgets_apply_to(tier):
+        return []
     return [
         f"{name}: p95 {row['p95_ms']:.1f} ms exceeds the {row['budget_ms']:.0f} ms budget"
+        for name, row in current.items()
+        if not row.get("skipped") and row.get("within_budget") is False
+    ]
+
+
+def budget_advisories(current: dict[str, Any], tier: str) -> list[str]:
+    """Budget misses on a tier the §3 numbers were not written for."""
+    if budgets_apply_to(tier):
+        return []
+    return [
+        f"{name}: p95 {row['p95_ms']:.1f} ms is over the {row['budget_ms']:.0f} ms "
+        f"{BUDGET_TIER} budget, which does not apply to the {tier} tier"
         for name, row in current.items()
         if not row.get("skipped") and row.get("within_budget") is False
     ]
@@ -409,8 +464,12 @@ def main(argv: list[str] | None = None) -> int:
         for sample in result.samples:
             stats.add(stage, sample)
 
+    tier = str(config.effective_tier())
+    on_budget_tier = budgets_apply_to(tier)
+
     payload = {
-        "tier": str(config.effective_tier()),
+        "tier": tier,
+        "budgets_enforced": on_budget_tier,
         "llm_model": config.llm_model(),
         "iterations": args.iterations,
         "synthetic": args.synthetic,
@@ -429,23 +488,42 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{name:<20} {'skipped':>9}  {row.get('reason', '')}")  # noqa: T201
             continue
         budget = row.get("budget_ms")
-        verdict = "ok" if row.get("within_budget") is not False else "OVER BUDGET"
+        if row.get("within_budget") is not False:
+            verdict = "ok"
+        else:
+            verdict = "OVER BUDGET" if on_budget_tier else f"over ({BUDGET_TIER} budget)"
         print(  # noqa: T201
             f"{name:<20} {row['p50_ms']:>9.1f} {row['p95_ms']:>9.1f} "
             f"{row['p99_ms']:>9.1f} {budget if budget else '-':>9}  {verdict}"
         )
 
-    problems = check_budgets(stages)
+    problems = check_budgets(stages, tier)
     problems += check_regression(stages, previous, config.latency.regression_tolerance)
+    advisories = budget_advisories(stages, tier)
 
     print()  # noqa: T201
+    if advisories:
+        print(  # noqa: T201
+            f"The section 3 budgets describe the {BUDGET_TIER} tier. This machine "
+            f"resolved to {tier}, so these are reported but not failed:"
+        )
+        for note in advisories:
+            print(f"  note: {note}")  # noqa: T201
+        print()  # noqa: T201
+
     if problems:
         for problem in problems:
             print(f"FAIL: {problem}")  # noqa: T201
         print(f"\nResults written to {output}")  # noqa: T201
         return 0 if args.no_fail else 1
 
-    print("All measured stages are within budget and show no regression.")  # noqa: T201
+    if on_budget_tier:
+        print("All measured stages are within budget and show no regression.")  # noqa: T201
+    else:
+        print(  # noqa: T201
+            f"No regression against the previous run. Absolute budgets are not "
+            f"checked on the {tier} tier."
+        )
     print(f"Results written to {output}")  # noqa: T201
     return 0
 

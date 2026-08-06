@@ -32,6 +32,9 @@ cover.
       tier, and names the `cudnn_ops64_9.dll` remediation specifically.
 - [x] T-0.5 `DONE` - `scripts/setup_env.ps1`, `scripts/pull_models.ps1`. Idempotent. The tier to
       model mapping is checked against `TIER_PROFILES` by a test that parses the script.
+      `pull_models.ps1` now also pre-fetches the spaCy model Kokoro's phonemiser needs: misaki
+      downloads it on first use otherwise, which lands about twenty seconds of silence on the
+      first sentence JARVIS ever speaks and fails outright if the machine is offline by then.
 
 ## Phase 1 - Voice loop MVP
 
@@ -42,10 +45,15 @@ cover.
 - [x] T-1.3 `DONE` - `audio/vad.py`. Silero endpointing plus a separate barge-in detector on a
       higher threshold so leaked TTS audio cannot make the assistant interrupt itself.
 - [x] T-1.4 `DONE` - `audio/stt.py`. faster-whisper and whisper.cpp behind one protocol, with the
-      cuDNN failure path turned into a speakable error. WER needs a real model, see M-2.
+      cuDNN failure path turned into a speakable error. The real `faster_whisper.WhisperModel`
+      call site is exercised by `tests/test_engines_live.py`, not just by a fake. WER on human
+      speech still needs a real model and a real voice, see M-2.
 - [x] T-1.5 `DONE` - `audio/tts.py` + `audio/player.py`.
       Note: found and fixed a real defect, a fully consumed chunk stayed current until the next
       callback, so `is_playing` reported True and `wait()` blocked with nothing left to play.
+      The real `kokoro.KPipeline` call site is exercised by `tests/test_engines_live.py`, which
+      also pins the sample rate the player trusts: a mismatch there would play every reply at
+      the wrong pitch and nothing else would catch it.
 - [x] T-1.6 `DONE` - `brain/llm.py`. Streaming, native tool calls, arguments accepted as dict or
       JSON string with retries, and three distinct failure messages.
 - [x] T-1.7 `DONE` - `brain/memory.py`. SQLite persistence, compaction that keeps `keep_recent`
@@ -126,6 +134,12 @@ cover.
 - [x] T-5.1 `DONE` - `tests/bench_latency.py`. p50/p95/p99 per stage, fails on a p95 regression
       past the tolerance. `turn_total` is composed from its components and skipped outright when
       any is unavailable, rather than summing a partial set and understating the total.
+      Two flaws surfaced the first time it ran against a real engine rather than the synthetic
+      harness. The §3 budgets head their own table "gpu-12 target", so applying them on a `cpu`
+      tier reported a failure no code change could fix; off-tier misses are now advisory and
+      only regressions fail. And the regression check compared percentages with no absolute
+      floor, so 0.04 ms of scheduling jitter on the 0.1 ms VAD stage read as a 37 percent
+      regression. A 5 ms floor sits far below the smallest §3 budget of 250 ms.
 - [x] T-5.2 `DONE` - `util/resilience.py`. Supervisor with a finite restart budget, health report,
       and reverse-order graceful shutdown on SIGINT. Shutdown no longer overwrites the two states
       that matter: a worker that ignores the stop request is reported `STALLED` rather than as a
@@ -221,6 +235,13 @@ uv run python tests/bench_latency.py
 ```
 Pass: every stage reports measured rather than skipped, and each p95 is inside its §3 budget. The
 first run establishes the baseline; later runs fail on a regression past 15 percent.
+
+Partly exercised on the build host: `vad_endpoint` and `tts_first_audio` now measure for real, so
+the harness itself is proven end to end rather than only against synthetic timings. `stt` still
+skips there (the cpu tier wants whisper.cpp, whose package is Windows only) and
+`llm_first_token` needs Ollama, so `turn_total` has still never been measured. **The §3 p95 of
+1200 ms remains unverified**, and this is the check most worth doing carefully. Note the budgets
+are only enforced on `gpu-12` and above; below that the run reports misses without failing.
 
 ---
 

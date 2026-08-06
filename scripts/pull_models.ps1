@@ -7,7 +7,8 @@
       1. the tier-appropriate Qwen3 model through ollama,
       2. the openWakeWord hey_jarvis model plus its shared feature extractors,
       3. the Silero VAD ONNX graph,
-      4. the Kokoro-82M weights, config, and the bm_george voice.
+      4. the Kokoro-82M weights, config, and the bm_george voice,
+      5. the spaCy English model Kokoro's phonemiser downloads on first use.
 
     Every item is guarded by an existence check, so the script is idempotent:
     a second run downloads nothing and reports each item as already present.
@@ -436,6 +437,41 @@ function Invoke-OllamaPull {
     $script:Downloaded.Add("$Label $Model")
 }
 
+function Install-SpacyEnglishModel {
+    <#
+    .SYNOPSIS
+        Pre-fetch the spaCy model Kokoro's grapheme-to-phoneme stage needs.
+
+    .DESCRIPTION
+        misaki.en.G2P calls spacy.cli.download('en_core_web_sm') the first time
+        it runs if the package is absent. Left alone that happens on the first
+        sentence JARVIS ever speaks: about twenty seconds of silence, and a
+        hard failure if the machine is offline by then. Setup is the right
+        place to pay that cost, so it is pulled here with everything else.
+    #>
+    $Label = 'spaCy en_core_web_sm (Kokoro phonemiser)'
+
+    $check = "import importlib.util,sys; " +
+             "sys.exit(0 if importlib.util.find_spec('en_core_web_sm') else 1)"
+    & uv run python -c $check 2>$null
+    if ($LASTEXITCODE -eq 0 -and -not $Force) {
+        Write-Skip $Label
+        $script:Skipped.Add($Label)
+        return
+    }
+
+    Write-Host "   uv run python -m spacy download en_core_web_sm"
+    & uv run python -m spacy download en_core_web_sm
+    if ($LASTEXITCODE -ne 0) {
+        Write-Fail "spaCy model download exited with code $LASTEXITCODE."
+        Write-Hint 'Without it the first spoken reply stalls while it downloads, and fails offline.'
+        $script:Failed.Add($Label)
+        return
+    }
+    Write-Ok $Label
+    $script:Downloaded.Add($Label)
+}
+
 # ---------------------------------------------------------------------------
 # 1. Which tier are we downloading for
 # ---------------------------------------------------------------------------
@@ -493,6 +529,8 @@ foreach ($item in $FileDownloads) {
         -MinimumBytes $item.MinimumBytes `
         -Hint $item.Hint
 }
+
+Install-SpacyEnglishModel
 
 # ---------------------------------------------------------------------------
 # 4. Summary

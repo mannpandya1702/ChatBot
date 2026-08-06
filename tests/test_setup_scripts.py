@@ -509,6 +509,25 @@ def test_downloaded_artifacts_match_the_configured_wake_word_and_voice() -> None
     assert f"{TtsConfig().voice}.pt" in text, "configured Kokoro voice not downloaded"
 
 
+def test_the_phonemiser_model_is_prefetched() -> None:
+    """Kokoro's G2P stage downloads a spaCy model the first time it runs.
+
+    misaki.en.G2P calls spacy.cli.download when en_core_web_sm is absent. Left
+    to happen on its own that lands on the first sentence JARVIS ever speaks:
+    roughly twenty seconds of silence, and an outright failure if the machine
+    is offline by then. Setup has to pay that cost instead.
+    """
+    text = _read(PULL)
+    assert "en_core_web_sm" in text, "the spaCy model is never pre-fetched"
+    assert "spacy download" in text, "no download command for it"
+
+
+def test_the_phonemiser_prefetch_is_idempotent() -> None:
+    """A second run must not reinstall it. The script promises idempotency."""
+    text = _read(PULL)
+    assert "find_spec('en_core_web_sm')" in text, "no presence check before installing"
+
+
 def test_wake_word_feature_models_and_vad_are_downloaded() -> None:
     """openWakeWord is useless without its two shared feature extractors."""
     text = _read(PULL)

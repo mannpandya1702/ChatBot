@@ -251,3 +251,119 @@ class TestLiveMeasurementDegradesGracefully:
         from tests.bench_latency import measure_live
 
         measure_live(cfg, 1)
+
+
+class TestRegressionNoiseFloor:
+    """A percentage on a sub-millisecond stage is noise, not a regression.
+
+    vad_endpoint runs in about a tenth of a millisecond. Ordinary scheduling
+    jitter of four hundredths of a millisecond is a 37 percent increase, and a
+    CI job that fails on that trains everyone to ignore CI.
+    """
+
+    @staticmethod
+    def _row(p95: float) -> dict[str, Any]:
+        return {"p95_ms": p95, "skipped": False}
+
+    def test_sub_millisecond_jitter_is_not_a_regression(self) -> None:
+        from tests.bench_latency import check_regression
+
+        current = {"vad_endpoint": self._row(0.11)}
+        previous = {"vad_endpoint": self._row(0.08)}
+        assert check_regression(current, previous, tolerance=0.15) == []
+
+    def test_a_real_slowdown_on_a_slow_stage_still_fails(self) -> None:
+        from tests.bench_latency import check_regression
+
+        current = {"tts_first_audio": self._row(400.0)}
+        previous = {"tts_first_audio": self._row(300.0)}
+        failures = check_regression(current, previous, tolerance=0.15)
+        assert len(failures) == 1
+        assert "33.3 percent" in failures[0]
+
+    def test_the_floor_is_absolute_not_relative(self) -> None:
+        """A big percentage on a tiny stage stays quiet; the same on a big one does not."""
+        from tests.bench_latency import REGRESSION_FLOOR_MS, check_regression
+
+        tiny = check_regression(
+            {"s": self._row(REGRESSION_FLOOR_MS - 0.1)}, {"s": self._row(0.01)}, 0.15
+        )
+        assert tiny == [], "an increase under the floor must not fail"
+
+        # Clears the floor by 45 ms and the tolerance by 35 percentage points.
+        large = check_regression({"s": self._row(150.0)}, {"s": self._row(100.0)}, 0.15)
+        assert large, "an increase over the floor must still be checked"
+
+        # Clears the floor but not the tolerance: still quiet.
+        assert (
+            check_regression(
+                {"s": self._row(100.0 + REGRESSION_FLOOR_MS + 1.0)},
+                {"s": self._row(100.0)},
+                0.15,
+            )
+            == []
+        ), "the percentage tolerance still applies above the floor"
+
+    def test_the_floor_sits_far_below_every_budget(self) -> None:
+        """A floor near a budget would mask regressions that matter."""
+        from jarvis.config import LatencyConfig
+        from tests.bench_latency import REGRESSION_FLOOR_MS
+
+        budgets = [float(v) for v in LatencyConfig().budgets_ms.values()]
+        assert budgets, "no budgets configured"
+        assert min(budgets) / 10 > REGRESSION_FLOOR_MS
+
+
+class TestBudgetsApplyOnlyToTheirTier:
+    """§3 heads its table "gpu-12 target", so the numbers describe that machine.
+
+    Holding a cpu tier to them reports a failure no amount of correct code can
+    fix, which makes the benchmark unusable on the tier most people start on.
+    """
+
+    @staticmethod
+    def _over_budget() -> dict[str, Any]:
+        return {
+            "tts_first_audio": {
+                "p95_ms": 1100.0,
+                "budget_ms": 300.0,
+                "within_budget": False,
+                "skipped": False,
+            }
+        }
+
+    def test_a_miss_on_the_cpu_tier_is_advisory(self) -> None:
+        from tests.bench_latency import budget_advisories, check_budgets
+
+        stages = self._over_budget()
+        assert check_budgets(stages, "cpu") == []
+        notes = budget_advisories(stages, "cpu")
+        assert len(notes) == 1
+        assert "does not apply to the cpu tier" in notes[0]
+
+    def test_a_miss_on_the_target_tier_fails(self) -> None:
+        from tests.bench_latency import budget_advisories, check_budgets
+
+        stages = self._over_budget()
+        assert len(check_budgets(stages, "gpu-12")) == 1
+        assert budget_advisories(stages, "gpu-12") == []
+
+    def test_faster_tiers_are_held_to_the_budget_too(self) -> None:
+        from tests.bench_latency import check_budgets
+
+        for tier in ("gpu-12", "gpu-16", "gpu-24"):
+            assert check_budgets(self._over_budget(), tier), f"{tier} should be enforced"
+
+    def test_slower_tiers_are_not(self) -> None:
+        from tests.bench_latency import check_budgets
+
+        for tier in ("cpu", "gpu-6", "gpu-8"):
+            assert check_budgets(self._over_budget(), tier) == [], f"{tier} should be advisory"
+
+    def test_every_enforced_tier_is_a_real_tier(self) -> None:
+        from jarvis.config import TIER_PROFILES
+        from tests.bench_latency import BUDGET_TIER, BUDGET_TIERS
+
+        known = {str(tier) for tier in TIER_PROFILES}
+        assert known >= BUDGET_TIERS, f"unknown tiers: {BUDGET_TIERS - known}"
+        assert BUDGET_TIER in known

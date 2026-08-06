@@ -286,10 +286,60 @@ class TestPlatform:
             plat.require_module("definitely_not_a_real_module_xyz")
         assert "definitely_not_a_real_module_xyz" in str(excinfo.value)
 
-    def test_require_module_maps_known_packages_to_extras(self) -> None:
+    def test_require_module_maps_known_packages_to_extras(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The mapping is what matters, not whether the extra happens to be installed.
+
+        Asserting that importing kokoro fails only held on a machine without the
+        tts extra, so the test broke the moment anyone installed the engines it
+        exists to describe. The import is forced to fail instead.
+        """
+
+        def _absent(name: str) -> object:
+            raise ImportError(f"No module named {name!r}")
+
+        monkeypatch.setattr(plat.importlib, "import_module", _absent)
+
         with pytest.raises(DependencyMissingError) as excinfo:
             plat.require_module("kokoro")
         assert excinfo.value.extra == "tts"
+
+    @pytest.mark.parametrize(
+        ("module", "extra"),
+        [
+            ("kokoro", "tts"),
+            ("faster_whisper", "stt"),
+            ("sounddevice", "audio"),
+            ("openwakeword", "audio"),
+            ("pynvml", "gpu"),
+        ],
+    )
+    def test_every_optional_engine_names_the_extra_that_installs_it(
+        self, module: str, extra: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A wrong hint sends the user to an extra that does not contain the package."""
+
+        def _absent(name: str) -> object:
+            raise ImportError(f"No module named {name!r}")
+
+        monkeypatch.setattr(plat.importlib, "import_module", _absent)
+
+        with pytest.raises(DependencyMissingError) as excinfo:
+            plat.require_module(module)
+        assert excinfo.value.extra == extra
+
+    def test_the_named_extras_exist_in_the_manifest(self) -> None:
+        """The hint tells the user to run `uv sync --extra X`, so X must be real."""
+        import tomllib
+        from pathlib import Path
+
+        manifest = Path(__file__).resolve().parents[1] / "pyproject.toml"
+        with manifest.open("rb") as handle:
+            declared = set(tomllib.load(handle)["project"]["optional-dependencies"])
+
+        named = {extra for extra in plat._EXTRA_FOR_MODULE.values() if extra}
+        assert named <= declared, f"hints name extras that do not exist: {named - declared}"
 
     @pytest.mark.skipif(plat.is_windows(), reason="checks the non-Windows branch")
     def test_require_windows_raises_off_windows(self) -> None:

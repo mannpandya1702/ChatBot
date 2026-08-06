@@ -42,11 +42,53 @@ def test_the_walk_found_modules() -> None:
     assert len(_module_names()) >= 5
 
 
-def test_no_optional_dependency_is_imported_at_module_scope() -> None:
-    """Importing the package must not pull in an optional engine."""
-    import sys
+#: §0b: none of these may be pulled in by importing the package.
+OPTIONAL_ENGINES = (
+    "sounddevice",
+    "openwakeword",
+    "faster_whisper",
+    "kokoro",
+    "mss",
+    "pynvml",
+    "torch",
+    "win32api",
+    "wmi",
+    "clr",
+)
 
-    for name in ("sounddevice", "openwakeword", "faster_whisper", "kokoro", "mss", "pynvml"):
-        assert name not in sys.modules, (
-            f"{name} was imported at module scope; move it inside the function that needs it"
-        )
+
+def test_no_optional_dependency_is_imported_at_module_scope() -> None:
+    """Importing the package must not pull in an optional engine.
+
+    Checked in a fresh interpreter rather than by reading this one's
+    ``sys.modules``. Any other test that touches an engine, directly or through
+    a live-engine check, leaves it loaded process-wide, and the assertion then
+    reports whatever ran earlier instead of what importing jarvis does. That
+    made the test pass or fail on collection order and on whether the optional
+    extras happened to be installed.
+    """
+    import json
+    import subprocess
+    import sys
+    import textwrap
+
+    program = textwrap.dedent(
+        f"""
+        import json, sys, importlib
+        for name in {list(OPTIONAL_ENGINES)!r}:
+            assert name not in sys.modules, name
+        for module in {_module_names()!r}:
+            importlib.import_module(module)
+        leaked = [n for n in {list(OPTIONAL_ENGINES)!r} if n in sys.modules]
+        print(json.dumps(leaked))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", program], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, f"importing the package failed:\n{result.stderr}"
+
+    leaked = json.loads(result.stdout.strip().splitlines()[-1])
+    assert leaked == [], (
+        f"{leaked} imported at module scope; move each inside the function that needs it"
+    )
