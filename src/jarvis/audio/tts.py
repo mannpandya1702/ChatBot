@@ -153,6 +153,13 @@ class SentenceChunker:
                 break
             ready.append(complete)
             index = self._buffer.find(complete)
+            if index < 0:
+                # Cannot happen: split_sentences returns substrings of the
+                # buffer. Guarded anyway because failing to shrink the buffer
+                # here would spin forever inside the turn loop.
+                _log.error("chunker lost track of its buffer, flushing it")
+                self._buffer = ""
+                break
             self._buffer = self._buffer[index + len(complete) :].lstrip()
 
         if len(self._buffer) >= self._max:

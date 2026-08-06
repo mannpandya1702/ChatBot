@@ -145,6 +145,43 @@ class TestSentenceChunker:
         assert " ".join(emitted) == "The disk is healthy. Memory is fine. All good."
 
 
+class TestChunkerFuzz:
+    def test_never_loses_text_and_never_hangs(self, cfg: JarvisConfig) -> None:
+        """Every character fed in must come back out, across arbitrary input.
+
+        The chunker sits in the middle of the speech path, so losing text means
+        the assistant silently drops part of its answer, and failing to shrink
+        the buffer means the turn loop spins forever.
+        """
+        import random
+        import string
+
+        random.seed(7)
+        alphabet = string.ascii_letters + " .!?,'\"()0123456789" + "..." + "\n\t"
+
+        for _ in range(500):
+            text = "".join(random.choice(alphabet) for _ in range(random.randint(0, 120)))
+            chunker = SentenceChunker(cfg)
+            out: list[str] = []
+            index = 0
+            while index < len(text):
+                step = random.randint(1, 5)
+                out.extend(chunker.feed(text[index : index + step]))
+                index += step
+            out.extend(chunker.flush())
+
+            assert "".join("".join(out).split()) == "".join(text.split()), repr(text)
+
+    @pytest.mark.parametrize(
+        "pathological", [". . . . .", "!!!!!", "?" * 50, "a." * 100, ".\n.\n.\n", "..."]
+    )
+    def test_pathological_punctuation_terminates(
+        self, cfg: JarvisConfig, pathological: str
+    ) -> None:
+        chunker = SentenceChunker(cfg)
+        assert chunker.feed(pathological) + chunker.flush() is not None
+
+
 class FakePipeline:
     """Stands in for Kokoro's KPipeline."""
 
