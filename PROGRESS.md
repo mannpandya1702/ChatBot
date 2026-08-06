@@ -4,7 +4,7 @@ Machine-maintained build ledger for `/loop`. See `CLAUDE.md` §7 for task defini
 
 Last run: 2026-08-06
 Target phase: 5
-Result: all tasks through Phase 5 implemented. 1512 automated tests pass, `ruff` and
+Result: all tasks through Phase 5 implemented. 1566 automated tests pass, `ruff` and
 `mypy --strict` are clean. M-8 and M-9 are resolved; the remaining 8 checks need the
 Windows host and are listed at the bottom.
 
