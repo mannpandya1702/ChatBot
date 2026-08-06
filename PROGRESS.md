@@ -44,6 +44,12 @@ cover.
       Detection rate needs a real microphone, see M-1 below.
 - [x] T-1.3 `DONE` - `audio/vad.py`. Silero endpointing plus a separate barge-in detector on a
       higher threshold so leaked TTS audio cannot make the assistant interrupt itself.
+      Note: the model was being fed a bare frame. Silero expects the previous frame's last 64
+      samples prepended to it, and without them the graph runs happily and returns near zero for
+      everything, so speech and silence are indistinguishable. Clear speech measured 0.003 without
+      the context and 1.000 with it. Two unit tests asserted the bare shape, which is why it
+      survived; they now assert the window, and `tests/test_engines_live.py` scores real speech
+      through the real checkpoint so a shape-level test cannot be wrong about it again.
 - [x] T-1.4 `DONE` - `audio/stt.py`. faster-whisper and whisper.cpp behind one protocol, with the
       cuDNN failure path turned into a speakable error. The real `faster_whisper.WhisperModel`
       call site is exercised by `tests/test_engines_live.py`, not just by a fake. WER on human

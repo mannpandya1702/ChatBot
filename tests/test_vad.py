@@ -28,6 +28,7 @@ import numpy as np
 import pytest
 
 from jarvis.audio.vad import (
+    _CONTEXT_SAMPLES,
     BargeInDetector,
     Endpoint,
     Endpointer,
@@ -227,7 +228,10 @@ def test_silero_feeds_the_right_shapes_and_sample_rate(cfg: JarvisConfig) -> Non
     vad.probability(zeros_frame())
 
     feed = session.calls[0]
-    assert feed["input"].shape == (1, FRAME)
+    # Frame plus the context window Silero requires. This asserted a bare
+    # (1, FRAME) for a long time, which is exactly the shape that makes the
+    # model return near zero for speech, so the test held the defect in place.
+    assert feed["input"].shape == (1, FRAME + _CONTEXT_SAMPLES[RATE])
     assert feed["input"].dtype == np.float32
     assert int(feed["sr"]) == RATE
     assert feed["state"].shape == (2, 1, 128)
@@ -364,7 +368,7 @@ def test_silero_accepts_the_8k_pairing(tmp_path: Path) -> None:
     vad.probability(np.zeros(256, dtype=np.float32))
 
     assert int(session.calls[0]["sr"]) == 8_000
-    assert session.calls[0]["input"].shape == (1, 256)
+    assert session.calls[0]["input"].shape == (1, 256 + _CONTEXT_SAMPLES[8_000])
 
 
 @pytest.mark.skipif(has_module("onnxruntime"), reason="onnxruntime is installed here")
@@ -984,3 +988,120 @@ def test_real_endpointer_stays_quiet_through_silence(silence: Any) -> None:
 
     assert all(result is None for result in produced)
     assert endpointer.state is SpeechState.SILENCE
+
+
+class TestTheModelGetsItsContextWindow:
+    """Silero expects the previous frame's tail prepended to the current one.
+
+    Fed a bare frame the ONNX graph runs without complaint and returns a
+    near-zero probability for everything, so speech and silence become
+    indistinguishable. Measured against the shipped checkpoint, one sentence of
+    clear speech scored 0.003 without the context and 1.000 with it. Nothing
+    failed, nothing was logged, and the endpointer simply never fired: the
+    assistant heard the wake word and then sat silent.
+    """
+
+    @staticmethod
+    def _detector(cfg: JarvisConfig, session: FakeSession) -> SileroVad:
+        return SileroVad(cfg, session)
+
+    def test_the_fed_window_is_the_frame_plus_the_context(
+        self, cfg: JarvisConfig
+    ) -> None:
+        from jarvis.audio.vad import _CONTEXT_SAMPLES
+
+        session = FakeSession([0.9])
+        detector = self._detector(cfg, session)
+        context = _CONTEXT_SAMPLES[detector.sample_rate]
+
+        detector.probability(np.zeros(detector.frame_samples, dtype=np.float32))
+
+        fed = session.calls[0]["input"]
+        assert fed.shape == (1, detector.frame_samples + context), (
+            f"the model was fed {fed.shape[1]} samples, expected "
+            f"{detector.frame_samples} plus {context} of context"
+        )
+
+    def test_the_first_frame_is_padded_with_silence(self, cfg: JarvisConfig) -> None:
+        """There is no previous frame, so the context starts as zeros."""
+        from jarvis.audio.vad import _CONTEXT_SAMPLES
+
+        session = FakeSession([0.9])
+        detector = self._detector(cfg, session)
+        context = _CONTEXT_SAMPLES[detector.sample_rate]
+
+        detector.probability(np.full(detector.frame_samples, 0.5, dtype=np.float32))
+
+        fed = session.calls[0]["input"][0]
+        assert np.all(fed[:context] == 0.0), "the leading context is not silence"
+        assert np.all(fed[context:] == pytest.approx(0.5)), "the frame itself was altered"
+
+    def test_the_context_is_the_previous_frames_tail(self, cfg: JarvisConfig) -> None:
+        from jarvis.audio.vad import _CONTEXT_SAMPLES
+
+        session = FakeSession([0.9, 0.9])
+        detector = self._detector(cfg, session)
+        context = _CONTEXT_SAMPLES[detector.sample_rate]
+
+        first = np.linspace(-1.0, 1.0, detector.frame_samples, dtype=np.float32)
+        second = np.full(detector.frame_samples, -0.25, dtype=np.float32)
+        detector.probability(first)
+        detector.probability(second)
+
+        fed = session.calls[1]["input"][0]
+        assert fed[:context] == pytest.approx(first[-context:]), (
+            "the second call was not given the tail of the first frame"
+        )
+        assert fed[context:] == pytest.approx(second)
+
+    def test_reset_clears_the_context(self, cfg: JarvisConfig) -> None:
+        """A new utterance must not inherit audio from the previous one."""
+        from jarvis.audio.vad import _CONTEXT_SAMPLES
+
+        session = FakeSession([0.9, 0.9])
+        detector = self._detector(cfg, session)
+        context = _CONTEXT_SAMPLES[detector.sample_rate]
+
+        detector.probability(np.full(detector.frame_samples, 0.7, dtype=np.float32))
+        detector.reset()
+        detector.probability(np.full(detector.frame_samples, 0.3, dtype=np.float32))
+
+        fed = session.calls[1]["input"][0]
+        assert np.all(fed[:context] == 0.0), "reset left the previous utterance's audio behind"
+
+    def test_a_failed_frame_does_not_poison_the_context(self, cfg: JarvisConfig) -> None:
+        """The tail is carried only after the session actually ran."""
+        from jarvis.audio.vad import _CONTEXT_SAMPLES
+
+        session = FakeSession([0.9, 0.9])
+        detector = self._detector(cfg, session)
+        context = _CONTEXT_SAMPLES[detector.sample_rate]
+
+        good = np.full(detector.frame_samples, 0.6, dtype=np.float32)
+        detector.probability(good)
+
+        with pytest.raises(AudioError):
+            detector.probability(np.zeros(detector.frame_samples + 1, dtype=np.float32))
+
+        detector.probability(np.zeros(detector.frame_samples, dtype=np.float32))
+        fed = session.calls[1]["input"][0]
+        assert fed[:context] == pytest.approx(good[-context:]), (
+            "a rejected frame disturbed the context of the next good one"
+        )
+
+    def test_eight_kilohertz_uses_a_smaller_context(self, tmp_path: Path) -> None:
+        from jarvis.audio.vad import _CONTEXT_SAMPLES
+        from jarvis.config import load_config
+
+        config = load_config(
+            tmp_path / "absent.yaml",
+            audio={"sample_rate": 8_000},
+            vad={"frame_samples": 256},
+        )
+        session = FakeSession([0.9])
+        detector = SileroVad(config, session)
+        detector.probability(np.zeros(detector.frame_samples, dtype=np.float32))
+
+        assert session.calls[0]["input"].shape[1] == (
+            detector.frame_samples + _CONTEXT_SAMPLES[8_000]
+        )

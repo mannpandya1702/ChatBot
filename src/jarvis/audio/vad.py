@@ -81,6 +81,15 @@ _FRAMES_FOR_RATE = {16_000: 512, 8_000: 256}
 #: Hidden size of the v5 LSTM state tensor, shaped (2, batch, 128).
 _STATE_DIM = 128
 
+#: Samples of the previous frame the model expects to be prepended to the
+#: current one, keyed by sample rate. Silero's own streaming wrapper does this
+#: and the ONNX graph depends on it: fed a bare frame the model runs happily
+#: and returns near zero for everything, so speech and silence become
+#: indistinguishable rather than the call failing. Measured against the shipped
+#: checkpoint, a sentence of clear speech scores 0.003 without the context and
+#: 1.000 with it.
+_CONTEXT_SAMPLES = {16_000: 64, 8_000: 32}
+
 #: Graph names for Silero v5, which is what ``pull_models.ps1`` fetches. v4 is
 #: also accepted: it kept the LSTM hidden and cell tensors apart as ``h`` and
 #: ``c`` instead of fusing them into one ``state``, and is detected from the
@@ -239,6 +248,8 @@ class SileroVad:
         self._state = self._zero_state()
         self._hidden = self._zero_state(pairs=1)
         self._cell = self._zero_state(pairs=1)
+        self._context_samples = _CONTEXT_SAMPLES.get(sample_rate, 64)
+        self._context = self._zero_context()
         self._frames_processed = 0
         if session is not None:
             self._bind(session)
@@ -312,6 +323,12 @@ class SileroVad:
                     context={"error": str(exc), "frame_samples": self._frame_samples},
                 ) from exc
             self._absorb_state(outputs)
+            # Carry this frame's tail into the next call. Only after a
+            # successful run, so a failed frame cannot corrupt the stream.
+            if self._context_samples:
+                self._context = block[-self._context_samples :].astype(
+                    np.float32, copy=True
+                )
             self._frames_processed += 1
             return self._extract_probability(outputs)
 
@@ -325,6 +342,7 @@ class SileroVad:
             self._state = self._zero_state()
             self._hidden = self._zero_state(pairs=1)
             self._cell = self._zero_state(pairs=1)
+            self._context = self._zero_context()
             self._frames_processed = 0
 
     # -- internals ---------------------------------------------------------
@@ -332,6 +350,10 @@ class SileroVad:
     def _zero_state(self, *, pairs: int = 2) -> Samples:
         """A zeroed state tensor shaped ``(pairs, 1, 128)``."""
         return np.zeros((pairs, 1, _STATE_DIM), dtype=np.float32)
+
+    def _zero_context(self) -> Samples:
+        """Silence standing in for the frame before the first one."""
+        return np.zeros(self._context_samples, dtype=np.float32)
 
     def _bind(self, session: Any) -> None:
         """Learn the session's input and output names and pick the model era.
@@ -361,9 +383,13 @@ class SileroVad:
     def _build_feed(self, block: Samples) -> dict[str, Any]:
         """Assemble the ONNX feed dict for one frame. Lock held."""
         feed: dict[str, Any] = {}
+        # The model is fed the tail of the previous frame followed by this one.
+        # See _CONTEXT_SAMPLES: without it the graph still runs and returns a
+        # near-zero probability for every input, speech included.
+        windowed = np.concatenate((self._context, block)).astype(np.float32, copy=False)
         for name in self._input_names:
             if name == "input":
-                feed[name] = block.reshape(1, -1).astype(np.float32, copy=False)
+                feed[name] = windowed.reshape(1, -1)
             elif name == "sr":
                 feed[name] = np.array(self._sample_rate, dtype=np.int64)
             elif name == "state":

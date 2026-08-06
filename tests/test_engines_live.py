@@ -161,3 +161,77 @@ class TestTheTwoEnginesAgree:
         assert transcript.language == "en"
         assert transcript.segments, "no segments, so no timing information"
         assert transcript.duration_s == pytest.approx(speech.size / WHISPER_RATE, abs=0.5)
+
+
+needs_vad = pytest.mark.skipif(
+    not has_module("onnxruntime"),
+    reason="onnxruntime is not installed; uv sync --extra audio",
+)
+
+
+@needs_vad
+@needs_tts
+class TestSileroForReal:
+    """Score real speech through the real checkpoint.
+
+    The unit tests use a fake session, so they can prove the wrapper feeds the
+    shape it intends to and nothing more. They cannot notice that the shape
+    itself is wrong. This one can: fed without its context window the model
+    returns near zero for speech, which read as an endpointer that simply never
+    fired, with nothing logged and nothing failing.
+    """
+
+    def test_speech_scores_far_above_silence(self, live_config: JarvisConfig) -> None:
+        from jarvis.audio.vad import SileroVad
+
+        synth = build_synthesizer(live_config)
+        speech = _resample(synth.synthesize(SPOKEN), synth.sample_rate, WHISPER_RATE)
+
+        detector = SileroVad(live_config)
+        frame = detector.frame_samples
+        if detector.find_model_file() is None:
+            pytest.skip("silero_vad.onnx is not downloaded; run scripts/pull_models.ps1")
+
+        spoken = [
+            detector.probability(speech[i : i + frame])
+            for i in range(0, speech.size - frame + 1, frame)
+        ]
+        detector.reset()
+        quiet = np.zeros(speech.size, dtype=np.float32)
+        silent = [
+            detector.probability(quiet[i : i + frame])
+            for i in range(0, quiet.size - frame + 1, frame)
+        ]
+
+        assert max(spoken) > 0.8, (
+            f"clear speech peaked at {max(spoken):.3f}. Near zero here means the "
+            "model is not getting the context window it expects."
+        )
+        assert max(silent) < 0.2, f"silence peaked at {max(silent):.3f}"
+
+    def test_the_endpointer_completes_an_utterance(self, live_config: JarvisConfig) -> None:
+        """The stage the assistant actually depends on, end to end."""
+        from jarvis.audio.vad import Endpointer, SileroVad
+
+        detector = SileroVad(live_config)
+        if detector.find_model_file() is None:
+            pytest.skip("silero_vad.onnx is not downloaded; run scripts/pull_models.ps1")
+
+        synth = build_synthesizer(live_config)
+        speech = _resample(synth.synthesize(SPOKEN), synth.sample_rate, WHISPER_RATE)
+        # Trailing silence, so the endpointer has an end to find.
+        padded = np.concatenate([speech, np.zeros(WHISPER_RATE, dtype=np.float32)])
+
+        endpointer = Endpointer(live_config, detector)
+        frame = endpointer.frame_samples
+        endpoint = None
+        for i in range(0, padded.size - frame + 1, frame):
+            endpoint = endpointer.process(padded[i : i + frame])
+            if endpoint is not None:
+                break
+
+        assert endpoint is not None, (
+            "the endpointer never completed an utterance from clear speech, "
+            "which is the silent failure the assistant showed"
+        )
+        assert endpoint.audio.size > 0
