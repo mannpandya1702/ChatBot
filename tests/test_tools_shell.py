@@ -102,6 +102,187 @@ class TestAllowlistIsPrimary:
         assert _verdict(r"C:\Windows\System32\cmd.exe /c dir", enabled).allowed is False
 
 
+class TestAllowlistIsNotKeyedOnTheFilenameAlone:
+    """The allowlist names commands, not files that happen to share a name.
+
+    Keying it on the filename stem meant any executable called "echo", anywhere
+    on disk, satisfied an allowlist that only ever meant the real echo.
+    """
+
+    def test_an_absolute_path_head_is_refused(
+        self, enabled: JarvisConfig, tmp_path: Path
+    ) -> None:
+        import stat
+
+        planted = tmp_path / "planted"
+        planted.mkdir()
+        payload = planted / "echo"
+        payload.write_text("#!/bin/sh\necho PWNED\n", encoding="utf-8")
+        payload.chmod(payload.stat().st_mode | stat.S_IEXEC)
+
+        verdict = _verdict(f"{payload} anything", enabled)
+        assert verdict.allowed is False
+        assert verdict.argv is None
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "./echo hi",
+            "../echo hi",
+            "/usr/bin/echo hi",
+            "bin/echo hi",
+            r"C:\Windows\System32\echo.exe hi",
+            "C:echo hi",
+        ],
+    )
+    def test_any_path_bearing_head_is_refused(
+        self, enabled: JarvisConfig, command: str
+    ) -> None:
+        assert _verdict(command, enabled).allowed is False
+
+    def test_the_resolved_executable_is_absolute(self, enabled: JarvisConfig) -> None:
+        """The file that was checked must be the file that runs, whatever the cwd."""
+        verdict = _verdict("echo hi", enabled)
+        assert verdict.allowed is True
+        assert verdict.argv is not None
+        assert Path(verdict.argv[0]).is_absolute()
+
+
+class TestQuotingCannotSmuggleAnArgument:
+    """Quoting used to hide a blocked argument from the check but not from argv."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'echo "-Command" Get-Process',
+            "echo '-Command' Get-Process",
+            'echo "-enc" payload',
+            "echo '-EncodedCommand' payload",
+            'echo "-nop" x',
+            'echo "-ExecutionPolicy" Bypass',
+        ],
+    )
+    def test_quoted_blocked_arguments_are_refused(
+        self, enabled: JarvisConfig, command: str
+    ) -> None:
+        assert _verdict(command, enabled).allowed is False
+
+    def test_quoted_blocked_commands_are_refused(self, enabled: JarvisConfig) -> None:
+        assert _verdict('echo "shutdown"', enabled).allowed is False
+
+    def test_argv_carries_the_same_value_that_was_checked(
+        self, enabled: JarvisConfig
+    ) -> None:
+        """A token must not pass a check in one form and reach the process in another."""
+        verdict = _verdict('echo "hello world"', enabled)
+        assert verdict.allowed is True
+        assert verdict.argv is not None
+        assert verdict.argv[1:] == ["hello world"]
+
+
+class TestValidationIsTotal:
+    """validate_command is documented as returning a verdict, so it must never raise."""
+
+    @pytest.mark.parametrize(
+        "working_dir",
+        ["~nonexistentuser12345/x", "\x00/etc", "", " ", "\n/tmp", "relative/path"],
+    )
+    def test_no_working_dir_makes_it_raise(
+        self, enabled: JarvisConfig, working_dir: str
+    ) -> None:
+        verdict = validate_command("echo hi", working_dir, enabled)
+        assert verdict.allowed is False
+
+    def test_refusals_are_still_audited_for_a_bad_working_dir(
+        self, enabled: JarvisConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from jarvis import config as config_module
+
+        monkeypatch.setattr(config_module, "_active", enabled)
+        run_command(ShellInput(command="echo hi", working_dir="~nouser99/x"))
+        assert (tmp_path / "shell_audit.jsonl").read_text(encoding="utf-8").strip()
+
+
+class TestOutputIsBounded:
+    def test_the_cap_bounds_memory_not_just_the_return_value(
+        self, enabled: JarvisConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Rule 9 is a resource bound, not a formatting rule.
+
+        Buffering the whole stream and slicing afterwards returns 4 KB while
+        still letting a chatty command exhaust memory first.
+        """
+        import resource
+        import shutil as shutil_module
+
+        if shutil_module.which("yes") is None:
+            pytest.skip("yes is not available on this host")
+
+        config = load_config(
+            tmp_path / "absent.yaml",
+            tools={"enable_shell": True},
+            shell={
+                "enabled": True,
+                "allowlist": ["yes"],
+                "working_dir_allowlist": [str(tmp_path)],
+                "audit_log": str(tmp_path / "audit.jsonl"),
+                "timeout_s": 3.0,
+            },
+        )
+        from jarvis import config as config_module
+
+        monkeypatch.setattr(config_module, "_active", config)
+
+        before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        result = run_command(ShellInput(command="yes"))
+        after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+
+        assert result.timed_out is True
+        assert len(result.stdout.encode()) <= config.shell.max_output_bytes
+        assert result.truncated is True, "truncation must be reported honestly"
+        assert (after - before) / 1024 < 200, "the cap did not bound memory"
+
+    def test_short_output_is_not_reported_as_truncated(
+        self, enabled: JarvisConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from jarvis import config as config_module
+
+        monkeypatch.setattr(config_module, "_active", enabled)
+        result = run_command(ShellInput(command="echo brief"))
+        assert result.truncated is False
+        assert result.exit_code == 0
+
+
+class TestAuditRecordsTheRealConfirmation:
+    def test_an_unconfirmed_call_is_logged_as_unconfirmed(
+        self, enabled: JarvisConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Rule 10 requires recording whether the user confirmed, not a constant."""
+        from jarvis import config as config_module
+
+        monkeypatch.setattr(config_module, "_active", enabled)
+        run_command(ShellInput(command="shutdown /s"), confirmed=False)
+
+        record = json.loads(
+            (tmp_path / "shell_audit.jsonl").read_text(encoding="utf-8").strip().splitlines()[-1]
+        )
+        assert record["confirmed"] is False
+        assert record["refused_reason"]
+
+    def test_a_confirmed_call_is_logged_as_confirmed(
+        self, enabled: JarvisConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from jarvis import config as config_module
+
+        monkeypatch.setattr(config_module, "_active", enabled)
+        run_command(ShellInput(command="echo hi"), confirmed=True)
+
+        record = json.loads(
+            (tmp_path / "shell_audit.jsonl").read_text(encoding="utf-8").strip().splitlines()[-1]
+        )
+        assert record["confirmed"] is True
+
+
 class TestBlockedCommands:
     @pytest.mark.parametrize(
         "name",

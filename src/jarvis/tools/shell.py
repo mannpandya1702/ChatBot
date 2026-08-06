@@ -28,14 +28,17 @@ registry will run it.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import shlex
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from pydantic import Field
 
@@ -107,15 +110,20 @@ class ShellOutput(ToolOutput):
     timed_out: bool = Field(default=False, description="Whether the hard timeout fired.")
 
 
-def _head(command: str) -> str:
-    """The command name, without path or extension, lowercased."""
-    try:
-        tokens = shlex.split(command, posix=False)
-    except ValueError:
-        return ""
-    if not tokens:
-        return ""
-    return Path(tokens[0].strip('"').strip("'")).stem.lower()
+#: Characters that mean the head names a location rather than a command.
+_PATH_MARKERS = ("/", "\\", ":")
+
+
+def _normalise(token: str) -> str:
+    """Strip the quoting shlex leaves behind in non-posix mode.
+
+    Every check and the final argv are built from this one function, so a token
+    can never look benign to a check and dangerous to the process.
+    """
+    text = token.strip()
+    while len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        text = text[1:-1]
+    return text.strip()
 
 
 def validate_command(
@@ -158,7 +166,6 @@ def validate_command(
     for char in text:
         if char in _ALWAYS_FORBIDDEN_CHARS:
             return ShellVerdict(False, f"the command contains the forbidden character {char!r}")
-    lowered = text.lower()
     for operator in shell_cfg.blocked_operators:
         if operator and operator in text:
             return ShellVerdict(False, f"the command contains the forbidden operator {operator!r}")
@@ -168,13 +175,30 @@ def validate_command(
     # Tokenise. Failure here means unbalanced quotes, which is refused rather
     # than guessed at.
     try:
-        tokens = shlex.split(text, posix=False)
+        raw_tokens = shlex.split(text, posix=False)
     except ValueError as exc:
         return ShellVerdict(False, f"the command could not be parsed: {exc}")
-    if not tokens:
+    if not raw_tokens:
         return ShellVerdict(False, "the command is empty")
 
-    head = _head(text)
+    # Normalise ONCE. Every check below and the argv built at the end use these
+    # same values, so a token cannot pass a check in one form and reach the
+    # process in another. Quoting "-Command" used to do exactly that.
+    tokens = [_normalise(token) for token in raw_tokens]
+    if not tokens[0]:
+        return ShellVerdict(False, "the command name could not be determined")
+
+    # Rule 1a: the allowlist names commands, not locations. A head carrying a
+    # path separator or a drive letter is refused outright, because otherwise
+    # /anywhere/echo passes an allowlist that only ever meant the real echo.
+    head_token = tokens[0]
+    if any(marker in head_token for marker in _PATH_MARKERS):
+        return ShellVerdict(
+            False,
+            "the command must be a bare command name, not a path",
+        )
+
+    head = Path(head_token).stem.lower()
     if not head:
         return ShellVerdict(False, "the command name could not be determined")
 
@@ -186,17 +210,16 @@ def validate_command(
     # "powershell Get-Process; shutdown" style constructions even if the
     # operator check were somehow bypassed.
     for token in tokens[1:]:
-        if Path(token.strip("\"'")).stem.lower() in blocked:
+        if Path(token).stem.lower() in blocked:
             return ShellVerdict(False, f"the command references the blocked command {token!r}")
 
-    # Rule 4: blocked PowerShell arguments.
+    # Rule 4: blocked PowerShell arguments, checked on the normalised token so
+    # that quoting cannot smuggle one through.
+    blocked_args = {arg.lstrip("/-").lower() for arg in shell_cfg.blocked_powershell_args}
+    blocked_args.update({"e", "ec", "enc", "encodedcommand", "command"})
     for token in tokens[1:]:
-        if token.lower().lstrip("/-") in {
-            arg.lstrip("-") for arg in shell_cfg.blocked_powershell_args
-        }:
+        if token.lstrip("/-").lower() in blocked_args:
             return ShellVerdict(False, f"the argument {token!r} is not permitted")
-    if "-e" in lowered.split() or "-enc" in lowered.split():
-        return ShellVerdict(False, "encoded command arguments are not permitted")
 
     # Rule 1: the allowlist is the primary control, applied last so its refusal
     # is the default outcome for anything unrecognised.
@@ -230,10 +253,14 @@ def validate_command(
     if working_dir is None:
         chosen = roots[0]
     else:
-        candidate = Path(working_dir).expanduser()
+        # Every failure mode here must become a verdict, not an exception: this
+        # function is documented as pure and total, and run_command relies on
+        # that to guarantee an audit record for every attempt.
+        if any(char in working_dir for char in _ALWAYS_FORBIDDEN_CHARS):
+            return ShellVerdict(False, "the working directory contains a forbidden character")
         try:
-            candidate = candidate.resolve(strict=True)
-        except (OSError, RuntimeError):
+            candidate = Path(working_dir).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
             return ShellVerdict(False, "the requested working directory does not exist")
         # resolve() collapses .. so a traversal out of an allowlisted root
         # cannot survive this comparison.
@@ -245,12 +272,17 @@ def validate_command(
         return ShellVerdict(False, "the working directory does not exist")
 
     # Rule 5: resolve the executable ourselves and build a fixed argv. No shell
-    # is involved at any point.
-    executable = shutil.which(tokens[0].strip("\"'"))
+    # is involved at any point. The resolved path is made absolute so the file
+    # that was checked is the file that runs, regardless of the child's cwd.
+    executable = shutil.which(head_token)
     if executable is None:
-        return ShellVerdict(False, f"{tokens[0]} was not found on the path")
+        return ShellVerdict(False, f"{head_token} was not found on the path")
+    try:
+        resolved = str(Path(executable).resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        return ShellVerdict(False, f"{head_token} could not be resolved to a real file")
 
-    argv = [executable, *[token.strip('"') for token in tokens[1:]]]
+    argv = [resolved, *tokens[1:]]
     return ShellVerdict(True, "allowed", argv=argv, cwd=chosen)
 
 
@@ -283,6 +315,52 @@ def _audit(
         _log.exception("could not write the shell audit log")
 
 
+class _CappedReader:
+    """Reads a pipe on its own thread, keeping at most ``limit`` bytes.
+
+    Rule 9 caps output at 4 KB. Buffering the whole stream and slicing
+    afterwards would honour the letter of that and none of its point, since a
+    chatty command could exhaust memory before the slice happened.
+
+    Draining rather than closing early matters: a child that gets EPIPE on its
+    first write dies with a broken pipe, which would misreport a working
+    command as a failed one.
+    """
+
+    def __init__(self, pipe: Any, limit: int) -> None:
+        self._pipe = pipe
+        self._limit = limit
+        self._chunks: list[bytes] = []
+        self.total = 0
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    @property
+    def overflowed(self) -> bool:
+        """Whether the stream produced more than the cap allowed."""
+        return self.total > self._limit
+
+    @property
+    def data(self) -> bytes:
+        """The retained bytes, never more than the cap."""
+        return b"".join(self._chunks)
+
+    def add(self, extra: bytes) -> None:
+        """Append a locally generated note, such as the timeout message."""
+        self._chunks.append(extra)
+
+    def _run(self) -> None:
+        try:
+            while True:
+                block = self._pipe.read(4096)
+                if not block:
+                    return
+                if self.total < self._limit:
+                    self._chunks.append(block[: self._limit - self.total])
+                self.total += len(block)
+        except (OSError, ValueError):
+            return
+
+
 def _truncate(text: str, limit: int) -> tuple[str, bool]:
     """Rule 9: cut output to the configured limit."""
     encoded = text.encode("utf-8", errors="replace")
@@ -305,7 +383,7 @@ def _truncate(text: str, limit: int) -> tuple[str, bool]:
     read_only=False,
     is_enabled=lambda config: config.tools.enable_shell and config.shell.enabled,
 )
-def run_command(params: ShellInput) -> ShellOutput:
+def run_command(params: ShellInput, *, confirmed: bool = True) -> ShellOutput:
     """Validate and run a shell command.
 
     The registry already refuses to call this without ``confirmed=True``, and the
@@ -315,6 +393,10 @@ def run_command(params: ShellInput) -> ShellOutput:
 
     Args:
         params: The command and optional working directory.
+        confirmed: Whether the user actually confirmed this invocation. Rule 10
+            requires the audit log to record that, so it is threaded through
+            rather than assumed. The registry refuses an unconfirmed call before
+            this function is reached; the flag is for the record, not the check.
 
     Returns:
         The outcome, including a refusal reason when the command was rejected.
@@ -338,7 +420,7 @@ def run_command(params: ShellInput) -> ShellOutput:
             argv=None,
             exit_code=None,
             refused=verdict.reason,
-            confirmed=True,
+            confirmed=confirmed,
             duration_s=time.perf_counter() - started,
         )
         return ShellOutput(ran=False, refused_reason=verdict.reason)
@@ -346,34 +428,64 @@ def run_command(params: ShellInput) -> ShellOutput:
     if verdict.argv is None or verdict.cwd is None:  # pragma: no cover - invariant
         raise SafetyViolationError("an allowed verdict must carry argv and cwd")
 
+    limit = config.shell.max_output_bytes
     timed_out = False
     exit_code: int | None = None
-    stdout = ""
-    stderr = ""
+    out_reader: _CappedReader | None = None
+    err_reader: _CappedReader | None = None
+    start_error = b""
+
     try:
         # Rule 5: fixed argv, shell=False. There is no shell to inject into.
-        completed = subprocess.run(
+        # Popen rather than run() so the readers can stop at the cap; see
+        # _read_capped. Binary mode so the cap is measured in the bytes the
+        # limit is stated in.
+        process = subprocess.Popen(
             verdict.argv,
             cwd=str(verdict.cwd),
-            capture_output=True,
-            text=True,
-            timeout=config.shell.timeout_s,  # Rule 8
-            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             shell=False,
         )
-        exit_code = completed.returncode
-        stdout = completed.stdout or ""
-        stderr = completed.stderr or ""
-    except subprocess.TimeoutExpired as exc:
-        timed_out = True
-        stdout = (exc.stdout or b"").decode("utf-8", errors="replace") if exc.stdout else ""
-        stderr = f"the command exceeded the {config.shell.timeout_s} second limit"
     except (OSError, subprocess.SubprocessError) as exc:
-        stderr = f"the command could not be started: {exc}"
+        start_error = f"the command could not be started: {exc}".encode()
+    else:
+        # Two readers, because reading one pipe to exhaustion while the child
+        # fills the other would deadlock.
+        out_reader = _CappedReader(process.stdout, limit)
+        err_reader = _CappedReader(process.stderr, limit)
+        out_reader.thread.start()
+        err_reader.thread.start()
 
-    limit = config.shell.max_output_bytes
-    stdout, cut_out = _truncate(stdout, limit)
-    stderr, cut_err = _truncate(stderr, limit)
+        try:
+            exit_code = process.wait(timeout=config.shell.timeout_s)  # Rule 8
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            process.kill()
+            try:
+                exit_code = process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                exit_code = None
+            err_reader.add(
+                f"the command exceeded the {config.shell.timeout_s} second limit".encode()
+            )
+        finally:
+            out_reader.thread.join(timeout=5)
+            err_reader.thread.join(timeout=5)
+            for pipe in (process.stdout, process.stderr):
+                if pipe is not None:
+                    with contextlib.suppress(OSError, ValueError):
+                        pipe.close()
+
+    out_bytes = out_reader.data if out_reader is not None else b""
+    err_bytes = err_reader.data if err_reader is not None else start_error
+    overflowed = (out_reader is not None and out_reader.overflowed) or (
+        err_reader is not None and err_reader.overflowed
+    )
+
+    stdout, cut_out = _truncate(out_bytes.decode("utf-8", errors="replace"), limit)
+    stderr, cut_err = _truncate(err_bytes.decode("utf-8", errors="replace"), limit)
     duration = time.perf_counter() - started
 
     _audit(
@@ -382,7 +494,7 @@ def run_command(params: ShellInput) -> ShellOutput:
         argv=verdict.argv,
         exit_code=exit_code,
         refused=None,
-        confirmed=True,
+        confirmed=confirmed,
         duration_s=duration,
     )
 
@@ -391,7 +503,7 @@ def run_command(params: ShellInput) -> ShellOutput:
         exit_code=exit_code,
         stdout=stdout,
         stderr=stderr,
-        truncated=cut_out or cut_err,
+        truncated=overflowed or cut_out or cut_err,
         duration_s=round(duration, 3),
         timed_out=timed_out,
     )
