@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -118,7 +117,7 @@ class TestClassifyResponse:
         assert classify_response(utterance, cfg) is not ConfirmationOutcome.AFFIRMATIVE
 
     def test_typographic_apostrophe(self, cfg: JarvisConfig) -> None:
-        assert classify_response("don’t", cfg) is ConfirmationOutcome.NEGATIVE
+        assert classify_response("don\u2019t", cfg) is ConfirmationOutcome.NEGATIVE
 
 
 class TestDecision:

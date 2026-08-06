@@ -42,7 +42,10 @@ class TestFormatUptime:
 class TestLoadTrend:
     @pytest.mark.parametrize(
         ("percent", "expected"),
-        [(0, "idle"), (5, "idle"), (20, "light"), (45, "moderate"), (70, "heavy"), (99, "saturated")],
+        [
+            (0, "idle"), (5, "idle"), (20, "light"),
+            (45, "moderate"), (70, "heavy"), (99, "saturated"),
+        ],
     )
     def test_thresholds(self, percent: float, expected: str) -> None:
         assert sys_cpu._describe_load(percent) == expected
@@ -89,7 +92,7 @@ class TestCpuStatus:
             current = 2400.0
             max = 0.0
 
-        monkeypatch.setattr(sys_cpu.psutil, "cpu_freq", lambda: Freq())
+        monkeypatch.setattr(sys_cpu.psutil, "cpu_freq", Freq)
         assert cpu_status(CpuInput(interval_s=0.1)).max_frequency_mhz is None
 
     def test_failure_becomes_tool_execution_error(self, monkeypatch: pytest.MonkeyPatch) -> None:

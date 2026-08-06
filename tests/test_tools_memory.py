@@ -16,7 +16,10 @@ from jarvis.util.errors import ToolExecutionError
 class TestPressure:
     @pytest.mark.parametrize(
         ("percent", "expected"),
-        [(10, "comfortable"), (49, "comfortable"), (60, "moderate"), (80, "tight"), (95, "critical")],
+        [
+            (10, "comfortable"), (49, "comfortable"),
+            (60, "moderate"), (80, "tight"), (95, "critical"),
+        ],
     )
     def test_thresholds(self, percent: float, expected: str) -> None:
         assert sys_memory._describe_pressure(percent) == expected
