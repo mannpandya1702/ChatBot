@@ -1,0 +1,414 @@
+"""Ollama client: streaming chat, native tool calls, and vision.
+
+T-1.6. The latency budget in §3 allows 400 ms to first token, which rules out
+buffering: :meth:`OllamaClient.chat_stream` yields each content delta as the
+NDJSON line arrives.
+
+Failure modes are distinguished on purpose. "Ollama is not running", "the model
+timed out", and "that model is not installed" need three different spoken
+answers, and collapsing them into one generic error makes the assistant useless
+to troubleshoot.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass, field
+from typing import Any
+
+import httpx
+
+from jarvis.config import JarvisConfig
+from jarvis.util.errors import LlmError
+
+__all__ = [
+    "ChatChunk",
+    "ChatResponse",
+    "OllamaClient",
+    "ToolCall",
+]
+
+_log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCall:
+    """One tool invocation requested by the model."""
+
+    name: str
+    arguments: dict[str, Any]
+    id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ChatChunk:
+    """One piece of a streaming response."""
+
+    content: str = ""
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    done: bool = False
+    metrics: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ChatResponse:
+    """A complete response, assembled from the stream."""
+
+    content: str
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    metrics: dict[str, Any] = field(default_factory=dict)
+
+
+class OllamaClient:
+    """HTTP client for a local Ollama instance.
+
+    Args:
+        config: Supplies the base URL, model, options, and timeouts.
+        client: An httpx client. Tests inject one with a mock transport.
+    """
+
+    def __init__(self, config: JarvisConfig, client: httpx.Client | None = None) -> None:
+        self._config = config
+        self._owns_client = client is None
+        self._client = client or httpx.Client(
+            base_url=config.llm.base_url,
+            timeout=httpx.Timeout(
+                config.llm.request_timeout_s, connect=config.llm.connect_timeout_s
+            ),
+        )
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def close(self) -> None:
+        """Close the underlying HTTP client, if this instance owns it."""
+        if self._owns_client:
+            self._client.close()
+
+    def __enter__(self) -> OllamaClient:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def _url(self, path: str) -> str:
+        """Absolute URL for a path, so an injected client needs no base_url."""
+        return f"{self._config.llm.base_url}{path}"
+
+    # -- discovery ---------------------------------------------------------
+
+    def is_available(self) -> bool:
+        """True when Ollama answers. Never raises."""
+        try:
+            response = self._client.get(self._url("/api/tags"), timeout=5.0)
+        except (httpx.HTTPError, OSError):
+            return False
+        return response.status_code == 200
+
+    def list_models(self) -> list[str]:
+        """Names of the models Ollama has pulled.
+
+        Raises:
+            LlmError: Ollama could not be reached.
+        """
+        try:
+            response = self._client.get(self._url("/api/tags"), timeout=10.0)
+            response.raise_for_status()
+            payload = response.json()
+        except httpx.ConnectError as exc:
+            raise _not_running(exc) from exc
+        except httpx.TimeoutException as exc:
+            raise _timed_out(exc) from exc
+        except (httpx.HTTPError, ValueError) as exc:
+            raise LlmError(f"could not list models: {exc}") from exc
+
+        return [
+            str(entry.get("name", ""))
+            for entry in payload.get("models", [])
+            if isinstance(entry, dict) and entry.get("name")
+        ]
+
+    def has_model(self, name: str) -> bool:
+        """Whether ``name`` is pulled, tolerating the implicit ``:latest`` tag."""
+        wanted = name if ":" in name else f"{name}:latest"
+        available = set(self.list_models())
+        return name in available or wanted in available
+
+    def ensure_model(self, name: str | None = None) -> None:
+        """Raise a speakable error when the required model is missing.
+
+        Raises:
+            LlmError: The model is not pulled, or Ollama is unreachable.
+        """
+        model = name or self._config.llm_model()
+        if not self.has_model(model):
+            raise LlmError(
+                f"model {model!r} is not installed in Ollama",
+                speakable=f"The {model} model is not installed. Run ollama pull {model}.",
+                context={"model": model},
+            )
+
+    # -- chat --------------------------------------------------------------
+
+    def _payload(
+        self,
+        messages: Sequence[dict[str, Any]],
+        *,
+        tools: Sequence[dict[str, Any]] | None,
+        model: str | None,
+        stream: bool,
+        think: bool | None,
+    ) -> dict[str, Any]:
+        """Build the /api/chat request body."""
+        llm = self._config.llm
+        body: dict[str, Any] = {
+            "model": model or self._config.llm_model(),
+            "messages": list(messages),
+            "stream": stream,
+            "keep_alive": llm.keep_alive,
+            "options": {
+                "temperature": llm.temperature,
+                "top_p": llm.top_p,
+                "num_ctx": llm.num_ctx,
+                "num_predict": llm.num_predict,
+            },
+        }
+        # Qwen3 thinking costs time to first token, so it is opt in (§3).
+        body["think"] = llm.think if think is None else think
+        if tools:
+            body["tools"] = list(tools)
+        return body
+
+    def chat_stream(
+        self,
+        messages: Sequence[dict[str, Any]],
+        *,
+        tools: Sequence[dict[str, Any]] | None = None,
+        model: str | None = None,
+        think: bool | None = None,
+    ) -> Iterator[ChatChunk]:
+        """Stream a chat completion, yielding deltas as they arrive.
+
+        Args:
+            messages: Chat history, in Ollama's message shape.
+            tools: JSON schemas from the tool registry.
+            model: Overrides the configured model.
+            think: Overrides the configured thinking mode.
+
+        Yields:
+            One :class:`ChatChunk` per NDJSON line, ending with ``done=True``.
+
+        Raises:
+            LlmError: Ollama is unreachable, timed out, or rejected the request.
+        """
+        body = self._payload(messages, tools=tools, model=model, stream=True, think=think)
+        _log.debug(
+            "chat request",
+            extra={
+                "context": {
+                    "model": body["model"],
+                    "messages": len(messages),
+                    "tools": len(tools or []),
+                }
+            },
+        )
+
+        retries_left = self._config.llm.tool_json_retries
+        try:
+            with self._client.stream("POST", self._url("/api/chat"), json=body) as response:
+                self._raise_for_status(response, body["model"])
+                for line in response.iter_lines():
+                    if not line.strip():
+                        continue
+                    try:
+                        payload = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        _log.warning("skipping a malformed stream line")
+                        continue
+
+                    chunk, bad_tool_json = self._parse_chunk(payload)
+                    if bad_tool_json:
+                        # T-1.6: retry a malformed tool call before giving up.
+                        if retries_left > 0:
+                            retries_left -= 1
+                            _log.warning(
+                                "the model emitted malformed tool JSON, retrying",
+                                extra={"context": {"retries_left": retries_left}},
+                            )
+                            continue
+                        raise LlmError(
+                            "the model kept emitting malformed tool call JSON",
+                            speakable="I could not work out how to do that.",
+                        )
+                    yield chunk
+                    if chunk.done:
+                        return
+        except httpx.ConnectError as exc:
+            raise _not_running(exc) from exc
+        except httpx.TimeoutException as exc:
+            raise _timed_out(exc) from exc
+        except httpx.HTTPError as exc:
+            raise LlmError(
+                f"the chat request failed: {exc}",
+                speakable="My language model is not responding.",
+            ) from exc
+
+    def chat(
+        self,
+        messages: Sequence[dict[str, Any]],
+        *,
+        tools: Sequence[dict[str, Any]] | None = None,
+        model: str | None = None,
+    ) -> ChatResponse:
+        """Non-streaming convenience wrapper over :meth:`chat_stream`."""
+        content: list[str] = []
+        calls: list[ToolCall] = []
+        metrics: dict[str, Any] = {}
+        for chunk in self.chat_stream(messages, tools=tools, model=model):
+            content.append(chunk.content)
+            calls.extend(chunk.tool_calls)
+            if chunk.metrics:
+                metrics = chunk.metrics
+        return ChatResponse(content="".join(content), tool_calls=calls, metrics=metrics)
+
+    def vision(self, prompt: str, image_b64: str, *, model: str | None = None) -> str:
+        """Ask a vision model about an image.
+
+        Args:
+            prompt: The question.
+            image_b64: Base64-encoded image bytes.
+            model: Overrides the configured vision model.
+
+        Returns:
+            The model's answer.
+
+        Raises:
+            LlmError: The request failed or the model is not installed.
+        """
+        body = {
+            "model": model or self._config.tools.vision_model,
+            "messages": [{"role": "user", "content": prompt, "images": [image_b64]}],
+            "stream": False,
+            "keep_alive": self._config.llm.keep_alive,
+            "options": {"temperature": 0.2, "num_predict": 300},
+        }
+        try:
+            response = self._client.post(self._url("/api/chat"), json=body)
+            self._raise_for_status(response, str(body["model"]))
+            payload = response.json()
+        except httpx.ConnectError as exc:
+            raise _not_running(exc) from exc
+        except httpx.TimeoutException as exc:
+            raise _timed_out(exc) from exc
+        except (httpx.HTTPError, ValueError) as exc:
+            raise LlmError(
+                f"the vision request failed: {exc}",
+                speakable="I could not look at the screen.",
+            ) from exc
+
+        message = payload.get("message") or {}
+        return str(message.get("content", "")).strip()
+
+    # -- parsing -----------------------------------------------------------
+
+    def _raise_for_status(self, response: httpx.Response, model: str) -> None:
+        """Turn an HTTP error into a specific, speakable LlmError."""
+        if response.status_code < 400:
+            return
+        if response.status_code == 404:
+            raise LlmError(
+                f"Ollama does not have the model {model!r}",
+                speakable=f"The {model} model is not installed. Run ollama pull {model}.",
+                context={"model": model},
+            )
+        raise LlmError(
+            f"Ollama returned status {response.status_code}",
+            speakable="My language model returned an error.",
+            context={"status": response.status_code},
+        )
+
+    def _parse_chunk(self, payload: dict[str, Any]) -> tuple[ChatChunk, bool]:
+        """Turn one NDJSON object into a chunk.
+
+        Returns:
+            ``(chunk, tool_json_was_malformed)``.
+        """
+        message = payload.get("message") or {}
+        content = str(message.get("content") or "")
+        done = bool(payload.get("done", False))
+
+        calls: list[ToolCall] = []
+        malformed = False
+        for raw in message.get("tool_calls") or []:
+            if not isinstance(raw, dict):
+                malformed = True
+                continue
+            function = raw.get("function") or {}
+            name = str(function.get("name") or "")
+            if not name:
+                malformed = True
+                continue
+            arguments, bad = _parse_arguments(function.get("arguments"))
+            if bad:
+                malformed = True
+                continue
+            calls.append(ToolCall(name=name, arguments=arguments, id=str(raw.get("id") or "")))
+
+        metrics: dict[str, Any] | None = None
+        if done:
+            metrics = {
+                key: payload[key]
+                for key in (
+                    "total_duration",
+                    "load_duration",
+                    "prompt_eval_count",
+                    "prompt_eval_duration",
+                    "eval_count",
+                    "eval_duration",
+                )
+                if key in payload
+            }
+
+        return ChatChunk(content=content, tool_calls=calls, done=done, metrics=metrics), malformed
+
+
+def _parse_arguments(raw: Any) -> tuple[dict[str, Any], bool]:
+    """Normalise a tool call's arguments.
+
+    Ollama returns a dict, but several models emit a JSON string instead, and a
+    few emit a string that is not valid JSON at all. Returns
+    ``(arguments, malformed)``.
+    """
+    if raw is None:
+        return {}, False
+    if isinstance(raw, dict):
+        return raw, False
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return {}, False
+        try:
+            parsed = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return {}, True
+        if isinstance(parsed, dict):
+            return parsed, False
+        return {}, True
+    return {}, True
+
+
+def _not_running(exc: BaseException) -> LlmError:
+    """The error for a refused connection, which means Ollama is down."""
+    return LlmError(
+        f"could not connect to Ollama: {exc}",
+        speakable="Ollama is not running, so I cannot think at the moment.",
+    )
+
+
+def _timed_out(exc: BaseException) -> LlmError:
+    """The error for a request that took too long."""
+    return LlmError(
+        f"the Ollama request timed out: {exc}",
+        speakable="My language model took too long to answer.",
+    )
