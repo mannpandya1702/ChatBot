@@ -174,6 +174,11 @@ class Orchestrator:
             self.state.set(AssistantState.THINKING)
 
             chunker = SentenceChunker(self._config)
+            # Everything spoken this turn, which is what the caller gets back.
+            spoken_all: list[str] = []
+            # Only what has NOT yet been written to memory. A tool round writes
+            # the text that preceded the call, so it is cleared afterwards;
+            # otherwise the final write would record that text a second time.
             reply: list[str] = []
             called: list[str] = []
             first_token_marked = False
@@ -181,7 +186,7 @@ class Orchestrator:
             try:
                 for _round in range(self._config.llm.max_tool_iterations):
                     if self._interrupt.is_set():
-                        return self._interrupted_result(reply, called, latency)
+                        return self._interrupted_result(spoken_all, called, latency)
 
                     messages = self._memory.messages(self.system_prompt())
                     tools = self._registry.ollama_tools(config=self._config)
@@ -191,7 +196,7 @@ class Orchestrator:
 
                     for chunk in self._stream(messages, tools):
                         if self._interrupt.is_set():
-                            return self._interrupted_result(reply, called, latency)
+                            return self._interrupted_result(spoken_all, called, latency)
 
                         if chunk.content:
                             if not first_token_marked:
@@ -201,6 +206,7 @@ class Orchestrator:
                             self.bus.emit(EventType.RESPONSE_CHUNK, text=chunk.content)
                             for ready in chunker.feed(chunk.content):
                                 reply.append(ready)
+                                spoken_all.append(ready)
                                 self._emit_speech(ready, speak, latency)
 
                         calls.extend(chunk.tool_calls)
@@ -208,14 +214,24 @@ class Orchestrator:
                     if not calls:
                         for ready in chunker.flush():
                             reply.append(ready)
+                            spoken_all.append(ready)
                             self._emit_speech(ready, speak, latency)
                         break
 
-                    # A tool round. Whatever the model said alongside the call
-                    # is kept, then the results go back for the final answer.
+                    # A tool round. Flush the chunker here rather than letting
+                    # it carry text into the next round: otherwise "Let me check
+                    # that" sits in the buffer until after the tool returns, so
+                    # it is spoken late and then merged into the final answer,
+                    # which also records it in memory twice.
+                    for ready in chunker.flush():
+                        spoken_all.append(ready)
+                        self._emit_speech(ready, speak, latency)
+
                     said = "".join(content_parts).strip()
                     if said:
                         self._memory.add_assistant(said)
+                    # Recorded above, so it must not be recorded again at the end.
+                    reply.clear()
                     called.extend(self._dispatch(calls, latency, speak))
                 else:
                     _log.warning(
@@ -224,14 +240,17 @@ class Orchestrator:
                     )
 
             except JarvisError as exc:
-                return self._error_result(exc, reply, called, latency, speak)
+                return self._error_result(exc, spoken_all, called, latency, speak)
             except Exception as exc:  # noqa: BLE001 - §5, never crash the loop
                 _log.exception("the turn failed")
-                return self._error_result(exc, reply, called, latency, speak)
+                return self._error_result(exc, spoken_all, called, latency, speak)
 
-            full = " ".join(part.strip() for part in reply if part.strip()).strip()
+            unrecorded = " ".join(part.strip() for part in reply if part.strip()).strip()
+            if unrecorded:
+                self._memory.add_assistant(unrecorded)
+
+            full = " ".join(part.strip() for part in spoken_all if part.strip()).strip()
             if full:
-                self._memory.add_assistant(full)
                 self.bus.emit(EventType.RESPONSE, text=full)
 
             latency.finish()

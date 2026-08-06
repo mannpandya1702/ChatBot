@@ -246,6 +246,66 @@ class TestToolChaining:
         assert result.ok
 
 
+class TestToolBoundary:
+    """Regressions for text that straddles a tool call."""
+
+    def _preamble_llm(self) -> Any:
+        class Preamble(ScriptedLlm):
+            def chat_stream(self, messages: Any, **kwargs: Any) -> Iterator[ChatChunk]:
+                self.calls.append(list(messages))
+                self.round_index += 1
+                if self.round_index == 1:
+                    yield ChatChunk(content="Let me check that for you. ")
+                    yield ChatChunk(
+                        tool_calls=[ToolCall(name="sys.cpu", arguments={"interval_s": 0.1})]
+                    )
+                    yield ChatChunk(content="", done=True)
+                else:
+                    yield ChatChunk(content="The processor is light. ")
+                    yield ChatChunk(content="", done=True)
+
+        return Preamble([])
+
+    def test_preamble_is_not_recorded_twice(
+        self, config: JarvisConfig, bus: EventBus
+    ) -> None:
+        """Text before a tool call must reach memory once, not once per round.
+
+        The chunker buffers until it sees a sentence boundary plus more text, so
+        without an explicit flush at the tool boundary the preamble is carried
+        into the next round and written again with the final answer.
+        """
+        memory = ConversationMemory(config, db_path=Path(config.memory.db_path))
+        with Orchestrator(config, bus, llm=self._preamble_llm(), memory=memory) as orch:
+            orch.run_turn("how busy is the cpu")
+
+        assistant = [m.content for m in memory.window() if m.role == "assistant"]
+        assert sum("Let me check" in line for line in assistant) == 1, assistant
+
+    def test_preamble_is_spoken_before_the_tool_runs(
+        self, config: JarvisConfig, bus: EventBus
+    ) -> None:
+        """Otherwise the user hears nothing until the tool has returned."""
+        memory = ConversationMemory(config, db_path=Path(config.memory.db_path))
+        order: list[str] = []
+
+        def record(chunk: str) -> None:
+            order.append(f"speak:{chunk[:12]}")
+
+        original_subscribe = bus.subscribe
+        bus.subscribe(
+            lambda event: order.append("tool"), [EventType.TOOL_CALL]
+        )
+        assert original_subscribe is not None
+
+        with Orchestrator(config, bus, llm=self._preamble_llm(), memory=memory) as orch:
+            orch.run_turn("how busy is the cpu", speak=record)
+
+        assert order[0].startswith("speak:Let me check"), order
+        assert "tool" in order
+        assert order.index("tool") > 0
+
+
 class TestMutatingToolsAreGated:
     def test_a_mutating_call_without_a_listener_is_refused(
         self, config: JarvisConfig, bus: EventBus

@@ -106,6 +106,9 @@ class Assistant:
         self._wake_event = threading.Event()
         self._wake_detection: Any = None
         self._stop = threading.Event()
+        # One barge-in watcher per reply, not one per spoken chunk.
+        self._barge_thread: threading.Thread | None = None
+        self._barge_lock = threading.Lock()
 
     # -- construction ------------------------------------------------------
 
@@ -289,9 +292,18 @@ class Assistant:
             self._watch_for_barge_in()
 
     def _watch_for_barge_in(self) -> None:
-        """Start a watcher that cuts playback when the user speaks over it."""
+        """Start a watcher that cuts playback when the user speaks over it.
+
+        At most one watcher runs at a time. A reply is spoken as several chunks,
+        and starting a thread per chunk would put five readers on the ring
+        buffer all racing to call interrupt() for the same utterance.
+        """
         if not self.config.orchestrator.barge_in:
             return
+
+        with self._barge_lock:
+            if self._barge_thread is not None and self._barge_thread.is_alive():
+                return
 
         def watch() -> None:
             reader = self._capture.reader()
@@ -311,7 +323,11 @@ class Assistant:
                     _log.exception("the barge-in detector failed")
                     return
 
-        threading.Thread(target=watch, name="jarvis-bargein", daemon=True).start()
+        with self._barge_lock:
+            self._barge_thread = threading.Thread(
+                target=watch, name="jarvis-bargein", daemon=True
+            )
+            self._barge_thread.start()
 
     def _metrics_loop(self) -> None:
         """Sample system metrics for the HUD."""
