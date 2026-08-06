@@ -158,6 +158,21 @@ class TestOperatorInjection:
     def test_null_byte_is_refused(self, enabled: JarvisConfig) -> None:
         assert _verdict("echo hi\x00shutdown", enabled).allowed is False
 
+    @pytest.mark.parametrize(
+        ("name", "char"),
+        [
+            ("line separator", "\u2028"),
+            ("paragraph separator", "\u2029"),
+            ("vertical tab", "\x0b"),
+            ("form feed", "\x0c"),
+        ],
+    )
+    def test_exotic_line_terminators_are_refused(
+        self, enabled: JarvisConfig, name: str, char: str
+    ) -> None:
+        """These terminate a line for several parsers, exactly like a newline."""
+        assert _verdict(f"echo hi{char}shutdown", enabled).allowed is False, name
+
     def test_operator_inside_quotes_is_still_refused(self, enabled: JarvisConfig) -> None:
         """Quoting must not launder an operator past the check."""
         assert _verdict('echo "hi && shutdown"', enabled).allowed is False
@@ -208,6 +223,35 @@ class TestPathEscape:
 
     def test_nonexistent_directory_is_refused(self, enabled: JarvisConfig) -> None:
         assert _verdict("echo hi", enabled, "/nope/not/here").allowed is False
+
+    def test_a_symlinked_allowlist_root_still_authorises_its_contents(
+        self, tmp_path: Path, workdir: Path
+    ) -> None:
+        """Roots are resolved, so a symlinked allowlist entry is not silently dead."""
+        link = tmp_path / "link-to-work"
+        link.symlink_to(workdir)
+        config = load_config(
+            tmp_path / "absent.yaml",
+            tools={"enable_shell": True},
+            shell={
+                "enabled": True,
+                "allowlist": ["echo"],
+                "working_dir_allowlist": [str(link)],
+            },
+        )
+        assert validate_command("echo hi", str(workdir), config).allowed is True
+
+    def test_a_missing_allowlist_root_authorises_nothing(self, tmp_path: Path) -> None:
+        config = load_config(
+            tmp_path / "absent.yaml",
+            tools={"enable_shell": True},
+            shell={
+                "enabled": True,
+                "allowlist": ["echo"],
+                "working_dir_allowlist": [str(tmp_path / "does-not-exist")],
+            },
+        )
+        assert validate_command("echo hi", None, config).allowed is False
 
     def test_empty_allowlist_means_nowhere(self, tmp_path: Path) -> None:
         """An unconfigured allowlist must mean no, not anywhere."""

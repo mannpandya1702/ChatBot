@@ -56,7 +56,7 @@ _log = logging.getLogger(__name__)
 #: Characters that can never appear in a command, whatever the allowlist says.
 #: Newlines matter as much as pipes: a newline in an argument becomes a second
 #: statement the moment anything re-parses the string.
-_ALWAYS_FORBIDDEN_CHARS = frozenset("&|;`\n\r\x00<>")
+_ALWAYS_FORBIDDEN_CHARS = frozenset("&|;`\n\r\x00<>\u2028\u2029\x0b\x0c")
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,7 +209,18 @@ def validate_command(
 
     # Rule 7: working directory allowlist. An empty allowlist means no directory
     # may be selected, so the tool cannot be pointed anywhere at all.
-    roots = [config.resolve_path(Path(p)) for p in shell_cfg.working_dir_allowlist]
+    roots: list[Path] = []
+    for entry in shell_cfg.working_dir_allowlist:
+        candidate_root = config.resolve_path(Path(entry))
+        try:
+            roots.append(candidate_root.resolve(strict=True))
+        except (OSError, RuntimeError):
+            # An allowlisted directory that does not exist cannot authorise
+            # anything, so it is dropped rather than compared against.
+            _log.warning(
+                "an allowlisted working directory does not exist",
+                extra={"context": {"path": str(candidate_root)}},
+            )
     if not roots:
         return ShellVerdict(
             False,
