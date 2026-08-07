@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import threading
 from pathlib import Path
 
@@ -421,3 +422,87 @@ class TestTheToolCallRoundTrip:
         reopened = ConversationMemory(cfg, db_path=path)
         assert reopened.message_count == 1
         assert not reopened.messages("sys")[-1].get("tool_calls")
+
+
+class TestCompactionStaysOffTheTurnPath:
+    """Compaction is a full, non-streaming LLM generation.
+
+    Triggered from _add it landed wherever a message happened to be recorded,
+    which includes between a tool result and the answering round: the user has
+    stopped speaking, a tool has already run, and the turn stops dead for
+    several seconds to summarise old messages nobody asked about.
+    """
+
+    def _config(self, tmp_path: Path) -> JarvisConfig:
+        return load_config(
+            tmp_path / "absent.yaml",
+            memory={"db_path": str(tmp_path / "m.db"), "max_messages": 4, "keep_recent": 2},
+        )
+
+    def test_nothing_compacts_inside_the_block(self, tmp_path: Path) -> None:
+        calls: list[int] = []
+
+        def summariser(messages: list[MemoryMessage], previous: str) -> str:
+            calls.append(len(messages))
+            return "summary"
+
+        with ConversationMemory(self._config(tmp_path), summariser=summariser) as memory:
+            with memory.deferred_compaction():
+                for index in range(10):
+                    memory.add_user(f"message {index}")
+                assert not calls, "compaction ran mid-turn"
+            assert calls, "compaction never ran at all"
+
+    def test_it_compacts_once_however_many_were_added(self, tmp_path: Path) -> None:
+        calls: list[int] = []
+
+        def summariser(messages: list[MemoryMessage], previous: str) -> str:
+            calls.append(len(messages))
+            return "summary"
+
+        with ConversationMemory(self._config(tmp_path), summariser=summariser) as memory:
+            with memory.deferred_compaction():
+                for index in range(20):
+                    memory.add_user(f"message {index}")
+            assert len(calls) == 1
+
+    def test_the_caps_still_hold_afterwards(self, tmp_path: Path) -> None:
+        config = self._config(tmp_path)
+        with ConversationMemory(config, summariser=_joining_summariser) as memory:
+            with memory.deferred_compaction():
+                for index in range(20):
+                    memory.add_user(f"message {index}")
+            assert memory.message_count <= config.memory.max_messages
+            assert memory.summary
+
+    def test_it_is_reentrant(self, tmp_path: Path) -> None:
+        calls: list[int] = []
+
+        def summariser(messages: list[MemoryMessage], previous: str) -> str:
+            calls.append(len(messages))
+            return "summary"
+
+        with ConversationMemory(self._config(tmp_path), summariser=summariser) as memory:
+            with memory.deferred_compaction():
+                for index in range(10):
+                    memory.add_user(f"outer {index}")
+                with memory.deferred_compaction():
+                    memory.add_user("inner")
+                assert not calls, "the inner block compacted"
+            assert len(calls) == 1
+
+    def test_an_exception_still_releases_the_hold(self, tmp_path: Path) -> None:
+        with ConversationMemory(self._config(tmp_path), summariser=_joining_summariser) as memory:
+            with contextlib.suppress(RuntimeError), memory.deferred_compaction():
+                memory.add_user("one")
+                raise RuntimeError("turn failed")
+            for index in range(10):
+                memory.add_user(f"after {index}")
+            assert memory.summary, "compaction stayed held after a failed turn"
+
+    def test_without_the_block_it_compacts_inline(self, tmp_path: Path) -> None:
+        """Every other caller keeps the old behaviour."""
+        with ConversationMemory(self._config(tmp_path), summariser=_joining_summariser) as memory:
+            for index in range(10):
+                memory.add_user(f"message {index}")
+            assert memory.summary

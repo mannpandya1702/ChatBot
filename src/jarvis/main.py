@@ -39,6 +39,11 @@ _log = logging.getLogger(__name__)
 #: How often the metrics sampler pushes a HUD update.
 _METRICS_INTERVAL_S = 1.0
 
+#: Consecutive synthesis failures before the fault is escalated a second time.
+#: Every chunk of every reply fails identically once the voice is dead, so this
+#: is the difference between reporting a hiccup and reporting a mute assistant.
+_MUTE_ESCALATE_AFTER = 5
+
 
 def _register_tools(config: JarvisConfig) -> int:
     """Import every tool module so its decorators register.
@@ -109,6 +114,7 @@ class Assistant:
         self._wake_event = threading.Event()
         self._wake_detection: Any = None
         self._endpointer_failed: JarvisError | None = None
+        self._speech_failures = 0
         self._stop = threading.Event()
         # One barge-in watcher per reply, not one per spoken chunk.
         self._barge_thread: threading.Thread | None = None
@@ -535,15 +541,49 @@ class Assistant:
         try:
             audio = self._synth.synthesize(text)
         except JarvisError as exc:
+            # This is the one output channel the whole product is built on, and
+            # it was the only failure path in this file that never reached the
+            # bus: its two siblings, _listen and WakeListener, both emit one, so
+            # the HUD showed their faults and showed nothing for this. A dead
+            # Kokoro produced a warning per chunk, a state machine still saying
+            # "speaking", and no way to tell from outside that anything was
+            # wrong. The user just stopped hearing anything.
             _log.warning("synthesis failed: %s", exc.message)
+            self._report_mute(exc)
             return
         if audio.size == 0 or self._orchestrator.interrupted:
             return
 
+        self._speech_failures = 0
         self._orchestrator.state.set(AssistantState.SPEAKING)
         self._player.play(audio, generation=generation)
         if self.config.orchestrator.barge_in:
             self._watch_for_barge_in()
+
+    def _report_mute(self, exc: JarvisError) -> None:
+        """Publish a synthesis failure, loudly the first time and once after.
+
+        Every chunk of every reply hits the same failure, so an unthrottled
+        report would be its own flood. The first one goes to the bus so the HUD
+        shows the error state, and a repeat is escalated once rather than
+        repeated forever, because a voice that has failed a dozen times running
+        is a different problem from one that hiccupped.
+        """
+        self._speech_failures += 1
+        if self._speech_failures == 1:
+            self.bus.emit(EventType.ERROR, message=exc.message, speakable=exc.speakable)
+            self._orchestrator.state.set(AssistantState.ERROR)
+        elif self._speech_failures == _MUTE_ESCALATE_AFTER:
+            _log.error(
+                "the voice has failed on every chunk, jarvis is mute",
+                extra={
+                    "context": {
+                        "failures": self._speech_failures,
+                        "error": exc.message,
+                    }
+                },
+            )
+            self.bus.emit(EventType.ERROR, message=exc.message, speakable=exc.speakable)
 
     def _watch_for_barge_in(self) -> None:
         """Start a watcher that cuts playback when the user speaks over it.

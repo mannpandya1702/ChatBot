@@ -1018,3 +1018,71 @@ class TestAnUnrecoverableEndpointerStopsInsteadOfSpinning:
             assert assistant._endpointer_failed is not None
         finally:
             assistant.stop()
+
+
+class TestADeadVoiceIsReported:
+    """Synthesis was the one failure path in main.py that never reached the bus.
+
+    Its two siblings both do: _listen emits an ERROR for endpointer and STT
+    failures, and WakeListener emits one on a fatal load, so the HUD showed
+    those. A dead Kokoro produced a WARNING per chunk, a state machine still
+    reporting "speaking", and nothing else. The user simply stopped hearing
+    anything and had no way to find out why.
+    """
+
+    class _BrokenSynth(FakeSynth):
+        def synthesize(self, text: str) -> Any:
+            from jarvis.util.errors import TtsError
+
+            self.said.append(text)
+            raise TtsError("no espeak backend", speakable="I could not speak that.")
+
+    def test_the_failure_reaches_the_bus(self, config: JarvisConfig) -> None:
+        assistant = Assistant(config, headless=True)
+        _wire(assistant, config, ["how busy is the cpu"])
+        assistant._synth = self._BrokenSynth()
+
+        errors: list[Any] = []
+        assistant.bus.subscribe(errors.append, [EventType.ERROR])
+
+        assistant.start()
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not errors:
+                time.sleep(0.05)
+        finally:
+            assistant.stop()
+
+        assert errors, "a mute assistant reported nothing at all"
+        assert errors[0].payload.get("speakable")
+
+    def test_it_does_not_report_once_per_chunk(self, config: JarvisConfig) -> None:
+        """Every chunk of every reply hits the same failure."""
+        assistant = Assistant(config, headless=True)
+        _wire(assistant, config, ["how busy is the cpu"])
+        assistant._synth = self._BrokenSynth()
+
+        errors: list[Any] = []
+        assistant.bus.subscribe(errors.append, [EventType.ERROR])
+
+        assistant.start()
+        try:
+            time.sleep(2.0)
+        finally:
+            assistant.stop()
+        assert len(errors) <= 3, f"{len(errors)} error events, the report is flooding"
+
+    def test_a_working_voice_reports_nothing(self, config: JarvisConfig) -> None:
+        assistant = Assistant(config, headless=True)
+        _wire(assistant, config, ["how busy is the cpu"])
+        errors: list[Any] = []
+        assistant.bus.subscribe(errors.append, [EventType.ERROR])
+
+        spoke = threading.Event()
+        assistant.bus.subscribe(lambda _e: spoke.set(), [EventType.RESPONSE])
+        assistant.start()
+        try:
+            spoke.wait(10)
+        finally:
+            assistant.stop()
+        assert not errors

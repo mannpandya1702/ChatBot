@@ -757,3 +757,68 @@ class TestTheUserGetsTheWholeWindow:
         from jarvis.tools.gate import ConfirmationGate
 
         assert ConfirmationGate(config).arm("not-a-token") is False
+
+
+class TestCompactionDoesNotStallTheTurn:
+    """Compaction is a full, non-streaming LLM generation.
+
+    Driven from ConversationMemory._add it landed wherever a message happened to
+    be recorded, and a tool round records two: the assistant's call and the
+    result. So it fired between the tool returning and the model being asked to
+    answer, stopping the turn dead for the length of a generation with the user
+    already waiting.
+    """
+
+    def _memory(self, config: JarvisConfig, log: list[str]) -> ConversationMemory:
+        def summariser(messages: Any, previous: str) -> str:
+            log.append("compact")
+            return "a summary"
+
+        return ConversationMemory(
+            config, summariser=summariser, db_path=Path(config.memory.db_path)
+        )
+
+    def test_it_does_not_run_between_a_tool_and_the_answer(
+        self, tmp_path: Path, bus: EventBus
+    ) -> None:
+        config = load_config(
+            tmp_path / "absent.yaml",
+            memory={
+                "db_path": str(tmp_path / "m.db"),
+                "session_id": "test",
+                # Tuned so the cap is passed by the tool result, which is the
+                # message recorded between the tool returning and the model
+                # being asked to answer. That is the moment the stall landed in.
+                "max_messages": 2,
+                "keep_recent": 2,
+            },
+            gate={"audit_log": str(tmp_path / "gate.jsonl")},
+            paths={"log_dir": str(tmp_path / "logs"), "data_dir": str(tmp_path / "data")},
+        )
+        log: list[str] = []
+        llm = ScriptedLlm(
+            [
+                [ToolCall(name="sys.cpu", arguments={"interval_s": 0.05})],
+                ["Forty one percent, sir."],
+            ]
+        )
+
+        class Watched(ScriptedLlm):
+            def chat_stream(self, messages: Any, **kwargs: Any) -> Iterator[ChatChunk]:
+                # Counted from the log, not from the wrapper: the round counter
+                # lives on the delegate.
+                log.append(f"round{sum(1 for e in log if e.startswith('round')) + 1}")
+                yield from llm.chat_stream(messages, **kwargs)
+
+        orchestrator = Orchestrator(
+            config, bus, llm=Watched([]), memory=self._memory(config, log)
+        )
+        try:
+            orchestrator.run_turn("how busy is the cpu")
+        finally:
+            orchestrator.close()
+
+        assert "compact" in log, "the caps were never enforced at all"
+        assert log.index("compact") > log.index("round2"), (
+            f"compaction ran before the answering round: {log}"
+        )

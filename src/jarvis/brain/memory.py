@@ -17,7 +17,8 @@ import logging
 import sqlite3
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -178,6 +179,8 @@ class ConversationMemory:
         self._summary = ""
         self._session_id = config.memory.session_id
         self._conn: sqlite3.Connection | None = None
+        self._defer_depth = 0
+        self._compaction_pending = False
 
         if config.memory.enabled:
             path = db_path or config.resolve_path(config.memory.db_path)
@@ -254,8 +257,43 @@ class ConversationMemory:
         with self._lock:
             self._messages.append(message)
             self._persist(message)
-        self.maybe_compact()
+            deferred = self._defer_depth > 0
+        if deferred:
+            self._compaction_pending = True
+        else:
+            self.maybe_compact()
         return message
+
+    @contextmanager
+    def deferred_compaction(self) -> Iterator[None]:
+        """Hold compaction until the end of the block.
+
+        Compaction runs a full, non-streaming LLM generation. Triggered from
+        :meth:`_add` it lands wherever a message happens to be recorded, which
+        includes between a tool result and the answering round: the user has
+        finished speaking, a tool has already run, and the turn stops dead for
+        several seconds to summarise old messages nobody asked about.
+
+        Wrapping a turn in this moves it to the end, where the reply is already
+        queued and playing, so it overlaps with speech instead of preceding it.
+        The work still happens on the same thread and the caps still hold; only
+        the moment changes.
+
+        Reentrant, and compacts at most once on the way out however many
+        messages were added inside.
+        """
+        with self._lock:
+            self._defer_depth += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._defer_depth -= 1
+                run = self._defer_depth == 0 and self._compaction_pending
+                if run:
+                    self._compaction_pending = False
+            if run:
+                self.maybe_compact()
 
     # -- reading -----------------------------------------------------------
 

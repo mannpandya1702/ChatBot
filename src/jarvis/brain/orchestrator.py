@@ -184,7 +184,9 @@ class Orchestrator:
         from jarvis.audio.tts import SentenceChunker
 
         latency = turn or TurnLatency(budgets_ms=_budgets(self._config))
-        with self._turn_lock:
+        # Compaction is a full LLM generation. Held until the turn is
+        # over, where it overlaps with the reply already playing.
+        with self._turn_lock, self._memory.deferred_compaction():
             self._interrupt.clear()
             spoken = text.strip()
             if not spoken:
