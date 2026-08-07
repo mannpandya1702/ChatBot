@@ -579,6 +579,22 @@ class FrameReader(Protocol):
         """Return exactly ``n`` samples, or None when fewer are available."""
 
 
+#: Readers may also expose a ``dropped`` count of samples lost to the writer
+#: lapping them. Read through :func:`_dropped_count` rather than declared on the
+#: protocol above, so a hand driven fake stays a two line class: a reader with
+#: no counter simply never reports a gap, which is the truth for a fake that
+#: hands over one frame at a time.
+
+
+def _dropped_count(reader: Any) -> int:
+    """Samples this reader has lost, or 0 when it does not keep count."""
+    value = getattr(reader, "dropped", 0)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
 DetectionCallback = Callable[[WakeDetection], None]
 
 
@@ -632,6 +648,10 @@ class WakeListener:
         self._thread: threading.Thread | None = None
         self._detections = 0
         self._errors = 0
+        # Last value seen from the reader, so a change means the writer
+        # lapped this consumer and the next frame is not contiguous.
+        self._dropped = 0
+        self._sample_rate = max(int(config.audio.sample_rate), 1)
 
     # -- introspection -----------------------------------------------------
 
@@ -775,6 +795,28 @@ class WakeListener:
             return None
         if frame is None or frame.size == 0:
             self._stop.wait(self._poll_interval_s)
+            return None
+
+        # The ring counts what a lapped reader lost and, until this, nobody
+        # asked. This loop is the one most likely to be lapped: the detector
+        # loads its models lazily inside process(), so the very first frame can
+        # block for seconds while the writer keeps going. Scoring across the
+        # splice looks for a wake word in audio that never existed, and the
+        # pre-roll handed to the turn would be the same splice.
+        dropped = _dropped_count(self._reader)
+        if dropped != self._dropped:
+            lost = dropped - self._dropped
+            self._dropped = dropped
+            _log.warning(
+                "capture fell behind the wake listener, resyncing",
+                extra={
+                    "context": {
+                        "samples": lost,
+                        "seconds": round(lost / max(self._sample_rate, 1), 3),
+                    }
+                },
+            )
+            self._detector.reset()
             return None
         return frame
 

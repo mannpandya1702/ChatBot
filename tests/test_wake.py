@@ -1048,3 +1048,77 @@ class TestAnUnloadableModelStopsRatherThanSpinning:
         assert wait_until(lambda: listener.errors >= 2, timeout=5)
         assert listener.is_running, "a transient frame error must not stop the listener"
         listener.stop()
+
+
+class TestALappedListenerResyncs:
+    """The wake listener is the consumer most likely to be lapped.
+
+    WakeWordDetector loads its models lazily inside process(), so the very first
+    frame can block for seconds while the writer keeps filling the ring.
+    RingReader counts what was lost and, until this, nothing asked: the listener
+    scored straight across the splice, looking for a wake word in audio that
+    never existed as a continuous signal, and the pre-roll it would hand the
+    turn was the same splice.
+
+    ``dropped`` is read through a helper rather than added to the FrameReader
+    protocol, so a hand driven fake stays a two line class.
+    """
+
+    class _LappingReader(ScriptedReader):
+        """Reports a gap on a chosen read."""
+
+        def __init__(self, blocks: list[np.ndarray[Any, Any]], *, gap_at: int) -> None:
+            super().__init__(blocks)
+            self.gap_at = gap_at
+            self.dropped = 0
+
+        def read(self, n: int) -> np.ndarray[Any, Any] | None:
+            block = super().read(n)
+            if self.reads == self.gap_at:
+                self.dropped += 4000
+            return block
+
+    def _listener(self, cfg: JarvisConfig, reader: Any) -> WakeListener:
+        return WakeListener(cfg, reader, EventBus(), detector=detector_for(cfg, FakeModel([0.0])))
+
+    def test_the_frame_at_a_gap_is_dropped_not_scored(self, cfg: JarvisConfig) -> None:
+        frame = cfg.wake.frame_samples
+        reader = self._LappingReader([ramp(frame) for _ in range(4)], gap_at=1)
+        listener = self._listener(cfg, reader)
+
+        assert listener._next_frame(frame) is None, "a spliced frame was handed on to be scored"
+        assert listener._next_frame(frame) is not None, "the listener never resynced"
+
+    def test_the_detector_state_is_cleared(self, cfg: JarvisConfig) -> None:
+        """Silero and openWakeWord both carry state that predates the gap."""
+        frame = cfg.wake.frame_samples
+        reader = self._LappingReader([ramp(frame) for _ in range(4)], gap_at=1)
+        listener = self._listener(cfg, reader)
+
+        listener.detector.process(ramp(frame))
+        listener._next_frame(frame)
+        assert listener.detector.frames_processed == 0
+
+    def test_a_steady_reader_is_untouched(self, cfg: JarvisConfig) -> None:
+        frame = cfg.wake.frame_samples
+        reader = self._LappingReader([ramp(frame) for _ in range(4)], gap_at=99)
+        listener = self._listener(cfg, reader)
+
+        assert listener._next_frame(frame) is not None
+        assert listener._next_frame(frame) is not None
+
+    def test_a_reader_without_a_counter_still_works(self, cfg: JarvisConfig) -> None:
+        """Most test doubles have no ``dropped``, and must keep working."""
+        frame = cfg.wake.frame_samples
+        listener = self._listener(cfg, ScriptedReader([ramp(frame) for _ in range(3)]))
+
+        assert listener._next_frame(frame) is not None
+        assert listener._next_frame(frame) is not None
+
+    def test_a_nonsense_counter_is_ignored(self, cfg: JarvisConfig) -> None:
+        class Weird(ScriptedReader):
+            dropped = "not a number"
+
+        frame = cfg.wake.frame_samples
+        listener = self._listener(cfg, Weird([ramp(frame) for _ in range(2)]))
+        assert listener._next_frame(frame) is not None

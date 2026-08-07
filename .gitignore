@@ -39,6 +39,9 @@ bench/results.json
 
 # Node / Tauri
 node_modules/
+# Written by jarvis.ui.server at startup from config.ui, so it carries the
+# machine's port. Generated, never committed.
+src/jarvis/ui/app/src/hud-config.js
 src/jarvis/ui/app/dist/
 src/jarvis/ui/app/src-tauri/target/
 src/jarvis/ui/app/src-tauri/gen/

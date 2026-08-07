@@ -92,17 +92,58 @@ class TestTauriWindow:
         assert "set_ignore_cursor_events(true)" in source
 
     def test_click_through_can_be_toggled_off(self) -> None:
-        """Without a toggle the drag handle and transcript would be unreachable."""
+        """Without a toggle the drag handle and transcript would be unreachable.
+
+        This asserted only that the Rust side defined the command, which it
+        always had. Nothing called it: not in the frontend source, not in the
+        built bundle. So the window ignored the cursor permanently and every
+        control was dead, with a green test saying otherwise.
+        """
         source = (APP / "src-tauri" / "src" / "main.rs").read_text(encoding="utf-8")
         assert "set_click_through" in source
+        assert "spawn_hit_tester" in source, "nothing decides when to toggle it"
+
+    def test_the_frontend_publishes_where_its_controls_are(self) -> None:
+        """The hit test cannot live in the frontend.
+
+        A window with ignore-cursor-events receives no pointer events, so a
+        pointermove handler would never fire and could never turn the window
+        solid again. The frontend reports rectangles; the shell polls the
+        cursor.
+        """
+        source = (APP / "src" / "main.js").read_text(encoding="utf-8")
+        assert "set_interactive_regions" in source
+        assert "getBoundingClientRect" in source
+
+    def test_the_built_bundle_carries_it_too(self) -> None:
+        """A source-only check is what let this ship: the bundle is what runs."""
+        bundles = list((APP / "dist" / "assets").glob("*.js"))
+        if not bundles:
+            pytest.skip("the HUD has not been built in this checkout")
+        assert any(
+            "set_interactive_regions" in b.read_text(encoding="utf-8") for b in bundles
+        ), "the shipped bundle never asks for the pointer"
 
     def test_csp_only_allows_the_local_core(self, conf: dict) -> None:
-        """§0.1: the HUD must not be able to reach anything off this machine."""
+        """§0.1: the HUD must not be able to reach anything off this machine.
+
+        The host is what §0.1 constrains, not the port. This used to pin
+        ws://127.0.0.1:8765, which enforced a bug rather than the contract:
+        ui.port is configurable, and setting it moved the server while the CSP
+        kept the HUD from ever reaching it. A wildcard port on a loopback host
+        reaches nothing that a fixed one does not.
+        """
         csp = conf["app"]["security"]["csp"]
         assert "connect-src" in csp
-        assert "127.0.0.1:8765" in csp or "localhost:8765" in csp
         assert "https://" not in csp
-        assert "*" not in csp.split("connect-src")[1].split(";")[0]
+
+        sources = csp.split("connect-src")[1].split(";")[0].split()
+        assert sources, "connect-src is empty"
+        for source in sources:
+            host = source.removeprefix("ws://").removeprefix("wss://").split(":")[0]
+            assert host in {"127.0.0.1", "localhost"}, f"{source} is not on this machine"
+        # A bare wildcard would allow any host, which is the thing being guarded.
+        assert "*" not in {s.strip("'") for s in sources}
 
     def test_frontend_dist_points_at_the_build_output(self, conf: dict) -> None:
         """T-3.2: the shipped HUD has to be the bundled one, not the sources.

@@ -331,14 +331,16 @@ Also fixed, found in the same pass and refuted only because the fix landed while
 the skeptics were checking: the HUD WebSocket accepted any browser origin, so any
 page the user had open could read the live transcript.
 
-### Still open
+### Also fixed, in a second pass
 
-| # | Severity | What | Why not yet |
-|---|---|---|---|
-| 7 | high | A capture reader lapped by the writer resynchronises silently; `RingReader.dropped` is computed and never read. | Needs a policy decision about what a consumer should do about it. |
-| 9 | high | The HUD window is permanently click-through: the frontend never calls `set_click_through`. | Tauri frontend, and the HUD has not been built on the target host yet (Rust absent). |
-| 10 | high | `ui.port`, `ui.host`, `ui.accent_color` and `ui.hud_position` never reach the HUD. | Same. Also the natural place to deliver a socket token. |
-| 21 | medium | One failed sink restart after a barge-in leaves the player permanently mute, with `wait()` never returning. | |
+| # | Severity | What was wrong |
+|---|---|---|
+| 7 | high | A capture reader lapped by the writer resynchronised silently. `RingReader.dropped` was computed correctly and no consumer read it, so audio from either side of a gap was spliced into one utterance and handed to the transcriber, with Silero still carrying state from before the jump. All three consumers now notice: `_listen` abandons the utterance and says so, the barge-in watcher and the wake listener reset. |
+| 9 | high | The HUD window was permanently click-through. `main.rs` set ignore-cursor-events at startup and defined a command to undo it that nothing ever called, so the drag handle and every control was dead. The obvious repair does not work: a window ignoring cursor events receives no pointer events, so a `pointermove` handler could never turn it back on. The frontend now publishes its interactive rectangles and the shell polls the global cursor against them. |
+| 10 | high | `ui.port`, `ui.host`, `ui.accent_color` and `ui.hud_position` were validated and never reached the HUD. The comments named a launcher and a build-time injector that existed nowhere. `ui/server.py` now writes `hud-config.js` at startup with the bound port, and the CSP allows any loopback port instead of pinning 8765. |
+| 21 | medium | One failed sink restart after a barge-in left the player mute for the session, because the retry was gated on the flag the failure had just cleared. It now retries, rebuilds the device if the restart keeps failing, reports at warning rather than debug, and `wait()` can no longer block past the audio it is waiting for. |
+
+All 23 confirmed findings are closed.
 
 ### Notes
 
@@ -350,3 +352,14 @@ page the user had open could read the live transcript.
 * `tests/test_engines_live.py` grew two suites that need the real engines: one
   asserting no voice profile costs intelligibility, one asserting the assistant
   does not cut itself off at any realistic speaker bleed.
+* Two more tests were enforcing bugs rather than the contract.
+  `test_click_through_can_be_toggled_off` asserted only that the Rust side
+  *defined* the command, which it always had, while nothing called it; and
+  `test_csp_only_allows_the_local_core` pinned `ws://127.0.0.1:8765`, which made
+  a configurable port a contract violation. Both now assert the thing that
+  actually matters, and the first also checks the built bundle, since a
+  source-only check is what let the dead HUD ship.
+* The Rust and the frontend are both compiled and built in this repo now
+  (`cargo check`, `npm run build`), so the HUD changes are verified rather than
+  written blind. The GTK development headers had to be installed to do it; on
+  the Windows target host they are not needed.

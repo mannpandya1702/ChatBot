@@ -362,6 +362,8 @@ class Assistant:
         endpoint = self._feed_preroll(preroll, frame_samples)
         if endpoint is not None:
             return self._transcribe(endpoint)
+
+        dropped = reader.dropped
         while time.monotonic() < deadline:
             if self._stop.is_set() or self.supervisor.should_stop("turn-loop"):
                 return "", None
@@ -369,6 +371,33 @@ class Assistant:
             if frame is None:
                 time.sleep(0.005)
                 continue
+
+            # The ring counts what a lapped reader lost and nobody asked. Audio
+            # either side of a gap is not one utterance: splicing it hands the
+            # transcriber a sentence with a hole in it and leaves Silero's LSTM
+            # carrying state from before the jump. Both are silent corruption,
+            # which is exactly what ring.py's own docstring says is worse than a
+            # logged gap.
+            if reader.dropped != dropped:
+                lost = reader.dropped - dropped
+                dropped = reader.dropped
+                _log.warning(
+                    "capture fell behind, abandoning this utterance",
+                    extra={
+                        "context": {
+                            "samples": lost,
+                            "seconds": round(lost / self.config.audio.sample_rate, 3),
+                        }
+                    },
+                )
+                self.bus.emit(
+                    EventType.ERROR,
+                    message=f"dropped {lost} samples of microphone audio",
+                    speakable="I lost part of that, could you say it again?",
+                )
+                self._endpointer.reset()
+                return "", None
+
             try:
                 endpoint = self._endpointer.process(frame)
             except (DependencyMissingError, AudioError) as exc:
@@ -623,10 +652,22 @@ class Assistant:
             reader = self._capture.reader()
             self._barge.reset()
             frame_samples = self.config.vad.frame_samples
+            dropped = reader.dropped
             while self._player.is_playing and not self._stop.is_set():
                 frame = reader.read(frame_samples)
                 if frame is None:
                     time.sleep(0.005)
+                    continue
+                if reader.dropped != dropped:
+                    # Silero's state and the echo estimate both describe audio
+                    # from before the gap. Carrying them across it is how a
+                    # detector starts answering about a moment that has passed.
+                    _log.debug(
+                        "capture fell behind during playback, resetting barge-in",
+                        extra={"context": {"samples": reader.dropped - dropped}},
+                    )
+                    dropped = reader.dropped
+                    self._barge.reset()
                     continue
                 try:
                     # The reference is what makes this the *user* talking over

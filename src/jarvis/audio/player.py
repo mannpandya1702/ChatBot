@@ -42,6 +42,11 @@ _LEVEL_HISTORY_BLOCKS = 64
 #: to cover the output device's buffering plus the trip through the room.
 _ECHO_WINDOW_S = 0.4
 
+#: Slack added to the queued duration when wait() is given no timeout. Covers
+#: scheduling and the device's own buffering without letting a stalled device
+#: park the caller indefinitely.
+_DRAIN_GRACE_S = 2.0
+
 
 class PlaybackSink(Protocol):
     """Where audio frames go. sounddevice in production, a fake in tests."""
@@ -331,28 +336,88 @@ class StreamingPlayer:
         # Ask the device to discard anything it has already buffered. Without
         # this the hardware buffer alone can hold tens of milliseconds of the
         # assistant's voice after the queue is empty.
+        #
+        # Deliberately not gated on self._started. A restart that failed leaves
+        # it False, and gating on it meant the next barge-in did not even try:
+        # one failed restart, from an abort that left the stream active or a
+        # Bluetooth headset walking out of range, made the player mute for the
+        # rest of the session. play() kept queueing, nothing consumed it,
+        # is_playing stayed True and wait() never returned, all reported at
+        # debug level.
         sink = self._sink
-        if sink is not None and self._started:
-            abort = getattr(sink, "abort", None)
-            if callable(abort):
-                try:
-                    abort()
-                except Exception:  # noqa: BLE001
-                    _log.debug("aborting the playback sink failed", exc_info=True)
-                # sounddevice needs an explicit restart after abort().
-                try:
-                    sink.start()
-                except Exception:  # noqa: BLE001
-                    _log.debug("restarting the playback sink failed", exc_info=True)
-                    self._started = False
+        if sink is None:
+            return
+        abort = getattr(sink, "abort", None)
+        if not callable(abort):
+            return
+        try:
+            abort()
+        except Exception:  # noqa: BLE001 - the restart below is what matters
+            _log.debug("aborting the playback sink failed", exc_info=True)
+        self._restart_sink()
+
+    def _restart_sink(self) -> None:
+        """Bring the device back after an abort, rebuilding it if it will not.
+
+        sounddevice needs an explicit restart after ``abort()``. When that
+        fails the sink itself is suspect, so the second attempt builds a new
+        one: an aborted stream that refuses to restart is exactly the shape a
+        removed device leaves behind, and reusing it can only fail again.
+        """
+        try:
+            if self._sink is not None:
+                self._sink.start()
+                self._started = True
+                return
+        except Exception:  # noqa: BLE001 - rebuilding is the next thing to try
+            _log.warning("restarting the playback sink failed", exc_info=True)
+        self._started = False
+
+        if not self._owns_sink:
+            # An injected sink is the caller's to manage, and replacing it would
+            # throw away whatever the test or the embedder is watching.
+            return
+        try:
+            self._sink = self._build_sink()
+            self._sink.start()
+            self._started = True
+            _log.info("rebuilt the playback device after a failed restart")
+        except Exception:  # noqa: BLE001 - §5, a dead speaker must not end the turn
+            _log.error(
+                "the playback device could not be reopened, jarvis is mute until it recovers"
+            )
+            self._started = False
 
     def wait(self, timeout: float | None = None) -> bool:
         """Block until the queue drains.
 
+        Args:
+            timeout: Seconds to wait, or None to wait as long as the audio
+                could possibly take.
+
         Returns:
             True when playback finished, False on timeout.
+
+        A dead device drains nothing, so an unbounded wait here parks the turn
+        loop until something else interrupts it. The queue knows how long it
+        would take to play; anything much past that means the audio is not
+        moving, and reporting a timeout is both true and recoverable.
         """
-        return self._drained.wait(timeout)
+        if timeout is None:
+            timeout = self.queued_seconds + _DRAIN_GRACE_S
+        drained = self._drained.wait(timeout)
+        if not drained and self.queued_seconds > 0:
+            _log.warning(
+                "playback did not drain in time, the device may have stopped",
+                extra={
+                    "context": {
+                        "queued_seconds": round(self.queued_seconds, 2),
+                        "waited_s": round(timeout, 2),
+                        "started": self._started,
+                    }
+                },
+            )
+        return drained
 
     def measure_stop_latency(self) -> float:
         """Time a stop() call in milliseconds. Used by the tests and the bench."""

@@ -430,3 +430,93 @@ class TestRealAudio:
             time.sleep(1.0)
             elapsed = player.measure_stop_latency()
             assert elapsed < cfg.tts.stop_latency_ms
+
+
+class TestAFailedRestartIsRecoverable:
+    """One failed sink restart used to make the player mute for the session.
+
+    stop() aborts the device and restarts it, and the restart was guarded by
+    self._started. A failure set that False, and the guard then meant the next
+    barge-in did not even try: play() kept queueing, nothing consumed it,
+    is_playing stayed True forever, wait() never returned, and the only trace
+    was a debug line. An abort that leaves the stream active, or a Bluetooth
+    headset walking out of range, produces exactly that shape.
+    """
+
+    class _FlakySink(NullSink):
+        """Fails its first restart after an abort, like a stream left active."""
+
+        def __init__(self, failures: int = 1) -> None:
+            super().__init__()
+            self.failures = failures
+            self.starts = 0
+
+        def start(self) -> None:
+            self.starts += 1
+            if self.aborted and self.failures > 0:
+                self.failures -= 1
+                msg = "PortAudioError: stream is not stopped"
+                raise RuntimeError(msg)
+            super().start()
+
+    def test_a_later_stop_retries_the_restart(self, cfg: JarvisConfig) -> None:
+        sink = self._FlakySink()
+        player = StreamingPlayer(cfg, sink=sink)
+        player.start()
+        try:
+            player.play(np.ones(cfg.tts.sample_rate, dtype=np.float32))
+            player.stop()  # the restart fails here
+            assert sink.started is False
+
+            player.play(np.ones(cfg.tts.sample_rate, dtype=np.float32))
+            player.stop()  # must try again rather than give up
+            assert sink.started is True, "the player never attempted to recover"
+        finally:
+            player.close()
+
+    def test_the_failure_is_not_hidden_at_debug(
+        self, cfg: JarvisConfig, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        player = StreamingPlayer(cfg, sink=self._FlakySink())
+        player.start()
+        try:
+            with caplog.at_level(logging.WARNING):
+                player.play(np.ones(100, dtype=np.float32))
+                player.stop()
+            assert any("restarting" in record.message for record in caplog.records)
+        finally:
+            player.close()
+
+    def test_an_injected_sink_is_not_replaced(self, cfg: JarvisConfig) -> None:
+        """Rebuilding would throw away what the caller is watching."""
+        sink = self._FlakySink(failures=99)
+        player = StreamingPlayer(cfg, sink=sink)
+        player.start()
+        try:
+            player.play(np.ones(100, dtype=np.float32))
+            player.stop()
+            assert player._sink is sink
+        finally:
+            player.close()
+
+    def test_wait_cannot_block_past_the_audio_it_is_waiting_for(
+        self, cfg: JarvisConfig
+    ) -> None:
+        """A dead device drains nothing, so an unbounded wait parks the turn loop."""
+        player = StreamingPlayer(cfg, sink=NullSink())
+        # Deliberately not started: nothing will ever consume the queue.
+        player.play(np.ones(cfg.tts.sample_rate // 4, dtype=np.float32))
+
+        started = time.perf_counter()
+        assert player.wait() is False
+        elapsed = time.perf_counter() - started
+        assert elapsed < 10.0, f"wait() blocked for {elapsed:.1f}s on a quarter second of audio"
+
+    def test_an_explicit_timeout_still_wins(self, cfg: JarvisConfig) -> None:
+        player = StreamingPlayer(cfg, sink=NullSink())
+        player.play(np.ones(cfg.tts.sample_rate * 30, dtype=np.float32))
+        started = time.perf_counter()
+        assert player.wait(timeout=0.1) is False
+        assert time.perf_counter() - started < 1.0

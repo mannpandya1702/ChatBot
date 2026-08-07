@@ -409,3 +409,80 @@ class TestOnlyTheHudMayConnect:
             tmp_path / "absent.yaml", ui={"allowed_origins": "tauri://localhost, http://a.b"}
         )
         assert config.ui.allowed_origins == ("tauri://localhost", "http://a.b")
+
+
+class TestTheHudGetsItsConfiguration:
+    """Four validated settings reached the HUD and none of them arrived.
+
+    main.js read window.JARVIS_PORT, main.rs read JARVIS_HUD_POSITION with a
+    comment saying "written by the launcher", and style.css said the accent was
+    "injected at build time". No launcher and no injector existed anywhere in
+    the tree. So changing ui.port moved the server and left the HUD dialling
+    8765 forever, reconnecting with backoff against nothing.
+    """
+
+    def _written(self, server: UiServer) -> str:
+        from jarvis.ui import server as server_module
+
+        app_src = Path(server_module.__file__).resolve().parent / "app" / "src"
+        return (app_src / "hud-config.js").read_text(encoding="utf-8")
+
+    async def test_the_bound_port_is_published(
+        self, ui_config: JarvisConfig, bus: EventBus
+    ) -> None:
+        """The bound one, not the configured one: port 0 means the OS chooses."""
+        with UiServer(ui_config, bus) as server:
+            body = self._written(server)
+            assert f"window.JARVIS_PORT = {server.port};" in body
+            assert server.port != 0
+
+    async def test_the_host_and_accent_are_published(
+        self, tmp_path: Any, bus: EventBus
+    ) -> None:
+        config = load_config(
+            tmp_path / "absent.yaml",
+            ui={"port": 0, "host": "127.0.0.1", "accent_color": "#ff8800"},
+        )
+        with UiServer(config, bus) as server:
+            body = self._written(server)
+        assert '"127.0.0.1"' in body
+        assert '"#ff8800"' in body
+
+    async def test_the_position_is_published(self, tmp_path: Any, bus: EventBus) -> None:
+        config = load_config(
+            tmp_path / "absent.yaml", ui={"port": 0, "hud_position": "top-left"}
+        )
+        with UiServer(config, bus) as server:
+            body = self._written(server)
+        assert '"top-left"' in body
+
+    async def test_it_is_valid_javascript_assignment_syntax(
+        self, ui_config: JarvisConfig, bus: EventBus
+    ) -> None:
+        """It is loaded as a plain script, so a syntax error blanks the HUD."""
+        with UiServer(ui_config, bus) as server:
+            body = self._written(server)
+        for line in body.splitlines():
+            if not line or line.startswith("//"):
+                continue
+            assert line.startswith("window.") and line.endswith(";"), line
+
+    async def test_a_missing_app_directory_is_not_an_error(
+        self, ui_config: JarvisConfig, bus: EventBus, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A source checkout that has never built the HUD still starts."""
+        server = UiServer(ui_config, bus)
+        monkeypatch.setattr(
+            "jarvis.ui.server.Path", lambda *_a, **_kw: Path("/nonexistent/nope")
+        )
+        assert server.write_hud_config() == []
+
+    def test_the_page_loads_it_before_the_module(self) -> None:
+        """Otherwise main.js reads the defaults and the config never applies."""
+        from jarvis.ui import server as server_module
+
+        html = (
+            Path(server_module.__file__).resolve().parent / "app" / "src" / "index.html"
+        ).read_text(encoding="utf-8")
+        assert "hud-config.js" in html
+        assert html.index("hud-config.js") < html.index("./main.js")

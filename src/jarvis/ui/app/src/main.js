@@ -21,12 +21,27 @@ const STATE_LABELS = {
   error: 'error',
 };
 
+/**
+ * Apply the accent colour the user configured.
+ *
+ * style.css carried a comment saying the accent was "injected from
+ * config.ui.accent_color at build time" by an injector that existed nowhere in
+ * the tree, so setting it did nothing at all. jarvis.ui.server now writes
+ * hud-config.js and this reads it, which means changing the colour is a restart
+ * rather than a rebuild.
+ */
+function applyAccent() {
+  const accent = window.JARVIS_ACCENT;
+  if (typeof accent === 'string' && /^#[0-9a-fA-F]{3,8}$/.test(accent)) {
+    document.documentElement.style.setProperty('--accent', accent);
+  }
+  return getComputedStyle(document.documentElement).getPropertyValue('--accent').trim();
+}
+
 class Hud {
   constructor() {
     this.orb = new ParticleOrb(document.getElementById('orb'), {
-      accentColor: getComputedStyle(document.documentElement)
-        .getPropertyValue('--accent')
-        .trim(),
+      accentColor: applyAccent(),
     });
     this.orb.start();
 
@@ -53,6 +68,8 @@ class Hud {
     this.retryDelay = RECONNECT_MIN_MS;
     this.connect();
     this.makeDraggable();
+    this.publishInteractiveRegions();
+    this.applyConfiguredPosition();
   }
 
   connect() {
@@ -162,6 +179,84 @@ class Hud {
         }
       }
     });
+  }
+
+  /**
+   * Put the window where the config asks.
+   *
+   * main.rs reads JARVIS_HUD_POSITION from the environment, with a comment
+   * saying "written by the launcher". There is no launcher: nothing in the tree
+   * ever set that variable, so every HUD sat bottom-right whatever the config
+   * said. The value now arrives in hud-config.js and is handed to the shell,
+   * which is the only side that can move a window.
+   */
+  applyConfiguredPosition() {
+    const position = window.JARVIS_HUD_POSITION;
+    if (typeof position !== 'string' || !position) return;
+    const tauri = window.__TAURI__;
+    const invoke = tauri && ((tauri.core && tauri.core.invoke) || tauri.invoke);
+    if (!invoke) return;
+    invoke('place_hud', { position }).catch(() => {
+      /* older shell without the command, or not under Tauri */
+    });
+  }
+
+  /**
+   * Tell the shell where the pointer should be able to reach the HUD.
+   *
+   * T-3.2 asks for a window that is click-through "except over interactive
+   * elements". main.rs set ignore-cursor-events at startup and defined a
+   * command to undo it, and nothing ever called that command: not here, not in
+   * the built bundle. So the window ignored the cursor permanently and the OS
+   * never delivered the mousedown makeDraggable listens for. The drag handle,
+   * and everything else, was dead.
+   *
+   * The obvious repair, a pointermove handler that toggles click-through, does
+   * not work and cannot: a window ignoring cursor events receives no pointer
+   * events, so the handler would never fire and could never turn itself back
+   * on. The hit test has to happen where the cursor is still visible, which is
+   * the shell. This side only reports where its controls are.
+   *
+   * Rectangles are in physical pixels, since that is what the shell compares
+   * against the window origin.
+   */
+  publishInteractiveRegions() {
+    const invoke = (() => {
+      const tauri = window.__TAURI__;
+      if (!tauri) return null;
+      // Tauri v2 moved invoke under .core; v1 has it at the top level.
+      return (tauri.core && tauri.core.invoke) || tauri.invoke || null;
+    })();
+    if (!invoke) return;
+
+    const publish = async () => {
+      const ratio = window.devicePixelRatio || 1;
+      const regions = Array.from(document.querySelectorAll('.interactive'))
+        .map((el) => el.getBoundingClientRect())
+        .filter((r) => r.width > 0 && r.height > 0)
+        .map((r) => ({
+          x: r.left * ratio,
+          y: r.top * ratio,
+          width: r.width * ratio,
+          height: r.height * ratio,
+        }));
+      try {
+        await invoke('set_interactive_regions', { regions });
+      } catch (err) {
+        /* the command is gone or we are not under Tauri after all */
+      }
+    };
+
+    publish();
+    // Republish whenever the layout could have moved: panels appear and hide as
+    // state changes, and a stale rectangle is a control that is solid where it
+    // no longer is.
+    window.addEventListener('resize', publish);
+    if (typeof ResizeObserver === 'function') {
+      const observer = new ResizeObserver(publish);
+      document.querySelectorAll('.interactive').forEach((el) => observer.observe(el));
+      this.regionObserver = observer;
+    }
   }
 }
 

@@ -1135,3 +1135,73 @@ class TestTheContractsLatencyIsTheOneMeasured:
         """Otherwise the number logged is not the number §3 puts a budget on."""
         stages = self._turn(config)
         assert stages["turn_total"] >= stages["stt"]
+
+
+class TestALappedReaderIsNotSpliced:
+    """ring.py's own docstring says a silent splice is worse than a logged gap.
+
+    RingReader counts what it lost correctly and no consumer ever asked:
+
+        $ grep -rn '\\.dropped' src/jarvis --include=*.py | grep -v ring.py
+        (nothing)
+
+    So audio from either side of a gap was concatenated into one utterance and
+    handed to the transcriber, with Silero still carrying LSTM state from before
+    the jump. The wake listener is the most exposed of the three consumers,
+    because the detector loads its models lazily inside process() and the very
+    first frame can block for seconds while the writer keeps going.
+    """
+
+    class _LappingReader:
+        """Reports a gap once, after a few frames."""
+
+        def __init__(self, frame: int, gap_after: int = 3) -> None:
+            self.frame = frame
+            self.gap_after = gap_after
+            self.reads = 0
+            self.dropped = 0
+
+        def read(self, n: int) -> Any:
+            self.reads += 1
+            if self.reads == self.gap_after:
+                self.dropped += 8000
+            return np.zeros(n, dtype=np.float32)
+
+    def test_the_utterance_is_abandoned_rather_than_spliced(
+        self, config: JarvisConfig
+    ) -> None:
+        assistant = Assistant(config, headless=True)
+        _wire(assistant, config, ["should never be transcribed"])
+
+        assistant.supervisor.add("turn-loop", lambda: None)
+        # A gap mid-utterance, which is the case that got spliced: the
+        # endpointer is still open, so without the check the frames either side
+        # of the jump are concatenated into one Endpoint.
+        assistant._endpointer = _SilentEndpointer()
+        reader = self._LappingReader(config.vad.frame_samples)
+        assistant._capture = type(
+            "OneReader", (), {"reader": lambda _self, **_kw: reader, "stop": lambda _self: None}
+        )()
+
+        errors: list[Any] = []
+        assistant.bus.subscribe(errors.append, [EventType.ERROR])
+
+        text, latency = assistant._listen(2.0)
+
+        assert text == "", "a spliced utterance was transcribed"
+        assert latency is None
+        assert errors, "the gap was neither logged nor published"
+        assert "dropped" in errors[0].payload["message"]
+
+    def test_a_reader_that_keeps_up_is_untouched(self, config: JarvisConfig) -> None:
+        assistant = Assistant(config, headless=True)
+        _wire(assistant, config, ["how busy is the cpu"])
+
+        assistant.supervisor.add("turn-loop", lambda: None)
+        reader = self._LappingReader(config.vad.frame_samples, gap_after=10_000)
+        assistant._capture = type(
+            "OneReader", (), {"reader": lambda _self, **_kw: reader, "stop": lambda _self: None}
+        )()
+
+        text, _latency = assistant._listen(2.0)
+        assert text == "how busy is the cpu"
