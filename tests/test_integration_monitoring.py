@@ -584,3 +584,139 @@ class TestTheModelSeesWhatItAskedFor:
         ]
         answered = [m["tool_name"] for m in round_two if m["role"] == "tool"]
         assert sorted(requested) == sorted(answered) == ["sys.cpu", "sys.memory"]
+
+
+class TestAnUnheardPromptAuthorisesNothing:
+    """§6 defines the gate as speaking the action back and waiting for a yes.
+
+    The speaking half was never checked. _emit_speech returns early when there
+    is no speech callback and swallows any exception from one, so whenever
+    tts.enabled is false or Kokoro fails, the assistant opened a fifteen second
+    microphone window having asked nothing. Any affirmative in earshot, someone
+    on a phone call saying "go ahead", then authorised apps.launch,
+    media.control, reminders.delete or shell.run, and the user was never told
+    what they had approved.
+
+    Neither condition is exotic: tts.enabled is a shipped toggle and
+    main._speak is written to log a synthesis failure and carry on.
+    """
+
+    def _turn(self, config: JarvisConfig, bus: EventBus, speak: Any) -> tuple[Any, list[str]]:
+        from jarvis.tools import apps  # noqa: F401 - registers apps.launch
+
+        llm = ScriptedLlm(
+            [[ToolCall(name="apps.launch", arguments={"name": "notepad"})], ["Done."]]
+        )
+        heard: list[str] = []
+        with _build(config, llm, bus) as orchestrator:
+            orchestrator.set_listener(lambda _timeout: heard.append("listened") or "yes")
+            orchestrator.run_turn("open notepad", speak=speak)
+        payloads = [m["content"] for m in llm.calls[1] if m.get("role") == "tool"]
+        return payloads, heard
+
+    def test_no_speech_callback_means_no_confirmation(
+        self, config: JarvisConfig, bus: EventBus
+    ) -> None:
+        """The tts.enabled false path, where main._speak returns immediately."""
+        payloads, heard = self._turn(config, bus, None)
+        assert payloads and "could not be spoken" in payloads[0]
+        assert not heard, "the microphone was opened for a question nobody was asked"
+
+    def test_a_synthesis_failure_means_no_confirmation(
+        self, config: JarvisConfig, bus: EventBus
+    ) -> None:
+        """The Kokoro failure path, which main._speak logs and swallows."""
+
+        def broken(_text: str) -> None:
+            from jarvis.util.errors import TtsError
+
+            raise TtsError("no espeak backend", speakable="I could not speak that.")
+
+        payloads, heard = self._turn(config, bus, broken)
+        assert payloads and "could not be spoken" in payloads[0]
+        assert not heard, "the microphone was opened for a question nobody heard"
+
+    def test_a_working_voice_still_confirms(
+        self, config: JarvisConfig, bus: EventBus
+    ) -> None:
+        """The guard must refuse silence, not refuse everything."""
+        payloads, heard = self._turn(config, bus, lambda _text: None)
+        assert heard, "the confirmation window never opened"
+        assert payloads and "could not be spoken" not in payloads[0]
+
+    def test_the_refusal_is_published(self, config: JarvisConfig, bus: EventBus) -> None:
+        outcomes: list[str] = []
+        bus.subscribe(
+            lambda event: outcomes.append(str(event.payload.get("outcome"))),
+            [EventType.CONFIRMATION_RESOLVED],
+        )
+        self._turn(config, bus, None)
+        assert "unspoken" in outcomes
+
+
+class TestTheUserGetsTheWholeWindow:
+    """§6 promises a window to answer the question the user was just asked.
+
+    The deadline was armed inside the gate's check(), which runs before the
+    prompt has been synthesised, let alone played. Speaking it then ate into the
+    same window: on the cpu tier routinely five to eight seconds of it. The user
+    said yes, heard nothing happen, and was told nothing.
+
+    shell.run failed closed outright. Its prompt embeds the whole command and
+    ShellInput.command allows 512 characters, which takes far longer to speak
+    than the window, so that call could never be confirmed at all.
+    """
+
+    def test_speaking_the_prompt_does_not_eat_the_window(
+        self, config: JarvisConfig, bus: EventBus
+    ) -> None:
+        from jarvis.tools import apps  # noqa: F401
+
+        clock = {"now": 1_000.0}
+        llm = ScriptedLlm(
+            [[ToolCall(name="apps.launch", arguments={"name": "notepad"})], ["Done."]]
+        )
+        with _build(config, llm, bus) as orchestrator:
+            orchestrator.gate._monotonic_source = lambda: clock["now"]
+
+            def slow_speak(_text: str) -> None:
+                # A long prompt on a slow tier, longer than the whole window.
+                clock["now"] += config.gate.confirmation_timeout_s + 5.0
+
+            def answer(_timeout: float) -> str:
+                clock["now"] += 1.0  # the user replies promptly
+                return "yes"
+
+            orchestrator.set_listener(answer)
+            orchestrator.run_turn("open notepad", speak=slow_speak)
+
+        payloads = [m["content"] for m in llm.calls[1] if m.get("role") == "tool"]
+        assert payloads
+        assert "timeout" not in payloads[0], (
+            f"a prompt answer was discarded as a timeout: {payloads[0]}"
+        )
+
+    def test_a_slow_answer_still_times_out(
+        self, config: JarvisConfig, bus: EventBus
+    ) -> None:
+        """Rearming must move the window, not remove it."""
+        from jarvis.tools import apps  # noqa: F401
+
+        clock = {"now": 1_000.0}
+        llm = ScriptedLlm(
+            [[ToolCall(name="apps.launch", arguments={"name": "notepad"})], ["Done."]]
+        )
+        with _build(config, llm, bus) as orchestrator:
+            orchestrator.gate._monotonic_source = lambda: clock["now"]
+            orchestrator.set_listener(
+                lambda _t: (clock.__setitem__("now", clock["now"] + 60.0), "yes")[1]
+            )
+            orchestrator.run_turn("open notepad", speak=lambda _t: None)
+
+        payloads = [m["content"] for m in llm.calls[1] if m.get("role") == "tool"]
+        assert payloads and "timeout" in payloads[0]
+
+    def test_arm_reports_an_unknown_token(self, config: JarvisConfig) -> None:
+        from jarvis.tools.gate import ConfirmationGate
+
+        assert ConfirmationGate(config).arm("not-a-token") is False

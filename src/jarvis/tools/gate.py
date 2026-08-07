@@ -366,8 +366,47 @@ class ConfirmationGate:
         )
         return GateResult(GateDecision.DENIED, tool, reason)
 
+    def arm(self, token: str) -> bool:
+        """Restart a pending request's answering window from now.
+
+        §6 gives the user a window to answer the question they were just asked,
+        and :meth:`_open` cannot start it: it runs before the prompt has been
+        synthesised, let alone played. The prompt then takes seconds to speak,
+        and on the cpu tier routinely five to eight, all of it deducted from the
+        time the user has to reply. They say yes, hear nothing happen, and are
+        told nothing.
+
+        The pathological case fails closed outright. ``shell.run`` puts the
+        whole command in the prompt and ``ShellInput.command`` allows 512
+        characters, which runs well past the window, so that call could never be
+        confirmed however fast the user answered.
+
+        So the orchestrator calls this once playback has drained and before it
+        opens the microphone. The initial deadline is not removed: it still
+        bounds a request whose prompt is never spoken at all.
+
+        Args:
+            token: The pending request.
+
+        Returns:
+            Whether a pending request was found and rearmed.
+        """
+        window = self._config.gate.confirmation_timeout_s
+        with self._lock:
+            request = self._pending.get(token)
+            if request is None:
+                return False
+            request.deadline = self._monotonic_source() + window
+            request.expires_at = self._clock() + window
+        return True
+
     def _open(self, tool: str, arguments: dict[str, Any]) -> ConfirmationRequest:
-        """Create a pending confirmation and start its clock."""
+        """Create a pending confirmation and start its clock.
+
+        This deadline is a backstop for a request that is never armed. The one
+        the user is actually measured against is set by :meth:`arm`, once the
+        prompt has finished being spoken.
+        """
         now = self._clock()
         window = self._config.gate.confirmation_timeout_s
         request = ConfirmationRequest(

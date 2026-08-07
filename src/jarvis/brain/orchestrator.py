@@ -292,10 +292,20 @@ class Orchestrator:
                 extra={"context": {"ms": round((time.perf_counter() - started) * 1000, 1)}},
             )
 
-    def _emit_speech(self, text: str, speak: SpeakFn | None, latency: TurnLatency) -> None:
-        """Hand one chunk to the speech callback and record first audio."""
+    def _emit_speech(self, text: str, speak: SpeakFn | None, latency: TurnLatency) -> bool:
+        """Hand one chunk to the speech callback and record first audio.
+
+        Returns:
+            Whether the chunk actually reached the speech callback. For an
+            ordinary sentence nobody looks: a failure there is logged and the
+            turn goes on, because losing one sentence is better than losing the
+            turn. The confirmation prompt is the exception, and §6 is the reason:
+            it defines the gate as speaking the action back and waiting for an
+            affirmative, so a prompt that was never rendered cannot be answered
+            and must not open a microphone.
+        """
         if not text.strip() or speak is None:
-            return
+            return False
         if latency.get(Stage.TTS_FIRST_AUDIO) is None:
             latency.mark(Stage.TTS_FIRST_AUDIO)
         self.state.set(AssistantState.SPEAKING)
@@ -303,6 +313,8 @@ class Orchestrator:
             speak(text)
         except Exception:  # noqa: BLE001 - a speech failure must not end the turn
             _log.exception("speaking a chunk failed")
+            return False
+        return True
 
     # -- tools -------------------------------------------------------------
 
@@ -338,8 +350,29 @@ class Orchestrator:
         self.bus.emit(
             EventType.CONFIRMATION_REQUIRED, prompt=pending.prompt, tool=pending.tool
         )
-        if speak is not None:
-            self._emit_speech(pending.prompt, speak, TurnLatency())
+
+        # §6 defines the gate as speaking the action back and waiting for an
+        # explicit affirmative. If the prompt never reached a speaker there is
+        # no question in the room, so opening the microphone would let any
+        # affirmative in earshot, someone on a phone call saying "go ahead",
+        # authorise a mutating tool the user was never told about. Silence is
+        # not exotic: tts.enabled is a shipped toggle and main._speak swallows
+        # a Kokoro failure by design.
+        if not self._emit_speech(pending.prompt, speak, TurnLatency()):
+            _log.warning(
+                "refusing a mutating call whose confirmation prompt could not be spoken",
+                extra={"context": {"tool": pending.tool}},
+            )
+            self._gate.expire(pending.token)
+            self.bus.emit(
+                EventType.CONFIRMATION_RESOLVED, tool=pending.tool, outcome="unspoken"
+            )
+            return ToolResult(
+                tool=pending.tool,
+                ok=False,
+                error="the confirmation prompt could not be spoken, so nothing was confirmed",
+                speakable="I have not done that.",
+            )
 
         # A user talking over the confirmation prompt is interrupting, not
         # answering. Treating their speech as the reply would let a barge-in
@@ -358,6 +391,11 @@ class Orchestrator:
 
         answer = ""
         if self._listen is not None:
+            # Start the answering window now, not when the gate was checked.
+            # The listener blocks until playback has drained, so by this point
+            # the question has actually been asked and the user has the full
+            # window §6 promises rather than what is left of it.
+            self._gate.arm(pending.token)
             self.state.set(AssistantState.LISTENING)
             try:
                 answer = self._listen(self._config.gate.confirmation_timeout_s)
