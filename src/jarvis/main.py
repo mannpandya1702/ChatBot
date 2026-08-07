@@ -24,6 +24,8 @@ import threading
 import time
 from typing import Any
 
+import numpy as np
+
 from jarvis.config import JarvisConfig, load_config, set_config
 from jarvis.state import AssistantState, EventBus, EventType
 from jarvis.util.errors import AudioError, DependencyMissingError, JarvisError
@@ -106,6 +108,7 @@ class Assistant:
 
         self._wake_event = threading.Event()
         self._wake_detection: Any = None
+        self._endpointer_failed: JarvisError | None = None
         self._stop = threading.Event()
         # One barge-in watcher per reply, not one per spoken chunk.
         self._barge_thread: threading.Thread | None = None
@@ -182,6 +185,8 @@ class Assistant:
         # The loops must be told to stop before anything they use is closed.
         self.shutdown.register("stop-flag", self._request_stop)
 
+        self._warm_engines()
+
         greeting = self.config.orchestrator.greeting.strip()
         if greeting:
             self._speak(greeting)
@@ -198,12 +203,73 @@ class Assistant:
             },
         )
 
+    def _warm_engines(self) -> None:
+        """Load every model now rather than during the user's first sentence.
+
+        All three engines load lazily, and measured on a machine with the
+        weights already on disk the first call to each costs:
+
+            Silero VAD        86 ms   (steady 0.2 ms, §3 budget 250 ms)
+            faster-whisper  3,722 ms  (steady 306 ms, §3 budget 200 ms)
+            Kokoro          7,706 ms  (steady 568 ms, §3 budget 300 ms)
+
+        So the first question of every session took about eleven seconds longer
+        than every question after it, which reads as the assistant being broken
+        rather than cold. ``Transcriber.warmup`` was written for exactly this and
+        was never called from anywhere but its own test.
+
+        Runs on a daemon thread so startup is not blocked: the wake word still
+        has to fire before any of it is needed, and a user who speaks
+        immediately simply waits where they would have waited anyway.
+        """
+
+        def warm() -> None:
+            started = time.perf_counter()
+            try:
+                frame = np.zeros(self.config.vad.frame_samples, dtype=np.float32)
+                for _ in range(3):
+                    self._endpointer.process(frame)
+                self._endpointer.reset()
+            except Exception:  # noqa: BLE001 - warmup must never take the loop down
+                _log.debug("could not warm the endpointer", exc_info=True)
+
+            try:
+                self._transcriber.warmup()
+            except Exception:  # noqa: BLE001
+                _log.debug("could not warm the transcriber", exc_info=True)
+
+            try:
+                # Real text, because Kokoro returns immediately for whitespace
+                # and would never load. The audio is discarded, and the rack is
+                # reset afterwards so this leaves no reverb tail in the greeting.
+                self._synth.synthesize("Ready.")
+                self._synth.begin_utterance()
+            except Exception:  # noqa: BLE001
+                _log.debug("could not warm the synthesiser", exc_info=True)
+
+            _log.info(
+                "engines warm",
+                extra={"context": {"seconds": round(time.perf_counter() - started, 1)}},
+            )
+
+        threading.Thread(target=warm, name="jarvis-warmup", daemon=True).start()
+
     def _request_stop(self) -> None:
-        """Ask every loop to exit. Safe to call more than once."""
+        """Ask every loop to exit. Safe to call more than once.
+
+        The player has to be told too. During a reply the turn loop is parked in
+        ``player.wait(max_turn_seconds)``, on an event only the audio callback or
+        ``player.stop()`` ever sets, so a Ctrl-C mid-sentence left it there:
+        shutdown blocked for its full five second grace period and then reported
+        the turn loop as stalled. Barge-in already treats "cut playback" and
+        "abandon the turn" as one operation. Shutdown is the same operation.
+        """
         self._stop.set()
         self._wake_event.set()
         if self._orchestrator is not None:
             self._orchestrator.interrupt()
+        if self._player is not None:
+            self._player.stop()
 
     def stop(self) -> None:
         """Stop everything, in reverse order of construction."""
@@ -223,6 +289,14 @@ class Assistant:
         """Wait for a wake word, then run turns until the user goes quiet."""
         always = self.config.orchestrator.always_listening
         while not self.supervisor.should_stop("turn-loop") and not self._stop.is_set():
+            if self._endpointer_failed is not None:
+                # Nothing here can recover it, and calling back in would only
+                # restart the flood. WakeListener handles a fatal load the same
+                # way: report it once and stop, rather than fail at frame rate.
+                _log.error(
+                    "the turn loop is stopping: %s", self._endpointer_failed.message
+                )
+                return
             if not always:
                 self._orchestrator.state.set(AssistantState.IDLE)
                 if not self._wake_event.wait(0.25):
@@ -233,7 +307,11 @@ class Assistant:
             while time.monotonic() < deadline:
                 if self._stop.is_set() or self.supervisor.should_stop("turn-loop"):
                     return
-                text = self._listen(self.config.vad.max_utterance_s)
+                preroll, self._wake_detection = self._wake_detection, None
+                text = self._listen(
+                    self.config.vad.max_utterance_s,
+                    getattr(preroll, "preroll", None),
+                )
                 if not text:
                     if always:
                         break
@@ -249,8 +327,24 @@ class Assistant:
                 # does not need the wake word again.
                 deadline = time.monotonic() + self.config.orchestrator.idle_timeout_s
 
-    def _listen(self, timeout_s: float) -> str:
-        """Endpoint one utterance and transcribe it. Empty string on silence."""
+    def _listen(self, timeout_s: float, preroll: Any = None) -> str:
+        """Endpoint one utterance and transcribe it. Empty string on silence.
+
+        Args:
+            timeout_s: How long to wait for the utterance to close.
+            preroll: Audio captured before the wake word fired, from
+                :class:`~jarvis.audio.wake.WakeDetection`. Fed through the
+                endpointer before the live stream so the utterance starts
+                unclipped.
+
+        The pre-roll matters more than it looks. The ring buffer keeps a second
+        of it precisely so the wake word's trailing audio is not lost, and
+        WakeDetection's own docstring says to prepend it, but nothing ever did:
+        the turn loop attached a fresh cursor at the write head, so the
+        endpointer only saw audio captured after the trigger. Anyone who says
+        "hey jarvis what time is it" as one phrase lost the front of the
+        question, and the transcriber was handed a sentence starting mid-word.
+        """
         reader = self._capture.reader()
         self._endpointer.reset()
         frame_samples = self.config.vad.frame_samples
@@ -258,6 +352,10 @@ class Assistant:
         errors = 0
 
         self._orchestrator.state.set(AssistantState.LISTENING)
+
+        endpoint = self._feed_preroll(preroll, frame_samples)
+        if endpoint is not None:
+            return self._transcribe(endpoint)
         while time.monotonic() < deadline:
             if self._stop.is_set() or self.supervisor.should_stop("turn-loop"):
                 return ""
@@ -269,11 +367,15 @@ class Assistant:
                 endpoint = self._endpointer.process(frame)
             except (DependencyMissingError, AudioError) as exc:
                 # Neither recovers between frames: the package will not install
-                # itself and the checkpoint will not appear. Retrying logged a
-                # full traceback per frame, roughly thirty a second, which
-                # buried the one line worth reading.
+                # itself and the checkpoint will not appear. Logging once per
+                # frame buried the one line worth reading, and returning "" only
+                # moved the spin one frame up: the turn loop reads that as
+                # ordinary silence and calls straight back in, so the rate
+                # stayed at the frame rate, 31 errors and 11 KiB of log a
+                # second. Latching it is what actually stops it.
+                self._endpointer_failed = exc
                 _log.error(
-                    "cannot endpoint speech: %s",
+                    "cannot endpoint speech, listening is disabled: %s",
                     exc.message,
                     extra={"context": {"error": type(exc).__name__, **exc.context}},
                 )
@@ -293,33 +395,7 @@ class Assistant:
             if endpoint is None:
                 continue
 
-            # Only the length. The endpointer zeroes its counters as it emits,
-            # so speech_ms and silence_ms read 0 here and would be worse than
-            # saying nothing. audio.vad logs the reason and the decision time.
-            _log.info(
-                "utterance endpointed",
-                extra={
-                    "context": {
-                        "seconds": round(endpoint.audio.size / self.config.audio.sample_rate, 2),
-                    }
-                },
-            )
-            try:
-                transcript = self._transcriber.transcribe(
-                    endpoint.audio, self.config.audio.sample_rate
-                )
-            except JarvisError as exc:
-                _log.warning("transcription failed: %s", exc.message)
-                self.bus.emit(EventType.ERROR, message=exc.message, speakable=exc.speakable)
-                return ""
-            text = str(transcript.text).strip()
-            if not text:
-                # Endpointed but nothing came back. Worth a line: from outside
-                # it is indistinguishable from never having heard anything.
-                _log.info("the transcriber returned nothing for that utterance")
-            else:
-                _log.info("heard", extra={"context": {"text": text}})
-            return text
+            return self._transcribe(endpoint)
 
         # Timed out. Silence here is the worst outcome to debug, because the
         # user spoke, nothing happened, and nothing said why. Report what the
@@ -371,6 +447,76 @@ class Assistant:
             if not self._player.wait(timeout=0.25):
                 continue
         return self._listen(timeout_s)
+
+    def _feed_preroll(self, preroll: Any, frame_samples: int) -> Any:
+        """Run the wake word's pre-roll through the endpointer before live audio.
+
+        Returns:
+            An endpoint if the utterance somehow completed inside the pre-roll,
+            which only happens when the user said nothing after the wake word,
+            otherwise None.
+
+        Never raises: a pre-roll that cannot be scored is not worth failing a
+        turn over, and the live stream immediately after it will be scored by
+        the same endpointer anyway.
+        """
+        if preroll is None:
+            return None
+        try:
+            samples = np.asarray(preroll, dtype=np.float32).reshape(-1)
+        except (TypeError, ValueError):
+            _log.debug("the wake detection carried a pre-roll that was not audio")
+            return None
+        if samples.size < frame_samples:
+            return None
+
+        whole = (samples.size // frame_samples) * frame_samples
+        for start in range(0, whole, frame_samples):
+            try:
+                endpoint = self._endpointer.process(samples[start : start + frame_samples])
+            except JarvisError as exc:
+                _log.debug("could not score the pre-roll: %s", exc.message)
+                return None
+            except Exception:  # noqa: BLE001 - the live stream is what matters
+                _log.debug("the endpointer failed on a pre-roll frame", exc_info=True)
+                return None
+            if endpoint is not None:
+                return endpoint
+        _log.debug(
+            "seeded the endpointer with the wake word's pre-roll",
+            extra={"context": {"samples": int(whole)}},
+        )
+        return None
+
+    def _transcribe(self, endpoint: Any) -> str:
+        """Turn a closed utterance into text. Empty string on any failure."""
+        # Only the length. The endpointer zeroes its counters as it emits, so
+        # speech_ms and silence_ms read 0 here and would be worse than saying
+        # nothing. audio.vad logs the reason and the decision time.
+        _log.info(
+            "utterance endpointed",
+            extra={
+                "context": {
+                    "seconds": round(endpoint.audio.size / self.config.audio.sample_rate, 2),
+                }
+            },
+        )
+        try:
+            transcript = self._transcriber.transcribe(
+                endpoint.audio, self.config.audio.sample_rate
+            )
+        except JarvisError as exc:
+            _log.warning("transcription failed: %s", exc.message)
+            self.bus.emit(EventType.ERROR, message=exc.message, speakable=exc.speakable)
+            return ""
+        text = str(transcript.text).strip()
+        if not text:
+            # Endpointed but nothing came back. Worth a line: from outside it is
+            # indistinguishable from never having heard anything.
+            _log.info("the transcriber returned nothing for that utterance")
+        else:
+            _log.info("heard", extra={"context": {"text": text}})
+        return text
 
     def _speak(self, text: str) -> None:
         """Synthesise and queue one chunk, watching for barge-in.

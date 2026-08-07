@@ -274,7 +274,10 @@ class TestFullLoop:
             assert answered.wait(15), "no response was produced"
             assert parts["llm"].turns >= 1
             assert parts["synth"].said, "nothing was handed to the synthesiser"
-            assert "processor" in parts["synth"].said[0]
+            # Any of them, not the first: startup warms the engines through the
+            # same synthesiser so the first real sentence does not pay for
+            # loading Kokoro, and that warmup text is recorded here too.
+            assert any("processor" in line for line in parts["synth"].said), parts["synth"].said
         finally:
             assistant.stop()
 
@@ -759,3 +762,259 @@ class TestTheListenPathSaysWhatHappened:
         messages = " ".join(r.getMessage() for r in caplog.records)
         assert "utterance endpointed" in messages
         assert "heard" in messages
+
+
+class TestStartupWarmsTheEngines:
+    """Every engine loads lazily, so the first sentence of a session paid for it.
+
+    Measured with the weights already on disk: Silero 86 ms, faster-whisper
+    3.7 s, Kokoro 7.7 s on their first call, against §3 budgets of 250, 200 and
+    300 ms. That is about eleven seconds added to the first question of every
+    session and none of the ones after it, which reads as the assistant being
+    broken rather than cold. Transcriber.warmup existed for exactly this and was
+    called from nowhere but its own test.
+    """
+
+    def test_the_transcriber_is_warmed(self, config: JarvisConfig) -> None:
+        assistant = Assistant(config, headless=True)
+        parts = _wire(assistant, config, [])
+        warmed = threading.Event()
+        parts["transcriber"].warmup = warmed.set  # type: ignore[attr-defined]
+        try:
+            assistant.start()
+            assert warmed.wait(5), "the transcriber was never warmed"
+        finally:
+            assistant.stop()
+
+    def test_the_synthesiser_is_warmed(self, config: JarvisConfig) -> None:
+        assistant = Assistant(config, headless=True)
+        parts = _wire(assistant, config, [])
+        try:
+            assistant.start()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not parts["synth"].said:
+                time.sleep(0.02)
+            assert parts["synth"].said, "the synthesiser was never warmed"
+        finally:
+            assistant.stop()
+
+    def test_warming_plays_no_audio(self, config: JarvisConfig) -> None:
+        """It loads the model. It must not make a noise doing so."""
+        assistant = Assistant(config, headless=True)
+        parts = _wire(assistant, config, [])
+        try:
+            assistant.start()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not parts["synth"].said:
+                time.sleep(0.02)
+            assert assistant._player.queued_seconds == 0.0
+        finally:
+            assistant.stop()
+
+    def test_a_broken_engine_does_not_stop_startup(self, config: JarvisConfig) -> None:
+        """A warmup failure belongs on the first real utterance, with context."""
+        assistant = Assistant(config, headless=True)
+        parts = _wire(assistant, config, [])
+
+        def explode() -> None:
+            raise RuntimeError("no CUDA")
+
+        parts["transcriber"].warmup = explode  # type: ignore[attr-defined]
+        try:
+            assistant.start()
+            time.sleep(0.3)
+            assert assistant.supervisor.health().healthy
+        finally:
+            assistant.stop()
+
+
+class TestTheWakeWordsPrerollIsUsed:
+    """The ring buffer keeps a second of audio before the trigger for a reason.
+
+    T-1.1 asks for the pre-roll "so the wake word's trailing audio is not lost",
+    WakeDetection carries it, and its own docstring says to prepend it. Nothing
+    did: the turn loop attached a fresh cursor at the write head, so the
+    endpointer only ever saw audio captured after the trigger. Anyone saying
+    "hey jarvis what time is it" as one phrase lost the front of the question,
+    and the transcriber got a sentence starting mid-word.
+    """
+
+    class _Recorder:
+        """An endpointer that records every frame and never closes an utterance."""
+
+        def __init__(self) -> None:
+            self.frames: list[Any] = []
+
+        def reset(self) -> None:
+            return None
+
+        def process(self, frame: Any) -> Any:
+            self.frames.append(np.asarray(frame).copy())
+            return None
+
+    def test_the_preroll_reaches_the_endpointer(self, config: JarvisConfig) -> None:
+        assistant = Assistant(config, headless=True)
+        _wire(assistant, config, [])
+        recorder = self._Recorder()
+        assistant._endpointer = recorder
+
+        frame = config.vad.frame_samples
+        preroll = np.tile(np.linspace(0.1, 1.0, frame, dtype=np.float32), 4)
+
+        assistant._capture.start()
+        try:
+            assistant._listen(0.15, preroll)
+        finally:
+            assistant._capture.stop()
+
+        assert len(recorder.frames) >= 4, "the pre-roll was never scored"
+        seeded = np.concatenate(recorder.frames[:4])
+        assert np.allclose(seeded, preroll), "the endpointer did not see the pre-roll audio"
+
+    def test_no_preroll_is_harmless(self, config: JarvisConfig) -> None:
+        assistant = Assistant(config, headless=True)
+        _wire(assistant, config, [])
+        assistant._endpointer = self._Recorder()
+        assistant._capture.start()
+        try:
+            assert assistant._listen(0.1, None) == ""
+        finally:
+            assistant._capture.stop()
+
+    def test_a_short_preroll_is_ignored_rather_than_padded(
+        self, config: JarvisConfig
+    ) -> None:
+        """Silero rejects a frame of the wrong length, so a partial one is dropped."""
+        assistant = Assistant(config, headless=True)
+        _wire(assistant, config, [])
+        recorder = self._Recorder()
+        assistant._endpointer = recorder
+        assistant._capture.start()
+        try:
+            assistant._listen(0.1, np.zeros(7, dtype=np.float32))
+        finally:
+            assistant._capture.stop()
+        assert all(f.size == config.vad.frame_samples for f in recorder.frames)
+
+    def test_rubbish_in_the_preroll_does_not_end_the_turn(
+        self, config: JarvisConfig
+    ) -> None:
+        assistant = Assistant(config, headless=True)
+        _wire(assistant, config, [])
+        assistant._endpointer = self._Recorder()
+        assistant._capture.start()
+        try:
+            assert assistant._listen(0.1, "not audio at all") == ""
+        finally:
+            assistant._capture.stop()
+
+    def test_a_detection_is_consumed_once(self, config: JarvisConfig) -> None:
+        """A stale pre-roll leaking into the next turn would replay old audio."""
+        assistant = Assistant(config, headless=True)
+        _wire(assistant, config, [])
+
+        class _Detection:
+            preroll = np.zeros(512, dtype=np.float32)
+
+        assistant._on_wake(_Detection())
+        assert assistant._wake_detection is not None
+
+        assistant._capture.start()
+        assistant._stop.set()
+        try:
+            assistant._turn_loop()
+        finally:
+            assistant._capture.stop()
+        assistant._stop.clear()
+
+
+class TestShutdownWakesEverythingItIsWaitingOn:
+    """Ctrl-C mid-reply hung for the supervisor's whole grace period.
+
+    During a reply the turn loop parks in player.wait(max_turn_seconds), on an
+    event only the audio callback or player.stop() ever sets. _request_stop set
+    the stop flag, set the wake event and interrupted the orchestrator, but
+    never told the one object the loop was actually blocked on, so stop() took
+    5 s and reported the turn loop as stalled.
+    """
+
+    def test_requesting_stop_drains_the_player(self, config: JarvisConfig) -> None:
+        assistant = Assistant(config, headless=True)
+        _wire(assistant, config, [])
+        assistant._player.start()
+        try:
+            assistant._player.play(
+                np.ones(config.tts.sample_rate * 30, dtype=np.float32)
+            )
+            assert not assistant._player.wait(0.05), "the player should still be busy"
+
+            assistant._request_stop()
+            assert assistant._player.wait(1.0), "shutdown left the turn loop parked"
+        finally:
+            assistant._player.close()
+
+    def test_stopping_mid_reply_is_prompt(self, config: JarvisConfig) -> None:
+        assistant = Assistant(config, headless=True)
+        _wire(assistant, config, ["how busy is the cpu"])
+        spoke = threading.Event()
+        assistant.bus.subscribe(lambda _e: spoke.set(), [EventType.RESPONSE])
+
+        assistant.start()
+        try:
+            spoke.wait(10)
+            assistant._player.play(np.ones(config.tts.sample_rate * 30, dtype=np.float32))
+            started = time.monotonic()
+        finally:
+            assistant.stop()
+        assert time.monotonic() - started < 3.0, "shutdown waited on playback"
+
+
+class TestAnUnrecoverableEndpointerStopsInsteadOfSpinning:
+    """A missing checkpoint made the loop fail at the frame rate.
+
+    _listen already special-cased it to avoid a traceback per frame, but
+    returning "" put the spin one frame up: the turn loop reads that as ordinary
+    silence and calls straight back in. Measured at 31 errors and 11 KiB of log
+    per second, which is exactly audio.sample_rate / vad.frame_samples.
+    """
+
+    class _Broken:
+        def reset(self) -> None:
+            return None
+
+        def process(self, frame: Any) -> Any:
+            from jarvis.util.errors import DependencyMissingError
+
+            raise DependencyMissingError("silero-vad")
+
+    def test_the_failure_is_reported_once_not_per_frame(
+        self, config: JarvisConfig
+    ) -> None:
+        assistant = Assistant(config, headless=True)
+        _wire(assistant, config, [])
+        assistant._endpointer = self._Broken()
+
+        errors: list[Any] = []
+        assistant.bus.subscribe(errors.append, [EventType.ERROR])
+
+        assistant.start()
+        try:
+            time.sleep(1.5)
+        finally:
+            assistant.stop()
+
+        # One frame's worth of errors, not one second's worth. The old loop
+        # produced about 31 a second here.
+        assert len(errors) <= 2, f"{len(errors)} errors in 1.5 s, the loop is spinning"
+
+    def test_it_latches_so_the_turn_loop_stops(self, config: JarvisConfig) -> None:
+        assistant = Assistant(config, headless=True)
+        _wire(assistant, config, [])
+        assistant._endpointer = self._Broken()
+
+        assistant.start()
+        try:
+            time.sleep(0.8)
+            assert assistant._endpointer_failed is not None
+        finally:
+            assistant.stop()
