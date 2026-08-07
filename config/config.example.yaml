@@ -75,8 +75,19 @@ vad:
   max_utterance_s: 30.0
   speech_pad_ms: 100
   frame_samples: 512
-  barge_in_threshold: 0.7   # Higher than `threshold` so leaked TTS audio does
-  barge_in_min_speech_ms: 200  # not make the assistant interrupt itself.
+  barge_in_threshold: 0.7      # Higher than `threshold`, but see below: on its
+  barge_in_min_speech_ms: 200  # own it does not stop the assistant interrupting
+                               # itself, because the model scores clean synthesis
+                               # at about 1.0 however quietly it arrives.
+  # What actually separates your voice from the assistant's own, coming back
+  # through the speakers: how much louder than the measured echo the microphone
+  # has to be. Raise it if the assistant still cuts itself off mid-sentence,
+  # lower it if it will not let you interrupt. Above about -10 dB of speaker
+  # bleed no level test can separate the two, and headphones remove the problem.
+  barge_in_echo_margin_db: 10.0
+  # Speaker level below which nothing loud enough to come back is playing, so no
+  # echo suppression applies.
+  barge_in_echo_floor: 0.0001
 
 # ---------------------------------------------------------------------------
 # Speech to text. null fields inherit from the hardware tier profile.

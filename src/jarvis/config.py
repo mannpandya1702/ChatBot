@@ -295,6 +295,15 @@ class VadConfig(_Section):
     #: threshold so the assistant's own leaked audio does not interrupt itself.
     barge_in_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
     barge_in_min_speech_ms: int = Field(default=200, ge=0, le=5_000)
+    #: How far above the measured echo level the microphone must be for a frame
+    #: to count as the user rather than the assistant's own voice coming back
+    #: through the speakers. A probability threshold cannot do this on its own:
+    #: Silero scores clean synthesised speech at essentially 1.0 however quietly
+    #: it arrives, so without this the assistant interrupts itself every turn.
+    barge_in_echo_margin_db: float = Field(default=10.0, ge=0.0, le=40.0)
+    #: Speaker level below which no echo suppression applies, since nothing loud
+    #: enough to come back is playing.
+    barge_in_echo_floor: float = Field(default=1e-4, ge=0.0, le=1.0)
 
 
 class SttConfig(_Section):

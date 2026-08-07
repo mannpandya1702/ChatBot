@@ -1105,3 +1105,168 @@ class TestTheModelGetsItsContextWindow:
         assert session.calls[0]["input"].shape[1] == (
             detector.frame_samples + _CONTEXT_SAMPLES[8_000]
         )
+
+
+# ---------------------------------------------------------------------------
+# BargeInDetector echo gate
+# ---------------------------------------------------------------------------
+
+
+def _tone(amplitude: float, samples: int = FRAME, seed: int = 0) -> np.ndarray[Any, Any]:
+    """A frame at a known RMS. Content is irrelevant: the VAD is scripted."""
+    rng = np.random.default_rng(seed)
+    block = rng.standard_normal(samples)
+    return (block / np.sqrt(np.mean(block**2)) * amplitude).astype(np.float32)
+
+
+class TestTheEchoGate:
+    """Barge-in must react to the user, not to the assistant's own voice.
+
+    The microphone hears the speakers. Silero has no opinion about who is
+    talking, only whether someone is, and it scores clean synthesised speech at
+    essentially 1.0 however quietly it arrives, so barge_in_threshold separates
+    nothing. Measured against the real models, the assistant's own reply
+    satisfied it within 544 ms at every bleed level down to -40 dB, a microphone
+    RMS of 0.0007. On speakers rather than headphones that cut the reply in half
+    on every single turn, which is the §7 Phase 1 gate failing.
+
+    What separates them is loudness relative to what is being played, which is
+    why the player reports its own output level and this gate compares the two.
+    """
+
+    def test_the_assistants_own_voice_never_triggers(self, cfg: JarvisConfig) -> None:
+        """The reported bug: constant coupling, the model says speech throughout."""
+        detector = BargeInDetector(cfg, vad=lambda _f: 1.0)
+        for _ in range(200):
+            assert detector.process(_tone(0.02), speaker_level=0.2) is False
+        assert detector.triggered is False
+        assert detector.suppressed_frames > 100
+
+    @pytest.mark.parametrize("coupling", [1.0, 0.5, 0.1, 0.01, 0.001])
+    def test_it_holds_at_every_bleed_level(self, cfg: JarvisConfig, coupling: float) -> None:
+        detector = BargeInDetector(cfg, vad=lambda _f: 1.0)
+        for _ in range(100):
+            assert detector.process(_tone(0.3 * coupling), speaker_level=0.3) is False
+
+    def test_a_voice_above_the_echo_still_interrupts(self, cfg: JarvisConfig) -> None:
+        detector = BargeInDetector(cfg, vad=lambda _f: 1.0)
+        for _ in range(40):
+            detector.process(_tone(0.002), speaker_level=0.2)
+        assert detector.triggered is False
+
+        # The user, a good 20 dB over the echo.
+        fired = any(detector.process(_tone(0.08), speaker_level=0.2) for _ in range(20))
+        assert fired, "a voice well above the echo floor must still cut the assistant off"
+
+    def test_the_coupling_it_learns_is_the_real_one(self, cfg: JarvisConfig) -> None:
+        detector = BargeInDetector(cfg, vad=lambda _f: 1.0)
+        for _ in range(30):
+            detector.process(_tone(0.03), speaker_level=0.3)
+        assert detector.coupling == pytest.approx(0.1, rel=0.05)
+
+    def test_it_learns_from_frames_the_model_calls_silence(self, cfg: JarvisConfig) -> None:
+        """Learning and gating have to be separate.
+
+        A quiet echo often scores below barge_in_threshold, so an estimate that
+        only updated on speech frames stayed unset through the whole quiet
+        passage and then initialised from the first frame of the user's voice.
+        Measured, that put it at 0.83 instead of 0.01, after which every real
+        interruption looked like an echo and barge-in stopped working at all.
+        """
+        detector = BargeInDetector(cfg, vad=lambda _f: 0.0)
+        for _ in range(20):
+            detector.process(_tone(0.02), speaker_level=0.2)
+        assert detector.coupling == pytest.approx(0.1, rel=0.05)
+
+    def test_a_quiet_echo_then_a_loud_user_still_interrupts(self, cfg: JarvisConfig) -> None:
+        """The regression the test above describes, end to end."""
+        detector = BargeInDetector(cfg, vad=lambda _f: 0.0)
+        for _ in range(30):
+            detector.process(_tone(0.002), speaker_level=0.2)
+
+        detector_speaks = BargeInDetector(cfg, vad=lambda _f: 1.0)
+        detector_speaks._coupling = detector.coupling
+        fired = any(detector_speaks.process(_tone(0.1), speaker_level=0.2) for _ in range(20))
+        assert fired
+
+    def test_nothing_playing_means_nothing_to_suppress(self, cfg: JarvisConfig) -> None:
+        """Between chunks the speaker is silent, so any speech is the user."""
+        detector = BargeInDetector(cfg, vad=lambda _f: 1.0)
+        fired = any(detector.process(_tone(0.01), speaker_level=0.0) for _ in range(20))
+        assert fired
+
+    def test_without_a_reference_the_gate_does_not_engage(self, cfg: JarvisConfig) -> None:
+        """Callers that pass no level get the old behaviour rather than silence."""
+        detector = BargeInDetector(cfg, vad=lambda _f: 1.0)
+        assert any(detector.process(zeros_frame()) for _ in range(20))
+        assert detector.suppressed_frames == 0
+
+    def test_the_first_frames_cannot_trigger(self, cfg: JarvisConfig) -> None:
+        """Nothing is known about the room yet, so there is no basis to decide."""
+        detector = BargeInDetector(cfg, vad=lambda _f: 1.0)
+        assert detector.coupling is None
+        assert detector.process(_tone(0.5), speaker_level=0.2) is False
+
+    def test_reset_forgets_the_room(self, cfg: JarvisConfig) -> None:
+        """The volume knob may have moved between replies."""
+        detector = BargeInDetector(cfg, vad=lambda _f: 1.0)
+        for _ in range(10):
+            detector.process(_tone(0.02), speaker_level=0.2)
+        assert detector.coupling is not None
+
+        detector.reset()
+        assert detector.coupling is None
+        assert detector.suppressed_frames == 0
+
+    def test_the_estimate_recovers_when_the_room_gets_louder(self, cfg: JarvisConfig) -> None:
+        """A min tracker that only ever fell would deafen itself permanently."""
+        detector = BargeInDetector(cfg, vad=lambda _f: 0.0)
+        detector.process(_tone(0.0002), speaker_level=0.2)
+        floor = detector.coupling
+        assert floor is not None
+
+        for _ in range(400):
+            detector.process(_tone(0.02), speaker_level=0.2)
+        assert detector.coupling is not None
+        assert detector.coupling > floor * 2
+
+    def test_the_margin_is_configurable(self, tmp_path: Path) -> None:
+        wide = make_config(tmp_path, barge_in_echo_margin_db=40.0)
+        detector = BargeInDetector(wide, vad=lambda _f: 1.0)
+        for _ in range(20):
+            detector.process(_tone(0.02), speaker_level=0.2)
+        # 20 dB over the echo, which a 40 dB margin still calls an echo.
+        assert not any(detector.process(_tone(0.2), speaker_level=0.2) for _ in range(20))
+
+    def test_a_pause_in_the_reply_does_not_look_like_an_interruption(
+        self, cfg: JarvisConfig
+    ) -> None:
+        """Both levels have to be measured over the same span.
+
+        Speech has an envelope, and its echo arrives late: the output device
+        buffers, then the room adds its own delay. Compared instant against
+        instant, the microphone during the rise of a syllable is still carrying
+        the quiet from before it, which drags the learned floor down by 30 dB;
+        the rest of that syllable then reads as somebody interrupting. Compared
+        as a peak over a matching window the ratio is flat and nothing moves.
+
+        The shape below is an ordinary spoken phrase: about half a second of
+        speech, a quarter second of pause, and 128 ms for the sound to get back
+        to the microphone.
+        """
+        detector = BargeInDetector(cfg, vad=lambda _f: 1.0)
+        burst_frames, gap_frames, delay_frames = 15, 8, 4
+        loud, quiet, coupling = 0.3, 0.01, 0.1
+
+        speaker: list[float] = []
+        while len(speaker) < 120:
+            speaker.extend([loud] * burst_frames + [quiet] * gap_frames)
+
+        window = max(round(400.0 / FRAME_MS), 1)
+        for index in range(120):
+            # The microphone hears the speaker, scaled and late.
+            echoed = speaker[max(index - delay_frames, 0)] * coupling
+            recent = speaker[max(index - window + 1, 0) : index + 1]
+            assert detector.process(_tone(echoed), speaker_level=max(recent)) is False
+
+        assert detector.triggered is False

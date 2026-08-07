@@ -423,7 +423,12 @@ class Assistant:
                     time.sleep(0.005)
                     continue
                 try:
-                    if self._barge.process(frame):
+                    # The reference is what makes this the *user* talking over
+                    # the assistant rather than the assistant talking over
+                    # itself. Without it the microphone hears the speakers, the
+                    # model says "that is speech", and the reply is cut off half
+                    # a second in, every turn.
+                    if self._barge.process(frame, self._player.recent_output_level()):
                         self._player.stop()
                         self._orchestrator.interrupt()
                         return

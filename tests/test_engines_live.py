@@ -278,3 +278,76 @@ class TestSileroForReal:
             "which is the silent failure the assistant showed"
         )
         assert endpoint.audio.size > 0
+
+
+@needs_tts
+@pytest.mark.skipif(
+    not has_module("onnxruntime"), reason="onnxruntime is not installed; uv sync --extra audio"
+)
+class TestTheAssistantDoesNotInterruptItself:
+    """Real synthesis into the real VAD, which is the only way this shows up.
+
+    Every barge-in test in the suite drives the detector from a scripted
+    probability, so none of them could see that Silero scores the assistant's
+    own voice at essentially 1.0 however quietly it arrives. Against the real
+    models, the reply satisfied barge_in_threshold within 544 ms at every bleed
+    level down to -40 dB. On speakers rather than headphones that cut the reply
+    in half on every turn, which is the §7 Phase 1 gate failing.
+    """
+
+    #: Speaker to microphone coupling. A desktop sits around -20 to -40 dB.
+    BLEED_DB = (-10.0, -20.0, -30.0, -40.0)
+
+    def _spoken(self, config: JarvisConfig, text: str) -> np.ndarray:
+        synth = build_synthesizer(config)
+        synth.begin_utterance()
+        return _resample(synth.synthesize(text), synth.sample_rate, WHISPER_RATE)
+
+    def _run(self, config: JarvisConfig, mic: np.ndarray, played: np.ndarray) -> int | None:
+        """Frames until barge-in fires, or None. Mirrors Assistant._watch_for_barge_in."""
+        from collections import deque
+
+        from jarvis.audio.vad import BargeInDetector
+
+        detector = BargeInDetector(config)
+        detector.reset()
+        frame = config.vad.frame_samples
+        window = max(round(0.4 * WHISPER_RATE / frame), 1)
+        history: deque[float] = deque(maxlen=window)
+
+        for start in range(0, min(mic.size, played.size) - frame, frame):
+            block = played[start : start + frame]
+            history.append(float(np.sqrt(np.mean(block.astype(np.float64) ** 2))))
+            if detector.process(mic[start : start + frame], max(history)):
+                return start + frame
+        return None
+
+    @pytest.mark.parametrize("bleed_db", BLEED_DB)
+    def test_its_own_reply_never_cuts_it_off(
+        self, live_config: JarvisConfig, bleed_db: float
+    ) -> None:
+        played = self._spoken(live_config, "Good evening, sir. The processor is light.")
+        heard = played * (10.0 ** (bleed_db / 20.0))
+
+        fired = self._run(live_config, heard, played)
+        assert fired is None, (
+            f"the assistant interrupted itself {fired / WHISPER_RATE * 1000:.0f} ms in, "
+            f"with {bleed_db:.0f} dB of speaker bleed"
+        )
+
+    @pytest.mark.parametrize("bleed_db", [-20.0, -30.0, -40.0])
+    def test_the_user_can_still_interrupt(
+        self, live_config: JarvisConfig, bleed_db: float
+    ) -> None:
+        """The gate must not have simply switched barge-in off."""
+        played = self._spoken(live_config, "Good evening, sir. The processor is light.")
+        user = self._spoken(live_config, "Jarvis, stop. What about the graphics card?")
+
+        start = WHISPER_RATE // 2
+        length = min(played.size, user.size + start)
+        mic = (played[:length] * (10.0 ** (bleed_db / 20.0))).copy()
+        mic[start:length] += user[: length - start]
+
+        fired = self._run(live_config, mic, played[:length])
+        assert fired is not None, f"the user could not interrupt at {bleed_db:.0f} dB of bleed"
+        assert fired > start, "it fired before the user had said anything"

@@ -33,6 +33,15 @@ _log = logging.getLogger(__name__)
 
 Samples = npt.NDArray[np.float32]
 
+#: How many output blocks of level history to keep. At the default 1024 sample
+#: block and 24 kHz that is roughly two seconds, comfortably more than the echo
+#: window below ever asks for.
+_LEVEL_HISTORY_BLOCKS = 64
+
+#: Default lookback for :meth:`StreamingPlayer.recent_output_level`. Wide enough
+#: to cover the output device's buffering plus the trip through the room.
+_ECHO_WINDOW_S = 0.4
+
 
 class PlaybackSink(Protocol):
     """Where audio frames go. sounddevice in production, a fake in tests."""
@@ -118,6 +127,14 @@ class StreamingPlayer:
         self._drained = threading.Event()
         self._drained.set()
         self._started = False
+
+        # What the speaker is actually producing, as (monotonic time, rms) per
+        # block. This is the reference signal the barge-in detector needs: the
+        # microphone hears whatever comes out of here, and without knowing how
+        # loud that was there is no way to tell the assistant's own voice from
+        # the user's. One float per block, so the audio thread pays almost
+        # nothing for it.
+        self._levels: deque[tuple[float, float]] = deque(maxlen=_LEVEL_HISTORY_BLOCKS)
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -270,7 +287,30 @@ class StreamingPlayer:
             if self._current is None and not self._queue:
                 self._drained.set()
 
+            self._levels.append((time.monotonic(), float(np.sqrt(np.mean(out**2)))))
+
         return out
+
+    def recent_output_level(self, window_s: float = _ECHO_WINDOW_S) -> float:
+        """Loudest thing the speaker has produced in the last ``window_s``.
+
+        This is the reference the barge-in detector measures the microphone
+        against. It is a peak over a window rather than a level at an instant
+        because the echo arrives late and smeared: the output device buffers
+        tens of milliseconds, the room adds a few more, and a reflection adds
+        more again. A window wide enough to cover all of that errs towards
+        calling a loud microphone frame an echo, which is the safe direction.
+        Being slightly deaf during the assistant's loudest syllable costs one
+        missed interruption; being wrong the other way cuts the assistant off
+        mid-sentence on every single turn.
+
+        Returns:
+            RMS in 0..1, or 0.0 when nothing has been played recently.
+        """
+        cutoff = time.monotonic() - max(window_s, 0.0)
+        with self._lock:
+            recent = [level for stamp, level in self._levels if stamp >= cutoff]
+        return max(recent) if recent else 0.0
 
     # -- interruption ------------------------------------------------------
 

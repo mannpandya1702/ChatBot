@@ -90,6 +90,17 @@ _STATE_DIM = 128
 #: 1.000 with it.
 _CONTEXT_SAMPLES = {16_000: 64, 8_000: 32}
 
+#: How fast the barge-in echo estimate is allowed to climb, per frame. It falls
+#: to any lower ratio at once and recovers at this rate, so it tracks the floor:
+#: a burst of the user's real speech lifts it only briefly, while a genuine
+#: change in the room settles within a second. At 32 ms frames this is about
+#: 1.6 dB per second.
+_COUPLING_RECOVERY = 1.006
+
+#: Lookback for the barge-in echo gate, matched to the player's own window in
+#: :mod:`jarvis.audio.player`. Both sides measure a peak over this span.
+_ECHO_WINDOW_S = 0.4
+
 #: Graph names for Silero v5, which is what ``pull_models.ps1`` fetches. v4 is
 #: also accepted: it kept the LSTM hidden and cell tensors apart as ``h`` and
 #: ``c`` instead of fusing them into one ``state``, and is detected from the
@@ -918,6 +929,17 @@ class BargeInDetector:
         self._triggered = False
         self._frames_processed = 0
 
+        # Echo gate. See _is_echo for why a probability threshold alone cannot
+        # do this job.
+        self._echo_margin = 10.0 ** (float(settings.barge_in_echo_margin_db) / 20.0)
+        self._echo_floor = float(settings.barge_in_echo_floor)
+        self._coupling: float | None = None
+        self._suppressed = 0
+        # Matched to the player's own lookback. Both sides have to be a peak
+        # over the same span or the ratio between them is meaningless.
+        window_frames = max(round(_ECHO_WINDOW_S * 1_000.0 / self._frame_ms), 1)
+        self._mic_levels: deque[float] = deque(maxlen=window_frames)
+
     # -- introspection -----------------------------------------------------
 
     @property
@@ -957,8 +979,100 @@ class BargeInDetector:
 
     # -- detection ---------------------------------------------------------
 
-    def process(self, frame: Samples) -> bool:
-        """Feed one frame and report whether the user is talking.
+    @property
+    def coupling(self) -> float | None:
+        """Learned ratio of microphone level to speaker level, or None.
+
+        None until the first frame arrives with a reference level, which is why
+        no barge-in can fire before the gate knows what the room sounds like.
+        """
+        return self._coupling
+
+    @property
+    def suppressed_frames(self) -> int:
+        """Frames the model called speech and the echo gate rejected."""
+        return self._suppressed
+
+    def _is_echo(self, level: float, speaker_level: float) -> bool:
+        """Whether a speech frame is just the assistant coming back round.
+
+        The microphone hears the speakers. Silero has no opinion about who is
+        talking, only whether someone is, and it scores clean synthesised speech
+        at essentially 1.0 no matter how quietly it arrives. So
+        ``barge_in_threshold`` separates nothing: measured against the real
+        models, the assistant's own voice satisfies it within half a second at
+        every bleed level down to -40 dB, which is a microphone RMS of 0.0007.
+        On any machine with speakers rather than headphones that meant the
+        assistant cut itself off mid-sentence on every turn.
+
+        What does separate them is loudness relative to what is being played.
+        The echo path has a gain: whatever fraction of the speaker's output
+        reaches the microphone, set by the room and the volume knob, and roughly
+        constant over a reply. Watching the ratio of the two levels while the
+        user is silent measures it. A user talking over the assistant has to be
+        louder than that, or no listener could pick them out either.
+
+        The two levels have to be measured the same way or the ratio is noise.
+        Both are a peak over the same window, which is what makes the ratio
+        stable across the assistant's own pauses and syllables: measured against
+        real synthesis, echo alone holds the ratio flat while the user talking
+        over it lifts it by 26 dB.
+
+        The estimate tracks the floor: it drops instantly to any lower ratio and
+        recovers slowly, so a burst of real speech raises it only briefly. It
+        starts unknown rather than optimistic, so the first frames of playback
+        cannot trigger.
+
+        There is a limit worth stating. When the speakers reach the microphone
+        as loudly as the user does, no level test can separate them, and neither
+        could a person in the room. Measured with real synthesis, interruption
+        works from about -10 dB of bleed downwards and stops working above it,
+        where the user adds less than the margin. Desktop bleed sits around -20
+        to -40 dB, so that covers the realistic range. Correlating the
+        microphone against the played signal would go further; the level test is
+        what closes the "cuts itself off every turn" bug without adding an
+        adaptive filter to the audio path.
+
+        Args:
+            level: Peak microphone level over the window.
+            speaker_level: Peak speaker level over the same window, from the
+                player.
+
+        Returns:
+            True when this frame is within the echo's expected level.
+        """
+        if speaker_level <= self._echo_floor:
+            # Nothing is playing loudly enough to come back, so whatever this
+            # is, it is not the assistant.
+            return False
+        if self._coupling is None:
+            # Nothing measured yet, so there is no basis to call this the user.
+            return True
+        return bool(level / speaker_level <= self._coupling * self._echo_margin)
+
+    def _observe(self, level: float, speaker_level: float) -> None:
+        """Update the echo estimate from one frame.
+
+        Separate from :meth:`_is_echo` on purpose, and called for every frame
+        rather than only for the ones the model calls speech. How loud the room
+        is has nothing to do with whether anyone is talking, and tying the two
+        together is a trap: the assistant's own quiet echo often scores below
+        the barge-in threshold, so the estimate would stay unset through the
+        whole quiet passage and then initialise from the first frame of the
+        *user's* voice. Measured, that put the estimate at 0.83 instead of 0.01,
+        after which every real interruption looked like an echo and barge-in
+        stopped working entirely.
+        """
+        if speaker_level <= self._echo_floor or level <= self._echo_floor:
+            return
+        ratio = level / speaker_level
+        if self._coupling is None or ratio < self._coupling:
+            self._coupling = ratio
+        else:
+            self._coupling = min(self._coupling * _COUPLING_RECOVERY, ratio)
+
+    def process(self, frame: Samples, speaker_level: float | None = None) -> bool:
+        """Feed one frame and report whether the *user* is talking.
 
         Frames continue to be scored after a trigger so the model's recurrent
         state stays aligned with the stream for whatever consumes it next.
@@ -966,6 +1080,11 @@ class BargeInDetector:
         Args:
             frame: Exactly :attr:`frame_samples` mono samples, float32 in -1..1
                 or int16.
+            speaker_level: What the speaker was producing at the same moment,
+                from :meth:`~jarvis.audio.player.StreamingPlayer.recent_output_level`.
+                Without it there is no way to tell the assistant's own voice
+                from the user's, so a caller that omits it gets the old
+                behaviour and can be interrupted by its own speech.
 
         Returns:
             True from the frame that completes the required run onwards, until
@@ -988,7 +1107,20 @@ class BargeInDetector:
             )
         probability = float(self._probability(block))
         self._frames_processed += 1
-        if probability >= self._threshold:
+
+        self._mic_levels.append(float(np.sqrt(np.mean(block.astype(np.float64) ** 2))))
+
+        speaks = probability >= self._threshold
+        if speaker_level is not None:
+            level = max(self._mic_levels)
+            if speaks and self._is_echo(level, speaker_level):
+                speaks = False
+                self._suppressed += 1
+            # Learned after the check, so the frame being judged cannot lift the
+            # estimate it is judged against.
+            self._observe(level, speaker_level)
+
+        if speaks:
             self._run += 1
         else:
             self._run = 0
@@ -1000,14 +1132,24 @@ class BargeInDetector:
                     "context": {
                         "threshold": self._threshold,
                         "speech_ms": round(self.speech_ms, 1),
+                        "coupling": self._coupling,
+                        "suppressed_frames": self._suppressed,
                     }
                 },
             )
         return self._triggered
 
     def reset(self) -> None:
-        """Clear the trigger and the run counter, and reset the source."""
+        """Clear the trigger, the run counter, the echo estimate, and the source.
+
+        The coupling estimate goes too. It describes the room at a particular
+        speaker volume, and the reply that just ended may have been the last one
+        before the user changed it. Relearning costs one frame.
+        """
         self._run = 0
         self._triggered = False
         self._frames_processed = 0
+        self._coupling = None
+        self._suppressed = 0
+        self._mic_levels.clear()
         self._reset_source()
