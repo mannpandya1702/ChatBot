@@ -23,10 +23,12 @@ from types import ModuleType
 from jarvis.util.errors import DependencyMissingError, PlatformUnsupportedError
 
 __all__ = [
+    "bundle_root",
     "cpu_model",
     "has_cuda",
     "has_module",
     "has_nvml",
+    "is_frozen",
     "is_linux",
     "is_macos",
     "is_windows",
@@ -239,15 +241,51 @@ def windows_version() -> str:
     return " ".join(p for p in (f"Windows {release}", edition, f"build {build or version}") if p)
 
 
+def is_frozen() -> bool:
+    """Whether this is running from a PyInstaller bundle rather than source.
+
+    Deliberately uncached: it is one attribute read, and caching it would make
+    the frozen and source paths untestable in the same process.
+    """
+    return bool(getattr(sys, "frozen", False))
+
+
 @lru_cache(maxsize=1)
 def project_root() -> Path:
-    """Absolute path to the repository root.
+    """Absolute path to the root that user-editable files live under.
 
     Resolved from the installed package location, never hardcoded, per §0.6.
     Honours ``JARVIS_PROJECT_ROOT`` so a packaged build can point elsewhere.
+
+    Frozen builds are the interesting case. ``scripts/build_helper.ps1``
+    produces a PyInstaller onefile exe, which unpacks itself into a fresh
+    ``%TEMP%\\_MEIxxxx`` on every run. Walking up from ``__file__`` there lands
+    on the *parent* of that directory, which is ``%TEMP%`` itself, so the root
+    became a directory every process running as the user can write to. Since
+    ``jarvis-helper.exe`` runs elevated by design, that turned a path lookup
+    into a way to hand it attacker-controlled bytes. Frozen builds resolve to
+    the directory the executable sits in instead.
     """
     override = os.environ.get("JARVIS_PROJECT_ROOT")
     if override:
         return Path(override).expanduser().resolve()
+    if is_frozen():
+        return Path(sys.executable).resolve().parent
     # src/jarvis/util/platform.py -> src/jarvis/util -> src/jarvis -> src -> root
     return Path(__file__).resolve().parents[3]
+
+
+def bundle_root() -> Path:
+    """Absolute path to read-only assets shipped inside the build.
+
+    Distinct from :func:`project_root` because the two diverge in a frozen
+    build: files added with PyInstaller's ``--add-binary`` land in the unpack
+    directory, while anything the user edits or writes belongs beside the
+    executable. Use this for the vendored DLL and other bundled data, and
+    :func:`project_root` for config, logs, and models.
+    """
+    if is_frozen():
+        unpacked = getattr(sys, "_MEIPASS", None)
+        if unpacked:
+            return Path(str(unpacked)).resolve()
+    return project_root()

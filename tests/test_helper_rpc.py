@@ -23,7 +23,7 @@ from jarvis.helper.rpc import (
     RpcError,
     pipe_path,
 )
-from jarvis.util.errors import HelperUnavailableError
+from jarvis.util.errors import HelperUnavailableError, JarvisError
 
 
 def _request(method: str, **extra: Any) -> str:
@@ -351,3 +351,55 @@ class TestVendoredSensorLibrary:
         """§1 permits MPL-2.0 specifically, so the file has to say so."""
         readme = (self.ROOT / "vendor" / "README.md").read_text(encoding="utf-8")
         assert "MPL-2.0" in readme
+
+
+class TestTheElevatedHelperVerifiesWhatItLoads:
+    """clr.AddReference executes whatever it is pointed at, as Administrator.
+
+    scripts/fetch_vendor.ps1 checks the library's hash when it downloads it,
+    which is the wrong moment: the file then sits on disk until the next time
+    the helper starts. Combined with a project root that resolved into %TEMP%
+    under PyInstaller, that made the path the entire trust boundary. Verifying
+    the bytes at load time is what demotes the path to a convenience.
+    """
+
+    def test_the_vendored_library_is_accepted(self) -> None:
+        from jarvis.helper.lhm import verify_assembly
+        from jarvis.util.platform import project_root
+
+        dll = project_root() / "vendor" / "LibreHardwareMonitorLib.dll"
+        if not dll.is_file():
+            pytest.skip("the vendored DLL is not present in this checkout")
+        verify_assembly(dll)
+
+    def test_a_substituted_library_is_refused(self, tmp_path: Path) -> None:
+        from jarvis.helper.lhm import verify_assembly
+
+        planted = tmp_path / "LibreHardwareMonitorLib.dll"
+        planted.write_bytes(b"ATTACKER SUPPLIED PAYLOAD")
+
+        with pytest.raises(JarvisError, match="does not match the vendored"):
+            verify_assembly(planted)
+
+    def test_the_refusal_is_speakable(self, tmp_path: Path) -> None:
+        from jarvis.helper.lhm import verify_assembly
+
+        planted = tmp_path / "x.dll"
+        planted.write_bytes(b"nope")
+        with pytest.raises(JarvisError) as excinfo:
+            verify_assembly(planted)
+        assert "altered" in (excinfo.value.speakable or "")
+
+    def test_an_explicitly_configured_path_is_allowed_with_a_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Choosing another build by hand is a decision, not an attack."""
+        import logging
+
+        from jarvis.helper.lhm import verify_assembly
+
+        other = tmp_path / "other.dll"
+        other.write_bytes(b"a different build")
+        with caplog.at_level(logging.WARNING):
+            verify_assembly(other, explicit=True)
+        assert any("unverified" in record.message for record in caplog.records)

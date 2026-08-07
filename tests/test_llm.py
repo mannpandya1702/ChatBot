@@ -163,41 +163,153 @@ class TestToolCallParsing:
         assert calls[0].arguments == {}
 
     def test_malformed_tool_json_is_retried_then_surfaced(self, tmp_path: Path) -> None:
-        """T-1.6: retry up to the configured count, then verbalise the failure."""
-        config = load_config(tmp_path / "absent.yaml", llm={"tool_json_retries": 2})
-        bad = {
-            "message": {
-                "tool_calls": [{"function": {"name": "sys.cpu", "arguments": "{not json"}}]
-            },
-            "done": False,
-        }
-        body = _ndjson(bad, bad, bad, bad)
+        """T-1.6: re-ask the model up to the configured count, then verbalise.
 
-        with _client(config, _stream_handler(body)) as client, pytest.raises(LlmError) as excinfo:
-            list(client.chat_stream([]))
-        assert "malformed" in str(excinfo.value)
-        assert excinfo.value.speakable == "I could not work out how to do that."
-
-    def test_a_recovered_tool_call_is_returned(self, tmp_path: Path) -> None:
-        """A retry that succeeds must produce the call, not an error."""
+        Driven by the shape Ollama actually produces: one message, done=true,
+        with arguments that are not JSON. The old test used a body of four
+        separate lines with done=false, which no Ollama emits, and asserted on
+        code that skipped the line rather than re-asking anything.
+        """
         config = load_config(tmp_path / "absent.yaml", llm={"tool_json_retries": 2})
         body = _ndjson(
             {
                 "message": {
+                    "content": "Let me check.",
+                    "tool_calls": [{"function": {"name": "sys.cpu", "arguments": "{not json"}}],
+                },
+                "done": True,
+            }
+        )
+        requests: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(str(request.url.path))
+            return httpx.Response(200, text=body)
+
+        with _client(config, handler) as client, pytest.raises(LlmError) as excinfo:
+            list(client.chat_stream([{"role": "user", "content": "how busy is the cpu"}]))
+
+        assert "malformed" in str(excinfo.value)
+        assert excinfo.value.speakable == "I could not work out how to do that."
+        # Two retries means three attempts. Anything less and nothing was asked
+        # again, which is what "retry" meant before: skip the line and move on.
+        assert requests == ["/api/chat"] * 3, f"asked {len(requests)} times, not 3"
+
+    def test_the_retry_carries_a_correction(self, tmp_path: Path) -> None:
+        """A blind re-ask usually produces the same broken call again."""
+        config = load_config(tmp_path / "absent.yaml", llm={"tool_json_retries": 1})
+        body = _ndjson(
+            {
+                "message": {
+                    "content": "One moment.",
+                    "tool_calls": [{"function": {"name": "sys.cpu", "arguments": "{oops"}}],
+                },
+                "done": True,
+            }
+        )
+        sent: list[list[dict[str, Any]]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            sent.append(json.loads(request.content)["messages"])
+            return httpx.Response(200, text=body)
+
+        with _client(config, handler) as client, pytest.raises(LlmError):
+            list(client.chat_stream([{"role": "user", "content": "how busy is the cpu"}]))
+
+        assert len(sent) == 2
+        second = sent[1]
+        assert any("not valid JSON" in m["content"] for m in second if m["role"] == "system")
+        assert any(
+            m["role"] == "assistant" and "One moment." in m["content"] for m in second
+        ), "the retry lost what the model had already said"
+
+    def test_a_recovered_tool_call_is_returned(self, tmp_path: Path) -> None:
+        """A retry that succeeds must produce the call, not an error."""
+        config = load_config(tmp_path / "absent.yaml", llm={"tool_json_retries": 2})
+        bad = _ndjson(
+            {
+                "message": {
                     "tool_calls": [{"function": {"name": "sys.cpu", "arguments": "{oops"}}]
                 },
-                "done": False,
-            },
+                "done": True,
+            }
+        )
+        good = _ndjson(
             {
                 "message": {
                     "tool_calls": [{"function": {"name": "sys.cpu", "arguments": {"x": 1}}}]
                 },
                 "done": True,
-            },
+            }
         )
-        with _client(config, _stream_handler(body)) as client:
+        bodies = iter([bad, good])
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, text=next(bodies))
+
+        with _client(config, handler) as client:
             calls = [c for chunk in client.chat_stream([]) for c in chunk.tool_calls]
-        assert calls[0].arguments == {"x": 1}
+        assert [c.arguments for c in calls] == [{"x": 1}]
+
+    def test_a_bad_call_does_not_take_its_siblings_with_it(self, tmp_path: Path) -> None:
+        """A valid call in the same message must survive a broken one."""
+        config = load_config(tmp_path / "absent.yaml", llm={"tool_json_retries": 0})
+        body = _ndjson(
+            {
+                "message": {
+                    "tool_calls": [
+                        {"function": {"name": "sys.cpu", "arguments": {"interval_s": 0.1}}},
+                        {"function": {"name": "sys.memory", "arguments": "{broken"}},
+                    ]
+                },
+                "done": True,
+            }
+        )
+        with _client(config, _stream_handler(body)) as client, pytest.raises(LlmError):
+            calls = [c for chunk in client.chat_stream([]) for c in chunk.tool_calls]
+            assert [c.name for c in calls] == ["sys.cpu"]
+
+    def test_content_on_a_bad_message_is_still_spoken(self, tmp_path: Path) -> None:
+        """The words the model already said are not the broken part."""
+        config = load_config(tmp_path / "absent.yaml", llm={"tool_json_retries": 0})
+        body = _ndjson(
+            {
+                "message": {
+                    "content": "The processor is at ",
+                    "tool_calls": [{"function": {"name": "sys.cpu", "arguments": "{bad"}}],
+                },
+                "done": True,
+            }
+        )
+        spoken: list[str] = []
+        with _client(config, _stream_handler(body)) as client, pytest.raises(LlmError):
+            for chunk in client.chat_stream([]):
+                spoken.append(chunk.content)
+        assert "".join(spoken) == "The processor is at "
+
+    def test_a_bad_call_never_yields_a_done_chunk(self, tmp_path: Path) -> None:
+        """Otherwise the orchestrator ends the turn on a reply that lost its call."""
+        config = load_config(tmp_path / "absent.yaml", llm={"tool_json_retries": 0})
+        body = _ndjson(
+            {
+                "message": {
+                    "tool_calls": [{"function": {"name": "sys.cpu", "arguments": "{bad"}}]
+                },
+                "done": True,
+            }
+        )
+        seen: list[bool] = []
+        with _client(config, _stream_handler(body)) as client, pytest.raises(LlmError):
+            for chunk in client.chat_stream([]):
+                seen.append(chunk.done)
+        assert not any(seen), "a message that lost a tool call was reported as complete"
+
+    def test_a_stream_that_never_finishes_is_an_error(self, cfg: JarvisConfig) -> None:
+        """An empty answer and a truncated one must not look the same."""
+        body = _ndjson({"message": {"content": "half a sen"}, "done": False})
+        with _client(cfg, _stream_handler(body)) as client, pytest.raises(LlmError) as excinfo:
+            list(client.chat_stream([]))
+        assert "without completing" in str(excinfo.value)
 
     @pytest.mark.parametrize(
         ("raw", "expected", "bad"),

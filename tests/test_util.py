@@ -368,6 +368,40 @@ class TestPlatform:
         assert plat.project_root() == Path("/tmp/elsewhere")
         plat.project_root.cache_clear()
 
+    def test_a_frozen_build_does_not_root_itself_in_temp(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """PyInstaller onefile unpacks into %TEMP%\\_MEIxxxx on every run.
+
+        Walking up from __file__ inside that bundle lands on %TEMP% itself, a
+        directory every process running as the user can write to. The helper
+        runs elevated and loads a native assembly from a path derived from this,
+        so getting it wrong turned a path lookup into a way to hand an
+        Administrator process attacker-supplied bytes.
+        """
+        unpacked = tmp_path / "_MEIabc123"
+        (unpacked / "vendor").mkdir(parents=True)
+        installed = tmp_path / "Program Files" / "JARVIS"
+        installed.mkdir(parents=True)
+
+        plat.project_root.cache_clear()
+        monkeypatch.delenv("JARVIS_PROJECT_ROOT", raising=False)
+        monkeypatch.setattr(plat.sys, "frozen", True, raising=False)
+        monkeypatch.setattr(plat.sys, "_MEIPASS", str(unpacked), raising=False)
+        monkeypatch.setattr(plat.sys, "executable", str(installed / "jarvis-helper.exe"))
+        try:
+            assert plat.is_frozen() is True
+            assert plat.project_root() == installed, "user files must live beside the exe"
+            assert plat.bundle_root() == unpacked, "bundled assets live in the unpack dir"
+            assert plat.project_root() != tmp_path, "rooted in the writable parent of the bundle"
+        finally:
+            plat.project_root.cache_clear()
+
+    def test_the_two_roots_agree_when_not_frozen(self) -> None:
+        plat.project_root.cache_clear()
+        assert plat.bundle_root() == plat.project_root()
+        assert plat.is_frozen() is False
+
 
 class _FakeClock:
     """Deterministic monotonic clock for latency tests."""

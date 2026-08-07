@@ -60,6 +60,15 @@ class ChatChunk:
     reasoning: str = ""
 
 
+#: Correction appended before re-asking for a tool call that would not parse.
+#: Concrete about what was wrong and what is wanted, because a small model given
+#: "that was invalid" tends to apologise in prose instead of calling the tool.
+_TOOL_JSON_NUDGE = (
+    "Your last tool call could not be used: its arguments were not valid JSON. "
+    "Call the tool again now. Put the arguments in a single valid JSON object "
+    "and write nothing else."
+)
+
 #: Reasoning delimiters that models emit inline in the content channel. Qwen3
 #: and DeepSeek-R1 both use the first pair.
 REASONING_TAGS: tuple[tuple[str, str], ...] = (
@@ -334,6 +343,97 @@ class OllamaClient:
         Raises:
             LlmError: Ollama is unreachable, timed out, or rejected the request.
         """
+        attempts = max(int(self._config.llm.tool_json_retries), 0) + 1
+        conversation: list[dict[str, Any]] = list(messages)
+        said: list[str] = []
+
+        for attempt in range(attempts):
+            # Only the first attempt speaks. A corrective round exists to get a
+            # parseable tool call, and the user has already heard whatever the
+            # model said the first time round.
+            speaking = attempt == 0
+            malformed = False
+            finished = False
+            reasoning = ReasoningFilter()
+
+            for chunk, bad in self._stream_once(
+                conversation, tools=tools, model=model, think=think, attempt=attempt
+            ):
+                malformed = malformed or bad
+
+                spoken = reasoning.feed(chunk.content)
+                if chunk.done:
+                    spoken += reasoning.flush()
+                dropped = reasoning.take_reasoning()
+                if dropped:
+                    _log.debug(
+                        "dropped inline reasoning from the spoken channel",
+                        extra={"context": {"characters": len(dropped)}},
+                    )
+                if speaking and spoken:
+                    said.append(spoken)
+
+                # Once anything in this message failed to parse, the terminal
+                # marker is held back: a tool call was lost, so this is not the
+                # end of the turn even though Ollama says it is. Yielding done
+                # here is what made a bad call a silent no-op, because the
+                # orchestrator took the empty answer as the whole reply.
+                out = replace(
+                    chunk,
+                    content=spoken if speaking else "",
+                    done=chunk.done and not malformed,
+                    reasoning=chunk.reasoning + dropped,
+                )
+                if out.content or out.tool_calls or out.done or out.reasoning:
+                    yield out
+                if chunk.done:
+                    finished = True
+                    break
+
+            if not finished:
+                raise LlmError(
+                    "the model's response ended without completing",
+                    speakable="My language model stopped halfway through.",
+                )
+            if not malformed:
+                return
+
+            if attempt + 1 < attempts:
+                _log.warning(
+                    "the model emitted malformed tool JSON, asking it again",
+                    extra={"context": {"attempt": attempt + 1, "of": attempts}},
+                )
+                # Give it back what it said plus a correction, so the retry has
+                # the context of its own broken attempt rather than starting
+                # blind and producing a different answer.
+                conversation = [
+                    *messages,
+                    {"role": "assistant", "content": "".join(said)},
+                    {"role": "system", "content": _TOOL_JSON_NUDGE},
+                ]
+
+        raise LlmError(
+            "the model kept emitting malformed tool call JSON",
+            speakable="I could not work out how to do that.",
+        )
+
+    def _stream_once(
+        self,
+        messages: Sequence[dict[str, Any]],
+        *,
+        tools: Sequence[dict[str, Any]] | None,
+        model: str | None,
+        think: bool | None,
+        attempt: int,
+    ) -> Iterator[tuple[ChatChunk, bool]]:
+        """One request to /api/chat, yielding ``(chunk, had_malformed_call)``.
+
+        The malformed flag is per message, and the chunk beside it still carries
+        everything that did parse: the content, the metrics, and any sibling
+        tool call that was well formed. Dropping the whole message, which is
+        what the old code did, threw away a valid call because another call in
+        the same message was broken.
+        """
         body = self._payload(messages, tools=tools, model=model, stream=True, think=think)
         _log.debug(
             "chat request",
@@ -342,12 +442,10 @@ class OllamaClient:
                     "model": body["model"],
                     "messages": len(messages),
                     "tools": len(tools or []),
+                    "attempt": attempt,
                 }
             },
         )
-
-        retries_left = self._config.llm.tool_json_retries
-        reasoning = ReasoningFilter()
         try:
             with self._client.stream("POST", self._url("/api/chat"), json=body) as response:
                 self._raise_for_status(response, body["model"])
@@ -359,40 +457,7 @@ class OllamaClient:
                     except (json.JSONDecodeError, ValueError):
                         _log.warning("skipping a malformed stream line")
                         continue
-
-                    chunk, bad_tool_json = self._parse_chunk(payload)
-                    if bad_tool_json:
-                        # T-1.6: retry a malformed tool call before giving up.
-                        if retries_left > 0:
-                            retries_left -= 1
-                            _log.warning(
-                                "the model emitted malformed tool JSON, retrying",
-                                extra={"context": {"retries_left": retries_left}},
-                            )
-                            continue
-                        raise LlmError(
-                            "the model kept emitting malformed tool call JSON",
-                            speakable="I could not work out how to do that.",
-                        )
-
-                    spoken = reasoning.feed(chunk.content)
-                    if chunk.done:
-                        spoken += reasoning.flush()
-                    dropped = reasoning.take_reasoning()
-                    if dropped:
-                        _log.debug(
-                            "dropped inline reasoning from the spoken channel",
-                            extra={"context": {"characters": len(dropped)}},
-                        )
-                    chunk = replace(chunk, content=spoken, reasoning=chunk.reasoning + dropped)
-
-                    # A line with nothing left in it after filtering is noise.
-                    # Reasoning still counts as something: it goes no further
-                    # than the log, but dropping the chunk would lose it.
-                    if chunk.content or chunk.tool_calls or chunk.done or chunk.reasoning:
-                        yield chunk
-                    if chunk.done:
-                        return
+                    yield self._parse_chunk(payload)
         except httpx.ConnectError as exc:
             raise _not_running(exc) from exc
         except httpx.TimeoutException as exc:
@@ -402,6 +467,7 @@ class OllamaClient:
                 f"the chat request failed: {exc}",
                 speakable="My language model is not responding.",
             ) from exc
+
 
     def chat(
         self,

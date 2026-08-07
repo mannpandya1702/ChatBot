@@ -20,6 +20,7 @@ from jarvis.util.errors import JarvisError
 __all__ = [
     "LibreHardwareMonitor",
     "get_pending_updates",
+    "verify_assembly",
 ]
 
 _log = logging.getLogger(__name__)
@@ -27,9 +28,68 @@ _log = logging.getLogger(__name__)
 _UPDATE_TIMEOUT_S = 90.0
 _MAX_UPDATE_NAMES = 5
 
+#: SHA-256 of the LibreHardwareMonitorLib.dll this repo vendors, matching
+#: ``vendor/README.md`` and what ``scripts/fetch_vendor.ps1`` verifies on
+#: download. Checked again at load time, because download time is the wrong
+#: time: this process is elevated, ``clr.AddReference`` executes whatever it is
+#: pointed at, and the file has been sitting on disk since setup. Verifying the
+#: bytes is what makes the path a convenience rather than the whole trust
+#: boundary.
+_VENDORED_DLL_SHA256 = "a0f2728f1734c236a9d02d9e25a88bc4f8cb7bd1faff1770726beb7af06bf8dc"
+
+#: Set to skip the hash check when deliberately running a different build of the
+#: library. Off by default, and refusing to load is the safe failure.
+_ALLOW_UNVERIFIED = "JARVIS_ALLOW_UNVERIFIED_LHM"
+
 #: Sensor names LibreHardwareMonitor uses for the package temperature, in
 #: descending order of preference.
 _PACKAGE_HINTS = ("package", "cpu package", "tctl", "tdie", "core (tctl/tdie)")
+
+
+def verify_assembly(dll: Any, *, explicit: bool = False) -> None:
+    """Refuse to load a native assembly whose bytes are not the vendored ones.
+
+    ``clr.AddReference`` runs whatever it is given, and this process is
+    elevated, so the question is not whether the file exists but whether it is
+    the library that was shipped. ``scripts/fetch_vendor.ps1`` checks the hash
+    at download time, which is months and one writable directory away from the
+    moment it matters.
+
+    An explicitly configured path is allowed through with a warning rather than
+    refused. Someone who set ``helper.dll_path`` by hand has chosen a different
+    build on purpose, and refusing them would only teach them to set the escape
+    hatch permanently.
+
+    Args:
+        dll: Path to the assembly.
+        explicit: Whether the path came from configuration rather than the
+            bundled default.
+
+    Raises:
+        JarvisError: The bundled assembly does not match the pinned hash.
+    """
+    import hashlib
+    import os
+    from pathlib import Path
+
+    path = Path(dll)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if digest == _VENDORED_DLL_SHA256:
+        return
+
+    if explicit or os.environ.get(_ALLOW_UNVERIFIED):
+        _log.warning(
+            "loading an unverified sensor library into the elevated helper",
+            extra={"context": {"path": str(path), "sha256": digest}},
+        )
+        return
+
+    raise JarvisError(
+        f"{path} does not match the vendored LibreHardwareMonitorLib "
+        f"(expected {_VENDORED_DLL_SHA256}, found {digest})",
+        speakable="The sensor library has been altered, so I have not loaded it.",
+        context={"path": str(path), "sha256": digest},
+    )
 
 
 class LibreHardwareMonitor:
@@ -57,12 +117,15 @@ class LibreHardwareMonitor:
 
         from pathlib import Path
 
-        from jarvis.util.platform import project_root, require_module, require_windows
+        from jarvis.util.platform import bundle_root, require_module, require_windows
 
         require_windows("LibreHardwareMonitor")
 
+        # bundle_root, not project_root: in the frozen helper the DLL is inside
+        # the PyInstaller unpack directory, and project_root deliberately points
+        # at the install directory instead.
         dll = Path(self._dll_path) if self._dll_path else (
-            project_root() / "vendor" / "LibreHardwareMonitorLib.dll"
+            bundle_root() / "vendor" / "LibreHardwareMonitorLib.dll"
         )
         if not dll.is_file():
             raise JarvisError(
@@ -70,6 +133,7 @@ class LibreHardwareMonitor:
                 speakable="The sensor library is not installed.",
                 context={"path": str(dll)},
             )
+        verify_assembly(dll, explicit=self._dll_path is not None)
 
         clr = require_module("clr")
         try:
