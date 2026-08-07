@@ -38,7 +38,7 @@ from jarvis.tools.registry import registry as default_registry
 from jarvis.util.errors import JarvisError, as_speakable
 from jarvis.util.latency import Stage, TurnLatency
 
-__all__ = ["Orchestrator", "TurnResult"]
+__all__ = ["Orchestrator", "TurnResult", "turn_budgets"]
 
 _log = logging.getLogger(__name__)
 
@@ -183,7 +183,7 @@ class Orchestrator:
         """
         from jarvis.audio.tts import SentenceChunker
 
-        latency = turn or TurnLatency(budgets_ms=_budgets(self._config))
+        latency = turn or TurnLatency(budgets_ms=turn_budgets(self._config))
         # Compaction is a full LLM generation. Held until the turn is
         # over, where it overlaps with the reply already playing.
         with self._turn_lock, self._memory.deferred_compaction():
@@ -346,14 +346,18 @@ class Orchestrator:
         """
         if not text.strip() or speak is None:
             return False
-        if latency.get(Stage.TTS_FIRST_AUDIO) is None:
-            latency.mark(Stage.TTS_FIRST_AUDIO)
         self.state.set(AssistantState.SPEAKING)
         try:
             speak(text)
         except Exception:  # noqa: BLE001 - a speech failure must not end the turn
             _log.exception("speaking a chunk failed")
             return False
+        # After, not before. The callback is what synthesises and queues the
+        # audio, so marking first the way this used to measured time to hand
+        # the text over, which is not a stage anyone budgeted. §3 budgets time
+        # to first audio out, and a chunk that failed to speak produced none.
+        if latency.get(Stage.TTS_FIRST_AUDIO) is None:
+            latency.mark(Stage.TTS_FIRST_AUDIO)
         return True
 
     # -- tools -------------------------------------------------------------
@@ -560,8 +564,13 @@ class Orchestrator:
         self.close()
 
 
-def _budgets(config: JarvisConfig) -> dict[Stage, float]:
-    """Latency budgets from config, keyed by Stage."""
+def turn_budgets(config: JarvisConfig) -> dict[Stage, float]:
+    """Latency budgets from config, keyed by Stage.
+
+    Public because ``main`` builds the turn's recorder now: §3 measures from the
+    end of the user's speech, which is before the orchestrator sees the turn at
+    all, so the two have to agree on the budgets.
+    """
     out: dict[Stage, float] = {}
     for stage in Stage:
         value = config.latency.budgets_ms.get(str(stage))

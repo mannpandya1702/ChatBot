@@ -691,7 +691,7 @@ class TestTheListenPathSaysWhatHappened:
         assistant._endpointer = _SilentEndpointer()
 
         with _capture_jarvis_logs(caplog):
-            assert assistant._listen(timeout_s=0.1) == ""
+            assert assistant._listen(timeout_s=0.1)[0] == ""
 
         record = next(
             (r for r in caplog.records if "no complete utterance" in r.getMessage()), None
@@ -737,7 +737,7 @@ class TestTheListenPathSaysWhatHappened:
         assistant._endpointer = Exploding()
 
         # Must return normally rather than propagating out of the turn loop.
-        assert assistant._listen(timeout_s=0.05) == ""
+        assert assistant._listen(timeout_s=0.05)[0] == ""
         # The broken properties are omitted rather than raising.
         state = assistant._endpointer_state()
         assert "state" not in state
@@ -877,7 +877,7 @@ class TestTheWakeWordsPrerollIsUsed:
         assistant._endpointer = self._Recorder()
         assistant._capture.start()
         try:
-            assert assistant._listen(0.1, None) == ""
+            assert assistant._listen(0.1, None)[0] == ""
         finally:
             assistant._capture.stop()
 
@@ -904,7 +904,7 @@ class TestTheWakeWordsPrerollIsUsed:
         assistant._endpointer = self._Recorder()
         assistant._capture.start()
         try:
-            assert assistant._listen(0.1, "not audio at all") == ""
+            assert assistant._listen(0.1, "not audio at all")[0] == ""
         finally:
             assistant._capture.stop()
 
@@ -1086,3 +1086,52 @@ class TestADeadVoiceIsReported:
         finally:
             assistant.stop()
         assert not errors
+
+
+class TestTheContractsLatencyIsTheOneMeasured:
+    """§3 budgets "end of user speech to first audio out".
+
+    VAD_ENDPOINT and STT appeared nowhere in src/ at all, and the recorder was
+    built inside run_turn, which the orchestrator only reaches once transcription
+    has finished. So the logged turn_total covered LLM plus TTS and nothing else:
+    a machine sitting at 1.6 s of real latency logged about 1.0 s and never
+    tripped the over-budget warning. bench_latency.py measured all five stages
+    against synthetic sources, so the benchmark stayed green while the shipped
+    loop reported a number that was not the contract's number.
+    """
+
+    def _turn(self, config: JarvisConfig) -> Any:
+        from jarvis.util.latency import Stage
+
+        assistant = Assistant(config, headless=True)
+        _wire(assistant, config, ["how busy is the cpu"])
+        seen: list[Any] = []
+        assistant.bus.subscribe(seen.append, [EventType.LATENCY])
+
+        answered = threading.Event()
+        assistant.bus.subscribe(lambda _e: answered.set(), [EventType.RESPONSE])
+        assistant.start()
+        try:
+            assert answered.wait(15), "no response was produced"
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not seen:
+                time.sleep(0.02)
+        finally:
+            assistant.stop()
+        assert seen, "no latency breakdown was published"
+        _ = Stage
+        return {
+            stage["stage"]: float(stage["duration_ms"])
+            for stage in seen[0].payload["stages"]
+        }
+
+    def test_the_endpoint_decision_is_measured(self, config: JarvisConfig) -> None:
+        assert "vad_endpoint" in self._turn(config)
+
+    def test_transcription_is_measured(self, config: JarvisConfig) -> None:
+        assert "stt" in self._turn(config)
+
+    def test_the_total_includes_them(self, config: JarvisConfig) -> None:
+        """Otherwise the number logged is not the number §3 puts a budget on."""
+        stages = self._turn(config)
+        assert stages["turn_total"] >= stages["stt"]

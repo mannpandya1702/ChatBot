@@ -314,7 +314,7 @@ class Assistant:
                 if self._stop.is_set() or self.supervisor.should_stop("turn-loop"):
                     return
                 preroll, self._wake_detection = self._wake_detection, None
-                text = self._listen(
+                text, latency = self._listen(
                     self.config.vad.max_utterance_s,
                     getattr(preroll, "preroll", None),
                 )
@@ -327,13 +327,13 @@ class Assistant:
                 # carry across the sentences within a reply, but the previous
                 # reply's tail must not lead into this one.
                 self._synth.begin_utterance()
-                self._orchestrator.run_turn(text, speak=self._speak)
+                self._orchestrator.run_turn(text, speak=self._speak, turn=latency)
                 self._player.wait(timeout=self.config.orchestrator.max_turn_seconds)
                 # Each answered question extends the window, so a follow-up
                 # does not need the wake word again.
                 deadline = time.monotonic() + self.config.orchestrator.idle_timeout_s
 
-    def _listen(self, timeout_s: float, preroll: Any = None) -> str:
+    def _listen(self, timeout_s: float, preroll: Any = None) -> tuple[str, Any]:
         """Endpoint one utterance and transcribe it. Empty string on silence.
 
         Args:
@@ -364,7 +364,7 @@ class Assistant:
             return self._transcribe(endpoint)
         while time.monotonic() < deadline:
             if self._stop.is_set() or self.supervisor.should_stop("turn-loop"):
-                return ""
+                return "", None
             frame = reader.read(frame_samples)
             if frame is None:
                 time.sleep(0.005)
@@ -388,7 +388,7 @@ class Assistant:
                 self.bus.emit(
                     EventType.ERROR, message=exc.message, speakable=exc.speakable
                 )
-                return ""
+                return "", None
             except Exception:  # noqa: BLE001 - a bad frame must not end listening
                 errors += 1
                 if errors <= _MAX_FRAME_ERRORS:
@@ -418,7 +418,7 @@ class Assistant:
                 }
             },
         )
-        return ""
+        return "", None
 
     def _endpointer_state(self) -> dict[str, Any]:
         """What the endpointer saw, for a log line. Never raises.
@@ -452,7 +452,7 @@ class Assistant:
         while self._player.is_playing and time.monotonic() < deadline:
             if not self._player.wait(timeout=0.25):
                 continue
-        return self._listen(timeout_s)
+        return self._listen(timeout_s)[0]
 
     def _feed_preroll(self, preroll: Any, frame_samples: int) -> Any:
         """Run the wake word's pre-roll through the endpointer before live audio.
@@ -494,8 +494,27 @@ class Assistant:
         )
         return None
 
-    def _transcribe(self, endpoint: Any) -> str:
-        """Turn a closed utterance into text. Empty string on any failure."""
+    def _transcribe(self, endpoint: Any) -> tuple[str, Any]:
+        """Turn a closed utterance into text, timing it against the §3 budget.
+
+        The turn's clock starts here rather than in the orchestrator. §3 defines
+        the budget as "end of user speech to first audio out", and the
+        orchestrator only sees the turn once transcription is finished, so a
+        TurnLatency built there could not include the two stages §3 puts a hard
+        number on. VAD_ENDPOINT and STT appeared nowhere in src/ at all, and
+        turn_total measured LLM plus TTS: a machine at 1.6 s of real latency
+        logged about 1.0 s and never tripped the over-budget warning.
+
+        Returns:
+            The transcript and the latency recorder for the rest of the turn.
+        """
+        from jarvis.brain.orchestrator import turn_budgets
+        from jarvis.util.latency import Stage, TurnLatency
+
+        latency = TurnLatency(budgets_ms=turn_budgets(self.config))
+        # Measured by the endpointer in audio time, which in a live stream is
+        # also the wall clock delay the user felt.
+        latency.record(Stage.VAD_ENDPOINT, float(endpoint.decision_ms), reason=endpoint.reason)
         # Only the length. The endpointer zeroes its counters as it emits, so
         # speech_ms and silence_ms read 0 here and would be worse than saying
         # nothing. audio.vad logs the reason and the decision time.
@@ -508,13 +527,14 @@ class Assistant:
             },
         )
         try:
-            transcript = self._transcriber.transcribe(
-                endpoint.audio, self.config.audio.sample_rate
-            )
+            with latency.stage(Stage.STT):
+                transcript = self._transcriber.transcribe(
+                    endpoint.audio, self.config.audio.sample_rate
+                )
         except JarvisError as exc:
             _log.warning("transcription failed: %s", exc.message)
             self.bus.emit(EventType.ERROR, message=exc.message, speakable=exc.speakable)
-            return ""
+            return "", latency
         text = str(transcript.text).strip()
         if not text:
             # Endpointed but nothing came back. Worth a line: from outside it is
@@ -522,7 +542,7 @@ class Assistant:
             _log.info("the transcriber returned nothing for that utterance")
         else:
             _log.info("heard", extra={"context": {"text": text}})
-        return text
+        return text, latency
 
     def _speak(self, text: str) -> None:
         """Synthesise and queue one chunk, watching for barge-in.

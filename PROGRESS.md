@@ -294,3 +294,59 @@ Recorded here rather than silently applied.
    wanted, that is a change to §6 and needs an explicit decision: the safe shape would be a
    separate fixed-argv cmdlet allowlist that never takes a model-authored string, but that is a
    contract amendment, not an implementation detail.
+
+---
+
+## Nine-dimension adversarial review
+
+Run after the first spoken round trip on the Windows host. 64 agents across nine
+dimensions (safety, concurrency, audio, agentic, contract, resilience,
+performance, deployment, tests), every finding re-checked by two independent
+skeptics working from the reporter's own reproduction. 27 found, 23 survived.
+
+Fixed here, each with a regression test verified to fail without the fix:
+
+| # | Severity | What was wrong |
+|---|---|---|
+| 1 | critical | `project_root()` resolved into `%TEMP%` inside the PyInstaller helper, so the elevated process loaded its native assembly from a user-writable directory. Now frozen-aware, plus a load-time hash check. |
+| 2 | critical | A malformed tool call on Ollama's terminal message discarded the whole message, making the turn a silent no-op. |
+| 3 | high | The malformed-JSON "retry" never re-asked; it skipped the line and decremented a counter. |
+| 4 | high | The tool-iteration ceiling ended the turn silently and reported success. |
+| 5 | high | The wake word's pre-roll was captured and dropped, clipping the start of every request. |
+| 6 | high | Ctrl-C during a reply hung for the supervisor's whole grace period. |
+| 11 | high | The STT pre-fetch filled a cache the runtime does not read. |
+| 12 | high | Kokoro weights were downloaded into `models/` and then downloaded again from the hub. |
+| 13 | high | Nothing was warmed at startup, so the first turn paid ~11 s of model loading. |
+| 14 | high | Memory compaction ran a blocking LLM generation between a tool result and the answer. |
+| 15 | high | An unrecoverable endpointer failure was retried at the frame rate, 31 errors a second. |
+| 16 | high | A dead Kokoro left the assistant mute with no error event and the state machine still saying "speaking". |
+| 17 | high | A mutating tool ran on a spoken "yes" when the confirmation prompt was never audible. |
+| 18 | high | The confirmation window was spent speaking the prompt, so `shell.run` could never be confirmed. |
+| 19 | high | Two tests pinned the fake retry as correct, using a stream shape Ollama never produces. |
+| 20 | high | Every absolute reminder time was read as UTC, so "at 5pm" fired at the wrong hour. |
+| 8, 22 | high | The two stages §3 puts a hard budget on, `vad_endpoint` and `stt`, were never measured on the live path. |
+| 23 | low | `tts.sample_rate` accepted any rate; Kokoro only emits 24 kHz. |
+
+Also fixed, found in the same pass and refuted only because the fix landed while
+the skeptics were checking: the HUD WebSocket accepted any browser origin, so any
+page the user had open could read the live transcript.
+
+### Still open
+
+| # | Severity | What | Why not yet |
+|---|---|---|---|
+| 7 | high | A capture reader lapped by the writer resynchronises silently; `RingReader.dropped` is computed and never read. | Needs a policy decision about what a consumer should do about it. |
+| 9 | high | The HUD window is permanently click-through: the frontend never calls `set_click_through`. | Tauri frontend, and the HUD has not been built on the target host yet (Rust absent). |
+| 10 | high | `ui.port`, `ui.host`, `ui.accent_color` and `ui.hud_position` never reach the HUD. | Same. Also the natural place to deliver a socket token. |
+| 21 | medium | One failed sink restart after a barge-in leaves the player permanently mute, with `wait()` never returning. | |
+
+### Notes
+
+* Two tests in this repo asserted bugs as correct behaviour and so kept them
+  alive: `tests/test_memory.py` asserted `message["name"]` for a key Ollama
+  discards, and every barge-in test drove the detector from a scripted
+  probability, which is why nothing could see that the assistant interrupts
+  itself. Both are corrected with the reason recorded next to them.
+* `tests/test_engines_live.py` grew two suites that need the real engines: one
+  asserting no voice profile costs intelligibility, one asserting the assistant
+  does not cut itself off at any realistic speaker bleed.
