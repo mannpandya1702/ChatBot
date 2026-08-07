@@ -61,11 +61,18 @@ class TestBasics:
         assert contents == ["m0", "m1", "m2", "m3", "m4"]
 
     def test_tool_messages_carry_their_name(self, config: JarvisConfig) -> None:
+        """Under ``tool_name``, which is the key Ollama actually reads.
+
+        This asserted ``name`` until the round trip was checked against Ollama's
+        Message struct. That key is not in the struct, so Go dropped it and the
+        result reached the model anonymous. The test passed the whole time,
+        because it only ever asked the code to agree with itself.
+        """
         with ConversationMemory(config) as memory:
             memory.add_tool("sys.cpu", {"cpu_percent": 43.2})
             message = memory.messages("S")[-1]
         assert message["role"] == "tool"
-        assert message["name"] == "sys.cpu"
+        assert message["tool_name"] == "sys.cpu"
         assert "43.2" in message["content"]
 
     def test_long_tool_output_is_truncated(self, config: JarvisConfig) -> None:
@@ -289,3 +296,128 @@ class TestThreadSafety:
             # Every write is present exactly once.
             contents = {m.content for m in memory.window()}
             assert len(contents) == 80
+
+
+class TestTheToolCallRoundTrip:
+    """A tool result has to arrive attached to the call that asked for it.
+
+    Ollama's Message struct is Role, Content, Thinking, Images, ToolCalls,
+    ToolName, ToolCallID. Go's JSON decoder drops unknown keys silently, so a
+    name sent under the wrong key arrives nameless with nothing to say so. And
+    Qwen3's template renders a tool result with no identity of its own: the only
+    thing binding a result to a question is the tool_calls block on the
+    assistant message before it. Send neither and the model sees anonymous JSON
+    appear after the user's question, which is what "it felt like it was reading
+    instructions" looks like from the other side.
+    """
+
+    def test_a_tool_result_names_itself_under_the_key_ollama_reads(
+        self, cfg: JarvisConfig
+    ) -> None:
+        message = MemoryMessage(role="tool", content="{}", tool_name="sys.cpu")
+        assert message.to_chat()["tool_name"] == "sys.cpu"
+
+    def test_it_does_not_use_the_key_ollama_discards(self, cfg: JarvisConfig) -> None:
+        """`name` is not in Ollama's Message struct, so it never arrives."""
+        assert "name" not in MemoryMessage(role="tool", content="{}", tool_name="sys.cpu").to_chat()
+
+    def test_an_assistant_message_carries_its_tool_calls(self, cfg: JarvisConfig) -> None:
+        calls = [{"type": "function", "function": {"name": "sys.cpu", "arguments": {}}}]
+        chat = MemoryMessage(role="assistant", content="", tool_calls=calls).to_chat()
+        assert chat["tool_calls"] == calls
+
+    def test_a_plain_assistant_message_carries_no_empty_block(self, cfg: JarvisConfig) -> None:
+        assert "tool_calls" not in MemoryMessage(role="assistant", content="Light.").to_chat()
+
+    def test_a_user_message_never_carries_tool_calls(self, cfg: JarvisConfig) -> None:
+        calls = [{"type": "function", "function": {"name": "x", "arguments": {}}}]
+        message = MemoryMessage(role="user", content="hi", tool_calls=calls)
+        assert "tool_calls" not in message.to_chat()
+
+    def test_add_assistant_stores_the_calls(self, cfg: JarvisConfig, tmp_path: Path) -> None:
+        memory = ConversationMemory(cfg, db_path=tmp_path / "m.db")
+        calls = [{"type": "function", "function": {"name": "sys.gpu", "arguments": {}}}]
+        memory.add_assistant("", tool_calls=calls)
+        assert memory.messages("sys")[-1]["tool_calls"] == calls
+
+    def test_the_calls_survive_a_restart(self, cfg: JarvisConfig, tmp_path: Path) -> None:
+        """They are part of the conversation, so they have to persist with it."""
+        path = tmp_path / "m.db"
+        call = {"name": "sys.disk", "arguments": {"unit": "gb"}}
+        calls = [{"type": "function", "function": call}]
+        first = ConversationMemory(cfg, db_path=path)
+        first.add_user("how much space")
+        first.add_assistant("", tool_calls=calls)
+        first.add_tool("sys.disk", {"free_gb": 41.2})
+        first.close()
+
+        reopened = ConversationMemory(cfg, db_path=path)
+        restored = reopened.messages("sys")
+        assert [m.get("tool_calls") for m in restored if m["role"] == "assistant"] == [calls]
+        assert [m.get("tool_name") for m in restored if m["role"] == "tool"] == ["sys.disk"]
+
+    def test_a_database_from_before_the_column_existed_still_opens(
+        self, cfg: JarvisConfig, tmp_path: Path
+    ) -> None:
+        """Anyone who has run JARVIS once has such a file.
+
+        CREATE TABLE IF NOT EXISTS does nothing to a table that already exists,
+        so without a migration every insert would fail on a live install.
+        """
+        import sqlite3
+
+        path = tmp_path / "old.db"
+        old = sqlite3.connect(str(path))
+        old.executescript(
+            """
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+                role TEXT NOT NULL, content TEXT NOT NULL, timestamp REAL NOT NULL,
+                tokens INTEGER NOT NULL, tool_name TEXT
+            );
+            CREATE TABLE summaries (
+                session_id TEXT PRIMARY KEY, summary TEXT NOT NULL, updated_at REAL NOT NULL
+            );
+            """
+        )
+        old.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp, tokens, tool_name)"
+            " VALUES (?, 'user', 'hello', 1.0, 2, NULL)",
+            (cfg.memory.session_id,),
+        )
+        old.commit()
+        old.close()
+
+        memory = ConversationMemory(cfg, db_path=path)
+        assert [m["content"] for m in memory.messages("sys") if m["role"] == "user"] == ["hello"]
+        calls = [{"function": {"name": "sys.cpu", "arguments": {}}}]
+        memory.add_assistant("", tool_calls=calls)
+        memory.close()
+
+        # Reopened rather than read back from the live window. Persistence
+        # failures are swallowed and logged so a full disk cannot kill the turn
+        # loop, which means an unmigrated insert looks fine in memory and loses
+        # the conversation on the next restart. Only disk proves the migration.
+        reopened = ConversationMemory(cfg, db_path=path)
+        stored = reopened.messages("sys")
+        assert [m["content"] for m in stored if m["role"] == "user"] == ["hello"]
+        assert [m.get("tool_calls") for m in stored if m["role"] == "assistant"] == [calls]
+
+    def test_unreadable_stored_calls_do_not_break_a_restart(
+        self, cfg: JarvisConfig, tmp_path: Path
+    ) -> None:
+        import sqlite3
+
+        path = tmp_path / "m.db"
+        memory = ConversationMemory(cfg, db_path=path)
+        memory.add_assistant("hm", tool_calls=[{"function": {"name": "x", "arguments": {}}}])
+        memory.close()
+
+        conn = sqlite3.connect(str(path))
+        conn.execute("UPDATE messages SET tool_calls = 'not json'")
+        conn.commit()
+        conn.close()
+
+        reopened = ConversationMemory(cfg, db_path=path)
+        assert reopened.message_count == 1
+        assert not reopened.messages("sys")[-1].get("tool_calls")

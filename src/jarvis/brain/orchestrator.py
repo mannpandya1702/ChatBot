@@ -44,6 +44,21 @@ _log = logging.getLogger(__name__)
 
 #: Speech callback: receives each speakable chunk as soon as it is ready.
 SpeakFn = Callable[[str], None]
+
+
+def _wire_call(call: ToolCall) -> dict[str, Any]:
+    """Render a tool call back into the shape Ollama sent it in.
+
+    It has to go back the way it came. Qwen3's chat template renders a tool
+    result with no identity of its own, so the only thing binding a result to
+    the question that produced it is this block on the preceding assistant
+    message.
+    """
+    function: dict[str, Any] = {"name": call.name, "arguments": call.arguments}
+    wire: dict[str, Any] = {"type": "function", "function": function}
+    if call.id:
+        wire["id"] = call.id
+    return wire
 #: Listener used to collect a spoken confirmation. Returns the transcript.
 ListenFn = Callable[[float], str]
 
@@ -227,9 +242,14 @@ class Orchestrator:
                         spoken_all.append(ready)
                         self._emit_speech(ready, speak, latency)
 
+                    # The assistant message goes in even when it said nothing,
+                    # because it is what carries the tool_calls. Without it the
+                    # results that follow are anonymous JSON appearing after the
+                    # user's question with nothing that asked for them, and the
+                    # model answers as though it were reading a document rather
+                    # than its own instruments.
                     said = "".join(content_parts).strip()
-                    if said:
-                        self._memory.add_assistant(said)
+                    self._memory.add_assistant(said, tool_calls=[_wire_call(c) for c in calls])
                     # Recorded above, so it must not be recorded again at the end.
                     reply.clear()
                     called.extend(self._dispatch(calls, latency, speak))

@@ -482,3 +482,105 @@ class TestRegistryCoverage:
         assert mutating <= set(config.gate.mutating_allowlist), (
             f"{mutating - set(config.gate.mutating_allowlist)} mutate but are not allowlisted"
         )
+
+
+class TestTheModelSeesWhatItAskedFor:
+    """The assistant message that requested a tool must reach the next round.
+
+    Ollama's Message struct is Role, Content, Thinking, Images, ToolCalls,
+    ToolName, ToolCallID, and Go's JSON decoder drops unknown keys in silence.
+    Qwen3's template gives a tool result no identity of its own, so the only
+    thing binding a result to the question that produced it is the tool_calls
+    block on the assistant message before it.
+
+    Send neither and round two is the system prompt, the user's question, and
+    then loose JSON with nothing saying the assistant went and measured
+    anything. The model then answers as though reading a document rather than
+    reporting its own instruments, which is what was reported from the Windows
+    host as "it felt like it was reading instructions".
+    """
+
+    def _round_two(self, config: JarvisConfig) -> list[dict[str, Any]]:
+        llm = ScriptedLlm(
+            [
+                [ToolCall(name="sys.cpu", arguments={"interval_s": 0.05})],
+                ["Forty one percent, sir."],
+            ]
+        )
+        orchestrator = _build(config, llm, EventBus())
+        try:
+            orchestrator.run_turn("how busy is the cpu")
+        finally:
+            orchestrator.close()
+        assert len(llm.calls) >= 2, "the tool round never happened"
+        return [dict(message) for message in llm.calls[1]]
+
+    def test_the_assistant_message_carries_the_call_it_made(
+        self, config: JarvisConfig
+    ) -> None:
+        assistant = [m for m in self._round_two(config) if m["role"] == "assistant"]
+        assert assistant, "round two had no assistant message at all"
+        names = [c["function"]["name"] for m in assistant for c in m.get("tool_calls", [])]
+        assert names == ["sys.cpu"]
+
+    def test_it_is_recorded_even_though_nothing_was_said_first(
+        self, config: JarvisConfig
+    ) -> None:
+        """The usual case: the model calls the tool without any preamble.
+
+        Storing only non-empty content is what dropped the call block, so an
+        empty assistant turn is exactly the case that has to survive.
+        """
+        assistant = [m for m in self._round_two(config) if m["role"] == "assistant"]
+        assert assistant[0]["content"] == ""
+        assert assistant[0]["tool_calls"]
+
+    def test_the_arguments_go_back_as_they_came(self, config: JarvisConfig) -> None:
+        calls = [
+            c
+            for m in self._round_two(config)
+            if m["role"] == "assistant"
+            for c in m.get("tool_calls", [])
+        ]
+        assert calls[0]["function"]["arguments"] == {"interval_s": 0.05}
+
+    def test_the_call_comes_before_its_result(self, config: JarvisConfig) -> None:
+        roles = [m["role"] for m in self._round_two(config)]
+        assert roles.index("assistant") < roles.index("tool")
+
+    def test_the_result_names_itself_under_the_key_ollama_reads(
+        self, config: JarvisConfig
+    ) -> None:
+        results = [m for m in self._round_two(config) if m["role"] == "tool"]
+        assert [m.get("tool_name") for m in results] == ["sys.cpu"]
+
+    def test_nothing_is_sent_under_the_key_ollama_discards(
+        self, config: JarvisConfig
+    ) -> None:
+        assert not any("name" in message for message in self._round_two(config))
+
+    def test_parallel_calls_all_come_back(self, config: JarvisConfig) -> None:
+        llm = ScriptedLlm(
+            [
+                [
+                    ToolCall(name="sys.cpu", arguments={"interval_s": 0.05}),
+                    ToolCall(name="sys.memory", arguments={}),
+                ],
+                ["All quiet, sir."],
+            ]
+        )
+        orchestrator = _build(config, llm, EventBus())
+        try:
+            orchestrator.run_turn("how is the machine")
+        finally:
+            orchestrator.close()
+
+        round_two = [dict(m) for m in llm.calls[1]]
+        requested = [
+            c["function"]["name"]
+            for m in round_two
+            if m["role"] == "assistant"
+            for c in m.get("tool_calls", [])
+        ]
+        answered = [m["tool_name"] for m in round_two if m["role"] == "tool"]
+        assert sorted(requested) == sorted(answered) == ["sys.cpu", "sys.memory"]

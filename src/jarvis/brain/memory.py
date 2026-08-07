@@ -12,11 +12,12 @@ T-1.7. Two things this has to get right:
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -43,7 +44,8 @@ CREATE TABLE IF NOT EXISTS messages (
     content     TEXT    NOT NULL,
     timestamp   REAL    NOT NULL,
     tokens      INTEGER NOT NULL,
-    tool_name   TEXT
+    tool_name   TEXT,
+    tool_calls  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
 
@@ -53,6 +55,49 @@ CREATE TABLE IF NOT EXISTS summaries (
     updated_at  REAL NOT NULL
 );
 """
+
+
+#: Columns added after the first release, as ``name -> ALTER TABLE type``.
+#: ``CREATE TABLE IF NOT EXISTS`` does nothing to a table that already exists,
+#: so a database written before a column was added keeps the old shape and the
+#: insert fails on every turn. Anyone who has run JARVIS once has such a file.
+_MIGRATIONS: dict[str, str] = {"tool_calls": "TEXT"}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add any column the running code expects and the file does not have."""
+    try:
+        existing = {str(row["name"]) for row in conn.execute("PRAGMA table_info(messages)")}
+    except sqlite3.Error:
+        _log.exception("could not inspect the conversation table")
+        return
+    if not existing:
+        return
+    for column, kind in _MIGRATIONS.items():
+        if column in existing:
+            continue
+        try:
+            conn.execute(f"ALTER TABLE messages ADD COLUMN {column} {kind}")
+            conn.commit()
+            _log.info("migrated the conversation store", extra={"context": {"column": column}})
+        except sqlite3.Error:
+            _log.exception("could not add a column", extra={"context": {"column": column}})
+
+
+def _load_tool_calls(row: sqlite3.Row) -> list[dict[str, Any]]:
+    """Decode a stored tool_calls column, tolerating old rows and bad JSON."""
+    try:
+        raw = row["tool_calls"]
+    except (IndexError, KeyError):
+        return []
+    if not raw:
+        return []
+    try:
+        decoded = json.loads(str(raw))
+    except (json.JSONDecodeError, ValueError):
+        _log.warning("discarding an unreadable stored tool call")
+        return []
+    return decoded if isinstance(decoded, list) else []
 
 
 def estimate_tokens(text: str) -> int:
@@ -71,24 +116,40 @@ def estimate_tokens(text: str) -> int:
 
 @dataclass
 class MemoryMessage:
-    """One stored message."""
+    """One stored message.
+
+    ``tool_calls`` is set on assistant messages that asked for a tool, and
+    ``tool_name`` on the tool messages that answered. Both halves have to be
+    kept: a tool result on its own is an anonymous blob of JSON, and the only
+    thing that says which call produced it is the assistant message before it.
+    """
 
     role: str
     content: str
     timestamp: float = field(default_factory=time.time)
     tokens: int = 0
     tool_name: str | None = None
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
     id: int | None = None
 
     def __post_init__(self) -> None:
         if not self.tokens:
             self.tokens = estimate_tokens(self.content)
 
-    def to_chat(self) -> dict[str, str]:
-        """Render in the shape Ollama's chat endpoint expects."""
-        message = {"role": self.role, "content": self.content}
+    def to_chat(self) -> dict[str, Any]:
+        """Render in the shape Ollama's chat endpoint expects.
+
+        The key for a tool result's name is ``tool_name``. Ollama's Message
+        struct declares exactly Role, Content, Thinking, Images, ToolCalls,
+        ToolName and ToolCallID, and Go's JSON decoder discards anything else
+        without complaint, so a message sent under ``name`` arrives nameless and
+        nothing says so.
+        """
+        message: dict[str, Any] = {"role": self.role, "content": self.content}
         if self.role == "tool" and self.tool_name:
-            message["name"] = self.tool_name
+            message["tool_name"] = self.tool_name
+        if self.role == "assistant" and self.tool_calls:
+            message["tool_calls"] = self.tool_calls
         return message
 
 
@@ -126,6 +187,7 @@ class ConversationMemory:
             with self._lock:
                 self._conn.executescript(_SCHEMA)
                 self._conn.commit()
+                _migrate(self._conn)
             self.load()
 
     # -- properties --------------------------------------------------------
@@ -159,9 +221,22 @@ class ConversationMemory:
         """Record something the user said."""
         return self._add(MemoryMessage(role="user", content=text))
 
-    def add_assistant(self, text: str) -> MemoryMessage:
-        """Record something the assistant said."""
-        return self._add(MemoryMessage(role="assistant", content=text))
+    def add_assistant(
+        self, text: str, tool_calls: Sequence[dict[str, Any]] | None = None
+    ) -> MemoryMessage:
+        """Record something the assistant said, and any tools it asked for.
+
+        Args:
+            text: What the assistant said, which may be empty when it went
+                straight to a tool without speaking first.
+            tool_calls: The calls it requested, in Ollama's wire shape. These
+                have to be stored: without the assistant message that requested
+                them, the tool results that follow are anonymous JSON with
+                nothing tying them to a question.
+        """
+        return self._add(
+            MemoryMessage(role="assistant", content=text, tool_calls=list(tool_calls or []))
+        )
 
     def add_tool(self, name: str, payload: Any) -> MemoryMessage:
         """Record a tool result.
@@ -184,14 +259,14 @@ class ConversationMemory:
 
     # -- reading -----------------------------------------------------------
 
-    def messages(self, system_prompt: str) -> list[dict[str, str]]:
+    def messages(self, system_prompt: str) -> list[dict[str, Any]]:
         """The exact message list handed to Ollama.
 
         Order is: the system prompt, then the running summary as a second system
         message when one exists, then the retained window.
         """
         with self._lock:
-            out: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+            out: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
             if self._summary:
                 out.append(
                     {
@@ -282,8 +357,9 @@ class ConversationMemory:
             return
         try:
             cursor = self._conn.execute(
-                "INSERT INTO messages (session_id, role, content, timestamp, tokens, tool_name)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO messages"
+                " (session_id, role, content, timestamp, tokens, tool_name, tool_calls)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     self._session_id,
                     message.role,
@@ -291,6 +367,7 @@ class ConversationMemory:
                     message.timestamp,
                     message.tokens,
                     message.tool_name,
+                    json.dumps(message.tool_calls) if message.tool_calls else None,
                 ),
             )
             self._conn.commit()
@@ -352,6 +429,7 @@ class ConversationMemory:
                     timestamp=float(row["timestamp"]),
                     tokens=int(row["tokens"]),
                     tool_name=row["tool_name"],
+                    tool_calls=_load_tool_calls(row),
                     id=int(row["id"]),
                 )
                 for row in rows
