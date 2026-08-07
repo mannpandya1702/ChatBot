@@ -45,6 +45,10 @@ _log = logging.getLogger(__name__)
 #: Speech callback: receives each speakable chunk as soon as it is ready.
 SpeakFn = Callable[[str], None]
 
+#: Spoken when the tool loop runs out of rounds and the model still will not
+#: answer. Says what happened without reading the tool results aloud.
+_CEILING_SPEAKABLE = "I checked, but I could not put an answer together."
+
 
 def _wire_call(call: ToolCall) -> dict[str, Any]:
     """Render a tool call back into the shape Ollama sent it in.
@@ -59,6 +63,8 @@ def _wire_call(call: ToolCall) -> dict[str, Any]:
     if call.id:
         wire["id"] = call.id
     return wire
+
+
 #: Listener used to collect a spoken confirmation. Returns the transcript.
 ListenFn = Callable[[float], str]
 
@@ -254,10 +260,20 @@ class Orchestrator:
                     reply.clear()
                     called.extend(self._dispatch(calls, latency, speak))
                 else:
+                    # Falling through here used to end the turn: no speech, no
+                    # RESPONSE event, ok=True, and a memory window full of tool
+                    # results nobody ever spoke. From the user's side the
+                    # assistant simply said nothing and looked fine. The
+                    # results are already gathered, so ask once more with the
+                    # tools taken away, which forces an answer out of them.
                     _log.warning(
-                        "hit the tool iteration ceiling",
+                        "hit the tool iteration ceiling, answering from what was gathered",
                         extra={"context": {"limit": self._config.llm.max_tool_iterations}},
                     )
+                    for ready in self._final_answer(latency):
+                        reply.append(ready)
+                        spoken_all.append(ready)
+                        self._emit_speech(ready, speak, latency)
 
             except JarvisError as exc:
                 return self._error_result(exc, spoken_all, called, latency, speak)
@@ -291,6 +307,28 @@ class Orchestrator:
                 "llm round complete",
                 extra={"context": {"ms": round((time.perf_counter() - started) * 1000, 1)}},
             )
+
+    def _final_answer(self, latency: TurnLatency) -> list[str]:
+        """Ask for an answer with the tools taken away.
+
+        Used when the tool loop runs out of rounds. The model has usually called
+        the same tool over and over, so its results are sitting in memory
+        unspoken; without a tool list it has nothing to do but say what they
+        mean. Never raises: this already runs on a degraded path, and a failure
+        here should leave the caller with the fallback sentence rather than an
+        exception.
+        """
+        try:
+            response = self._llm.chat(self._memory.messages(self.system_prompt()))
+        except Exception:  # noqa: BLE001 - §5, never crash the loop
+            _log.exception("could not summarise after the tool ceiling")
+            return [build_error_response(_CEILING_SPEAKABLE, self._config)]
+
+        text = str(response.content).strip()
+        if not text:
+            return [build_error_response(_CEILING_SPEAKABLE, self._config)]
+        self._memory.add_assistant(text)
+        return [text]
 
     def _emit_speech(self, text: str, speak: SpeakFn | None, latency: TurnLatency) -> bool:
         """Hand one chunk to the speech callback and record first audio.

@@ -113,7 +113,7 @@ tts:
   voice: bm_george
   lang_code: b              # "b" is British English, matching the bm_* voices.
   speed: 1.0
-  sample_rate: 24000
+  sample_rate: 24000        # Kokoro emits this and only this. Not adjustable.
   min_chunk_chars: 24
   max_chunk_chars: 240
   stop_latency_ms: 100

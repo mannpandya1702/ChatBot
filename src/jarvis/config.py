@@ -331,7 +331,13 @@ class TtsConfig(_Section):
     #: Kokoro language code. "b" is British English, which matches bm_* voices.
     lang_code: str = "b"
     speed: float = Field(default=1.0, ge=0.5, le=2.0)
-    sample_rate: int = Field(default=24_000, ge=8_000, le=48_000)
+    #: Kokoro emits 24 kHz and nothing else, and every consumer trusts this
+    #: number: the player clocks the device with it and the voice rack scales
+    #: its delays by it. Setting 16000, which the old 8k-48k range allowed,
+    #: played 24 kHz audio at 16 kHz. That is a fifth flat and half again as
+    #: long, with no warning anywhere, so the field is pinned rather than
+    #: ranged.
+    sample_rate: Literal[24_000] = 24_000
     #: Smallest chunk worth synthesising. Below this we wait for more text so the
     #: first sentence does not come out clipped.
     min_chunk_chars: int = Field(default=24, ge=1, le=500)

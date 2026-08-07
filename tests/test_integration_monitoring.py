@@ -237,13 +237,50 @@ class TestToolChaining:
         assert "tool_result" in seen
 
     def test_iteration_ceiling_is_enforced(self, config: JarvisConfig, bus: EventBus) -> None:
-        """A model that only ever calls tools must not loop forever."""
+        """A model that only ever calls tools must not loop forever.
+
+        The cap is on tool rounds. One further round runs with the tools taken
+        away, to get an answer out of the results already gathered, so the
+        ceiling costs the user a worse answer rather than no answer.
+        """
         rounds = [[ToolCall(name="sys.cpu", arguments={"interval_s": 0.1})] for _ in range(20)]
         llm = ScriptedLlm(rounds)
         with _build(config, llm, bus) as orchestrator:
             result = orchestrator.run_turn("loop forever")
-        assert llm.round_index <= config.llm.max_tool_iterations
+        assert llm.round_index <= config.llm.max_tool_iterations + 1
         assert result.ok
+
+    def test_the_ceiling_still_says_something(
+        self, config: JarvisConfig, bus: EventBus
+    ) -> None:
+        """It used to end the turn silently and report success.
+
+        No speech, no RESPONSE event, ok=True, and a memory window full of tool
+        results nobody spoke. From the user's side the assistant simply said
+        nothing and looked fine, which is the hardest kind of failure to report.
+        """
+        rounds = [[ToolCall(name="sys.cpu", arguments={"interval_s": 0.1})] for _ in range(20)]
+        spoken: list[str] = []
+        with _build(config, ScriptedLlm(rounds), bus) as orchestrator:
+            orchestrator.run_turn("loop forever", speak=spoken.append)
+        assert spoken, "the turn ended without the assistant saying anything"
+
+    def test_the_ceiling_falls_back_when_the_model_says_nothing(
+        self, config: JarvisConfig, bus: EventBus
+    ) -> None:
+        """Even the final round can come back empty."""
+
+        class Mute(ScriptedLlm):
+            def chat(self, messages: Any, **kwargs: Any) -> Any:
+                from jarvis.brain.llm import ChatResponse
+
+                return ChatResponse(content="")
+
+        rounds = [[ToolCall(name="sys.cpu", arguments={"interval_s": 0.1})] for _ in range(20)]
+        spoken: list[str] = []
+        with _build(config, Mute(rounds), bus) as orchestrator:
+            orchestrator.run_turn("loop forever", speak=spoken.append)
+        assert any("could not" in line for line in spoken), spoken
 
 
 class TestToolBoundary:

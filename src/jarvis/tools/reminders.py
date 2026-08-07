@@ -87,9 +87,14 @@ def parse_when(when: str, now: datetime | None = None) -> datetime:
     has already passed today is taken to mean tomorrow, which is what a person
     means by "remind me at 8".
 
+    A clock time is a *local* clock time. The reference used to be
+    ``datetime.now(tz=UTC)``, so ``replace(hour=17)`` produced 17:00 UTC and
+    "remind me at 5pm" fired at 13:00 for a user in New York and 22:30 for one
+    in India. Nobody says "at five" and means somewhere else's five.
+
     Args:
         when: The spoken expression.
-        now: Reference time, injected for tests.
+        now: Reference time, injected for tests. Naive values are read as local.
 
     Returns:
         The absolute due time, timezone aware.
@@ -97,7 +102,9 @@ def parse_when(when: str, now: datetime | None = None) -> datetime:
     Raises:
         ValueError: The expression could not be understood.
     """
-    reference = now or datetime.now(tz=UTC)
+    reference = now if now is not None else datetime.now().astimezone()
+    if reference.tzinfo is None:
+        reference = reference.astimezone()
     text = when.strip().lower()
 
     match = _RELATIVE.match(text)
@@ -118,6 +125,8 @@ def parse_when(when: str, now: datetime | None = None) -> datetime:
         if not (0 <= hour <= 23 and 0 <= minute <= 59):
             msg = f"{when!r} is not a valid time"
             raise ValueError(msg)
+        # In the reference's own zone, which is the user's, so the hour they
+        # said is the hour they get.
         candidate = reference.replace(hour=hour, minute=minute, second=0, microsecond=0)
         if candidate <= reference:
             candidate += timedelta(days=1)

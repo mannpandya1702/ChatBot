@@ -264,3 +264,71 @@ class TestGating:
         assert "reminders.create" in cfg.gate.mutating_allowlist
         assert "reminders.delete" in cfg.gate.mutating_allowlist
         assert "reminders.list" not in cfg.gate.mutating_allowlist
+
+
+class TestClockTimesAreLocal:
+    """"At five" means the user's five.
+
+    parse_when used datetime.now(tz=UTC) as its reference, so replace(hour=17)
+    produced 17:00 UTC. On the target host, a Windows machine in a local zone,
+    "remind me at 5pm" fired at 13:00 in New York and 22:30 in India, and the
+    spoken confirmation repeated the hour the user asked for, so nothing about
+    it looked wrong until the reminder did not arrive.
+    """
+
+    @pytest.mark.parametrize(
+        "zone", ["America/New_York", "Asia/Kolkata", "Europe/London", "Pacific/Auckland"]
+    )
+    @pytest.mark.parametrize(
+        ("spoken", "hour", "minute"),
+        [("at 5pm", 17, 0), ("at 8am", 8, 0), ("at 17:30", 17, 30), ("at 12am", 0, 0)],
+    )
+    def test_the_hour_asked_for_is_the_hour_stored(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        zone: str,
+        spoken: str,
+        hour: int,
+        minute: int,
+    ) -> None:
+        import time as _time
+
+        monkeypatch.setenv("TZ", zone)
+        if hasattr(_time, "tzset"):
+            _time.tzset()
+        try:
+            due = parse_when(spoken).astimezone()
+            assert (due.hour, due.minute) == (hour, minute)
+        finally:
+            monkeypatch.delenv("TZ", raising=False)
+            if hasattr(_time, "tzset"):
+                _time.tzset()
+
+    def test_a_time_already_past_moves_to_tomorrow_in_local_terms(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import time as _time
+
+        monkeypatch.setenv("TZ", "America/New_York")
+        if hasattr(_time, "tzset"):
+            _time.tzset()
+        try:
+            now = datetime.now().astimezone()
+            asked = (now.hour - 1) % 24
+            due = parse_when(f"at {asked}:00").astimezone()
+            assert due.hour == asked
+            assert due > now
+        finally:
+            monkeypatch.delenv("TZ", raising=False)
+            if hasattr(_time, "tzset"):
+                _time.tzset()
+
+    def test_relative_times_are_unaffected(self) -> None:
+        before = datetime.now().astimezone()
+        due = parse_when("in 5 minutes")
+        assert 4.9 <= (due - before).total_seconds() / 60 <= 5.1
+
+    def test_a_naive_reference_is_read_as_local(self) -> None:
+        """Callers passing a bare datetime meant local, not UTC."""
+        naive = datetime(2026, 8, 7, 9, 0)
+        assert parse_when("at 5pm", naive).astimezone().hour == 17

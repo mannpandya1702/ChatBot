@@ -472,8 +472,13 @@ class TestFromConfig:
         assert not build_voice_effect(config).is_bypass
 
     def test_it_follows_the_configured_sample_rate(self) -> None:
-        config = JarvisConfig(tts={"sample_rate": 16_000})
-        assert build_voice_effect(config)._sample_rate == 16_000
+        """Kokoro emits 24 kHz and the field is pinned to it, so this is 24 kHz.
+
+        The rack scales its delays by the rate, which is why the field stopped
+        being a range: a config claiming 16 kHz built a comb tuned for audio
+        that was actually 24 kHz, on top of playing the whole voice a fifth flat.
+        """
+        assert build_voice_effect(JarvisConfig())._sample_rate == 24_000
 
     def test_turning_it_off_in_config_bypasses(self) -> None:
         assert build_voice_effect(JarvisConfig(tts={"effect_profile": "none"})).is_bypass
