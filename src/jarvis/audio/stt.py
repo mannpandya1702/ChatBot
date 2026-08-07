@@ -70,10 +70,40 @@ __all__ = [
     "TranscriptSegment",
     "WhisperCppTranscriber",
     "build_transcriber",
+    "faster_whisper_cache",
     "to_float32_mono",
+    "whispercpp_cache",
 ]
 
 _log = logging.getLogger(__name__)
+
+
+def faster_whisper_cache(config: JarvisConfig) -> Path:
+    """Where faster-whisper checkpoints are cached.
+
+    ``stt.download_root`` wins when set. Otherwise everything lands under
+    ``models/`` alongside the rest of the downloaded artefacts (§4), which keeps
+    a machine that has been through ``pull_models.ps1`` fully offline.
+
+    Module level rather than a method because ``scripts/fetch_stt_model.py``
+    needs the same answer. It used to compute its own, which is to say it did
+    not compute one at all: it called ``download_model(model)`` with no cache
+    argument, so setup filled the default HuggingFace cache and the runtime
+    looked in ``models/faster-whisper`` and downloaded the whole checkpoint
+    again during the user's first sentence.
+    """
+    configured = config.stt.download_root
+    if configured is not None:
+        return config.resolve_path(configured)
+    return config.models_dir / "faster-whisper"
+
+
+def whispercpp_cache(config: JarvisConfig) -> Path:
+    """Where whisper.cpp ggml weights are cached. Same story as above."""
+    configured = config.stt.download_root
+    if configured is not None:
+        return config.resolve_path(configured)
+    return config.models_dir / "whispercpp"
 
 Samples = npt.NDArray[Any]
 
@@ -734,16 +764,8 @@ class FasterWhisperTranscriber(_BaseTranscriber):
         return model
 
     def _download_root(self) -> Path:
-        """Where checkpoints are cached.
-
-        ``stt.download_root`` wins when set. Otherwise everything lands under
-        ``models/`` alongside the rest of the downloaded artefacts (§4), which
-        keeps a machine that has been through ``pull_models.ps1`` fully offline.
-        """
-        configured = self._config.stt.download_root
-        if configured is not None:
-            return self._config.resolve_path(configured)
-        return self._config.models_dir / "faster-whisper"
+        """Where checkpoints are cached."""
+        return faster_whisper_cache(self._config)
 
     def _run(self, model: Any, samples: npt.NDArray[np.float32]) -> _RawResult:
         """Transcribe and drain the generator faster-whisper returns.
@@ -893,10 +915,7 @@ class WhisperCppTranscriber(_BaseTranscriber):
 
     def _models_dir(self) -> Path:
         """Directory ggml weights are cached in."""
-        configured = self._config.stt.download_root
-        if configured is not None:
-            return self._config.resolve_path(configured)
-        return self._config.models_dir / "whispercpp"
+        return whispercpp_cache(self._config)
 
     def _run(self, model: Any, samples: npt.NDArray[np.float32]) -> _RawResult:
         """Transcribe one buffer.

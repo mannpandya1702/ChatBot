@@ -247,11 +247,78 @@ class KokoroSynthesizer:
         """Whether the pipeline has been built."""
         return self._pipeline is not None
 
+    def _local_weights(self) -> tuple[Any, Any] | None:
+        """The weights ``pull_models.ps1`` downloaded, when they are present.
+
+        Returns ``(config.json, kokoro-v1_0.pth)`` or None.
+
+        Setup fetches about 330 MB into ``models/kokoro`` and nothing read it:
+        ``KPipeline(lang_code=...)`` with no repo_id sends KModel to
+        ``hf_hub_download``, so the weights came down a second time into the
+        HuggingFace cache, and a machine that had been through setup and then
+        gone offline could not speak at all.
+        """
+        root = self._config.models_dir / "kokoro"
+        config_file = root / "config.json"
+        weights = root / "kokoro-v1_0.pth"
+        if config_file.is_file() and weights.is_file():
+            return config_file, weights
+        return None
+
+    def _preload_voice(self, pipeline: Any) -> None:
+        """Put the vendored voice pack into the pipeline before it asks the hub.
+
+        Loading the weights locally is only half of going offline. The voice is
+        a separate file, and ``KPipeline.load_single_voice`` reaches for
+        ``hf_hub_download`` unless the voice is already in its ``voices`` dict.
+        ``pull_models.ps1`` downloads ``kokoro/voices/bm_george.pt`` for exactly
+        this, so it goes in the dict.
+
+        Never raises: a voice that will not preload is one hub request away, and
+        that is a far better outcome than refusing to speak.
+        """
+        pack = self._config.models_dir / "kokoro" / "voices" / f"{self._voice}.pt"
+        if not pack.is_file():
+            return
+        try:
+            import torch
+
+            pipeline.voices[self._voice] = torch.load(str(pack), weights_only=True)
+        except Exception:  # noqa: BLE001 - the hub path still works
+            _log.debug("could not preload the vendored voice pack", exc_info=True)
+
     def _ensure_pipeline(self) -> Any:
-        """Load Kokoro on first use."""
+        """Load Kokoro on first use, preferring the weights setup downloaded."""
         if self._pipeline is not None:
             return self._pipeline
         kokoro = require_module("kokoro", feature="speech synthesis")
+
+        local = self._local_weights()
+        if local is not None:
+            config_file, weights = local
+            try:
+                model = kokoro.KModel(config=str(config_file), model=str(weights))
+                self._pipeline = kokoro.KPipeline(lang_code=self._lang_code, model=model)
+            except Exception:  # noqa: BLE001 - fall back rather than refuse to speak
+                _log.warning(
+                    "could not load the vendored Kokoro weights, falling back to the hub",
+                    extra={"context": {"weights": str(weights)}},
+                    exc_info=True,
+                )
+            else:
+                self._preload_voice(self._pipeline)
+                _log.info(
+                    "kokoro loaded from models/",
+                    extra={
+                        "context": {
+                            "voice": self._voice,
+                            "lang_code": self._lang_code,
+                            "weights": str(weights),
+                        }
+                    },
+                )
+                return self._pipeline
+
         try:
             self._pipeline = kokoro.KPipeline(lang_code=self._lang_code)
         except Exception as exc:

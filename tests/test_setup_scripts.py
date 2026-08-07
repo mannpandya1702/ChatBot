@@ -663,3 +663,58 @@ class TestTheTranscriptionModelIsPreFetched:
         fetch = (ROOT / "scripts" / "fetch_stt_model.py").read_text(encoding="utf-8")
         assert "faster_whisper" in fetch
         assert "pywhispercpp" in fetch
+
+
+class TestSetupDownloadsWhereTheRuntimeLooks:
+    """Every artefact pull_models.ps1 fetches has to be one the runtime reads.
+
+    Two of them were not. The STT pre-fetch called download_model(model) with no
+    cache argument, filling the default HuggingFace cache while the runtime
+    passed download_root=models/faster-whisper, so the whole checkpoint came down
+    again during the user's first sentence. And pull_models.ps1 fetched 330 MB of
+    Kokoro weights into models/kokoro that no code ever opened, so those came
+    down a second time too and an offline machine could not speak at all.
+    """
+
+    def test_the_prefetch_uses_the_runtime_cache(self, tmp_path: Path) -> None:
+        """One resolver, imported by both, so the two cannot drift again."""
+        import importlib.util
+
+        from jarvis.audio.stt import faster_whisper_cache, whispercpp_cache
+        from jarvis.config import load_config
+
+        spec = importlib.util.spec_from_file_location(
+            "fetch_stt_model", ROOT / "scripts" / "fetch_stt_model.py"
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        config = load_config(tmp_path / "absent.yaml")
+        assert module.faster_whisper_cache(config) == faster_whisper_cache(config)
+        assert module.whispercpp_cache(config) == whispercpp_cache(config)
+
+    def test_the_prefetch_passes_the_cache_to_the_downloader(self) -> None:
+        source = (ROOT / "scripts" / "fetch_stt_model.py").read_text(encoding="utf-8")
+        assert "download_model(model, cache_dir=str(cache))" in source, (
+            "the prefetch is downloading into whatever cache faster-whisper picks"
+        )
+        assert "models_dir=str(models_dir)" in source
+
+    def test_the_kokoro_weights_setup_downloads_are_the_ones_loaded(self) -> None:
+        """pull_models.ps1 names these paths; tts.py has to open them."""
+        script = (ROOT / "scripts" / "pull_models.ps1").read_text(encoding="utf-8")
+        tts = (ROOT / "src" / "jarvis" / "audio" / "tts.py").read_text(encoding="utf-8")
+
+        assert "kokoro\\kokoro-v1_0.pth" in script
+        assert "kokoro-v1_0.pth" in tts, "setup fetches weights tts.py never opens"
+        assert "config.json" in tts
+        assert 'models_dir / "kokoro"' in tts
+
+    def test_the_kokoro_voice_setup_downloads_is_the_one_loaded(self) -> None:
+        """Local weights are only half of offline: the voice is a separate file."""
+        script = (ROOT / "scripts" / "pull_models.ps1").read_text(encoding="utf-8")
+        tts = (ROOT / "src" / "jarvis" / "audio" / "tts.py").read_text(encoding="utf-8")
+
+        assert "kokoro\\voices\\bm_george.pt" in script
+        assert '"voices"' in tts, "setup fetches a voice pack tts.py never opens"

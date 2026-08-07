@@ -24,12 +24,20 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from jarvis.config import SttEngine, load_config
+from jarvis.audio.stt import faster_whisper_cache, whispercpp_cache
+from jarvis.config import JarvisConfig, SttEngine, load_config
 from jarvis.util.platform import has_module
 
 
-def fetch_faster_whisper(model: str) -> int:
-    """Download a faster-whisper checkpoint into the shared cache."""
+def fetch_faster_whisper(model: str, config: JarvisConfig) -> int:
+    """Download a faster-whisper checkpoint into the cache the runtime reads.
+
+    The cache directory comes from ``jarvis.audio.stt`` rather than being
+    computed here. It used to be neither: ``download_model(model)`` with no
+    cache argument fills the default HuggingFace cache, while the runtime passes
+    ``download_root=models/faster-whisper``, so setup downloaded the checkpoint
+    and the first spoken sentence downloaded it again.
+    """
     if not has_module("faster_whisper"):
         print(
             f"faster-whisper is not installed, so {model} cannot be pre-fetched.\n"
@@ -39,9 +47,11 @@ def fetch_faster_whisper(model: str) -> int:
 
     from faster_whisper.utils import download_model
 
-    print(f"fetching faster-whisper {model} ...")
+    cache = faster_whisper_cache(config)
+    cache.mkdir(parents=True, exist_ok=True)
+    print(f"fetching faster-whisper {model} into {cache} ...")
     try:
-        path = download_model(model)
+        path = download_model(model, cache_dir=str(cache))
     except Exception as exc:  # noqa: BLE001 - network, disk, and auth all land here
         print(f"could not fetch {model}: {exc}")
         return 1
@@ -49,7 +59,7 @@ def fetch_faster_whisper(model: str) -> int:
     return 0
 
 
-def fetch_whispercpp(model: str) -> int:
+def fetch_whispercpp(model: str, config: JarvisConfig) -> int:
     """Download a whisper.cpp checkpoint.
 
     pywhispercpp fetches on first construction and offers no separate download
@@ -65,9 +75,11 @@ def fetch_whispercpp(model: str) -> int:
 
     from pywhispercpp.model import Model
 
-    print(f"fetching whisper.cpp {model} ...")
+    models_dir = whispercpp_cache(config)
+    models_dir.mkdir(parents=True, exist_ok=True)
+    print(f"fetching whisper.cpp {model} into {models_dir} ...")
     try:
-        Model(model)
+        Model(model, models_dir=str(models_dir))
     except Exception as exc:  # noqa: BLE001
         print(f"could not fetch {model}: {exc}")
         return 1
@@ -92,8 +104,8 @@ def main(argv: list[str] | None = None) -> int:
         f"tier {config.effective_tier()}: {engine} {model} on {device} ({compute_type})"
     )
     if engine is SttEngine.WHISPERCPP:
-        return fetch_whispercpp(model)
-    return fetch_faster_whisper(model)
+        return fetch_whispercpp(model, config)
+    return fetch_faster_whisper(model, config)
 
 
 if __name__ == "__main__":
