@@ -318,3 +318,94 @@ class TestUiServer:
             bus.emit(EventType.STATE_CHANGED, state="listening")
             await asyncio.sleep(0.2)
             assert server.is_running is True
+
+
+class TestOnlyTheHudMayConnect:
+    """A WebSocket handshake is exempt from the same origin policy.
+
+    There is no preflight and no CORS, so binding to 127.0.0.1 keeps nothing out
+    of a browser: any page the user has open, down to an ad in an iframe, can
+    open ws://127.0.0.1:8765. What this socket sends is the live microphone
+    transcript, the reply, the rolling history, and the confirmation prompts for
+    mutating actions. Unrestricted, it is a transcript exfiltration channel that
+    is on by default, which breaks §0.1 more thoroughly than a cloud call would.
+
+    The whole suite passed with it open, because every test connected from the
+    same process and none of them sent an Origin header.
+    """
+
+    async def _connect(self, port: int, origin: str | None) -> dict[str, Any]:
+        extra = {"additional_headers": {"Origin": origin}} if origin is not None else {}
+        async with websockets.connect(f"ws://127.0.0.1:{port}", **extra) as ws:
+            return dict(json.loads(await asyncio.wait_for(ws.recv(), timeout=3.0)))
+
+    @pytest.mark.parametrize(
+        "origin",
+        [
+            "https://evil.example.com",
+            "http://evil.example.com",
+            "http://localhost:3000",
+            "null",
+            "file://",
+        ],
+    )
+    async def test_a_web_page_cannot_read_the_transcript(
+        self, ui_config: JarvisConfig, bus: EventBus, origin: str
+    ) -> None:
+        with UiServer(ui_config, bus) as server:
+            server.state.transcript = "my passphrase is hunter2"
+            with pytest.raises(websockets.exceptions.InvalidStatus):
+                await self._connect(server.port, origin)
+
+    @pytest.mark.parametrize(
+        "origin", ["tauri://localhost", "http://tauri.localhost", "https://tauri.localhost"]
+    )
+    async def test_the_tauri_shell_still_connects(
+        self, ui_config: JarvisConfig, bus: EventBus, origin: str
+    ) -> None:
+        with UiServer(ui_config, bus) as server:
+            server.state.state = "listening"
+            assert (await self._connect(server.port, origin))["state"] == "listening"
+
+    async def test_a_client_with_no_origin_still_connects(
+        self, ui_config: JarvisConfig, bus: EventBus
+    ) -> None:
+        """Every non browser client sends none, and a browser always sends one."""
+        with UiServer(ui_config, bus) as server:
+            server.state.state = "idle"
+            assert (await self._connect(server.port, None))["state"] == "idle"
+
+    async def test_originless_clients_can_be_refused_too(
+        self, tmp_path: Any, bus: EventBus
+    ) -> None:
+        config = load_config(
+            tmp_path / "absent.yaml",
+            ui={"port": 0, "host": "127.0.0.1", "allow_originless": False},
+        )
+        with UiServer(config, bus) as server, pytest.raises(websockets.exceptions.InvalidStatus):
+            await self._connect(server.port, None)
+
+    async def test_a_star_disables_the_check_loudly(
+        self, tmp_path: Any, bus: EventBus, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An escape hatch has to exist, and has to say what it costs."""
+        import logging
+
+        config = load_config(
+            tmp_path / "absent.yaml",
+            ui={"port": 0, "host": "127.0.0.1", "allowed_origins": ["*"]},
+        )
+        with caplog.at_level(logging.WARNING), UiServer(config, bus) as server:
+            frame = await self._connect(server.port, "https://evil.example.com")
+        assert frame["ts"] > 0
+        assert any("allowed_origins" in record.message for record in caplog.records)
+
+    def test_the_default_allowlist_has_no_wildcard(self) -> None:
+        assert "*" not in JarvisConfig().ui.allowed_origins
+
+    def test_the_allowlist_accepts_a_comma_separated_string(self, tmp_path: Any) -> None:
+        """YAML and environment variables both hand it over as one string."""
+        config = load_config(
+            tmp_path / "absent.yaml", ui={"allowed_origins": "tauri://localhost, http://a.b"}
+        )
+        assert config.ui.allowed_origins == ("tauri://localhost", "http://a.b")

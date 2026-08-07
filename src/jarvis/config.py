@@ -405,6 +405,33 @@ class UiConfig(_Section):
     accent_color: str = "#22d3ee"
     #: Sparkline history depth in the HUD.
     metrics_history: int = Field(default=60, ge=10, le=600)
+    #: Browser origins allowed to open the HUD socket.
+    #:
+    #: This is a security control, not a convenience. WebSocket handshakes are
+    #: exempt from the same origin policy, so binding to 127.0.0.1 keeps nothing
+    #: out of a browser: any page the user has open, including an ad frame, can
+    #: connect to localhost and read the live transcript. The entries below are
+    #: the origins the Tauri shell actually loads from. Adding "*" disables the
+    #: check and hands every website a microphone feed.
+    allowed_origins: tuple[str, ...] = (
+        "tauri://localhost",
+        "http://tauri.localhost",
+        "https://tauri.localhost",
+        "http://localhost:1420",
+    )
+    #: Whether to accept connections that send no Origin header at all, which is
+    #: every non browser client: the Tauri sidecar, tests, and a debugging
+    #: script. A browser always sends one, so this does not weaken the control
+    #: above. Turn it off to require a browser origin.
+    allow_originless: bool = True
+
+    @field_validator("allowed_origins", mode="before")
+    @classmethod
+    def _coerce_origins(cls, value: Any) -> Any:
+        """Accept a single string or a comma separated list from YAML or env."""
+        if isinstance(value, str):
+            return tuple(part.strip() for part in value.split(",") if part.strip())
+        return value
 
     @field_validator("accent_color")
     @classmethod

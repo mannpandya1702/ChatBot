@@ -46,7 +46,16 @@ class TestFullyLocal:
 
     #: The only hosts the runtime may name. SearXNG and Home Assistant are
     #: user-supplied at runtime and are never hardcoded.
-    ALLOWED = re.compile(r"^https?://(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?/?$")
+    #:
+    #: ``tauri.localhost`` is the origin the Tauri webview serves the bundled
+    #: HUD from on Windows. It names the app's own asset protocol, resolves to
+    #: nothing on the network, and appears here only in the socket's origin
+    #: allowlist, so permitting it grants no cloud access. It is spelled out
+    #: rather than covered by a looser pattern precisely so that a real host
+    #: cannot slip in beside it.
+    ALLOWED = re.compile(
+        r"^https?://(localhost|127\.0\.0\.1|0\.0\.0\.0|tauri\.localhost)(:\d+)?/?$"
+    )
 
     def test_no_remote_url_in_the_runtime_tree(self) -> None:
         offenders: list[str] = []

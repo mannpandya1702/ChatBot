@@ -278,6 +278,7 @@ class UiServer:
             self._config.ui.port,
             ping_interval=20,
             ping_timeout=20,
+            origins=self._allowed_origins(),
         ) as server:
             self._server = server
             for sock in server.sockets or []:
@@ -289,6 +290,42 @@ class UiServer:
             )
             self._ready.set()
             await self._pump()
+
+    def _allowed_origins(self) -> list[Any] | None:
+        """Which browser origins may open this socket.
+
+        Binding to 127.0.0.1 is not access control here. A WebSocket handshake
+        is exempt from the same origin policy: there is no preflight and no
+        CORS, so any page the user has open, down to an ad in an iframe, can
+        connect to ws://127.0.0.1:8765 and read whatever is broadcast. What
+        this socket broadcasts is the live microphone transcript, the reply, the
+        rolling history, and the confirmation prompts for mutating actions. An
+        unrestricted one is a transcript exfiltration channel that is on by
+        default, which is a worse breach of §0.1 than any cloud call.
+
+        ``websockets`` matches a missing Origin against ``None``, which is what
+        every non browser client sends. That entry is configurable but on by
+        default, because the Tauri shell and every debugging script rely on it
+        and a browser always sends an Origin.
+
+        Returns:
+            The allowlist, or None to accept anything, which only happens when
+            the config explicitly asks for it.
+        """
+        ui = self._config.ui
+        # websockets types an origin as a NewType over str. Casting rather than
+        # importing it keeps this module free of a websockets import at module
+        # scope, which §0b requires.
+        origins: list[Any] = [origin for origin in ui.allowed_origins if origin != "*"]
+        if "*" in ui.allowed_origins:
+            _log.warning(
+                "ui.allowed_origins contains *, so any website the user visits can read "
+                "the transcript from this socket"
+            )
+            return None
+        if ui.allow_originless:
+            origins.append(None)
+        return origins
 
     async def _handle_client(self, websocket: Any) -> None:
         """Serve one HUD client until it disconnects."""

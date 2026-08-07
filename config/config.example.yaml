@@ -166,6 +166,20 @@ ui:
                                # bottom-left | bottom-center | bottom-right
   accent_color: "#22d3ee"
   metrics_history: 60
+  # Which browser origins may open the HUD socket. This is a security control.
+  # A WebSocket handshake is exempt from the same origin policy, so binding to
+  # 127.0.0.1 keeps nothing out of a browser: without this list, any page the
+  # user has open can connect and read the live microphone transcript. The
+  # defaults are the origins the Tauri shell loads from. Setting "*" turns the
+  # check off and hands every website a transcript feed.
+  allowed_origins:
+    - tauri://localhost
+    - http://tauri.localhost
+    - https://tauri.localhost
+    - http://localhost:1420   # vite dev server, only used when developing the HUD
+  # Accept clients that send no Origin header, which is every non browser client.
+  # A browser always sends one, so this does not weaken the list above.
+  allow_originless: true
 
 # ---------------------------------------------------------------------------
 # Elevated sidecar. Required for CPU temperatures, fan speeds, and the pending
