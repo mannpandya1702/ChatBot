@@ -54,6 +54,7 @@ __all__ = [
     "TtsConfig",
     "UiConfig",
     "VadConfig",
+    "VoiceProfile",
     "WakeConfig",
     "config_file_path",
     "get_config",
@@ -88,6 +89,24 @@ class SttEngine(StrEnum):
     AUTO = "auto"
     FASTER_WHISPER = "faster-whisper"
     WHISPERCPP = "whispercpp"
+
+
+class VoiceProfile(StrEnum):
+    """Post-processing applied to Kokoro's output.
+
+    Kokoro gives the accent and the register; the profile is what turns a human
+    reading British English into the voice from the films. See
+    :mod:`jarvis.audio.effects` for what each one is made of.
+    """
+
+    #: Raw synthesis, nothing applied.
+    NONE = "none"
+    #: Broadcast polish. No synthetic character.
+    CLEAN = "clean"
+    #: Metallic resonance, detuned double, short dark plate, flat compression.
+    JARVIS = "jarvis"
+    #: The same idea pushed towards the machine.
+    ROBOT = "robot"
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,6 +330,11 @@ class TtsConfig(_Section):
     max_chunk_chars: int = Field(default=240, ge=20, le=2_000)
     #: Playback must die within this many milliseconds of stop() (§7 T-1.5).
     stop_latency_ms: int = Field(default=100, ge=10, le=1_000)
+    #: Which voice character to apply after synthesis. "jarvis" is the point of
+    #: the assistant, so it is the default; "none" gives raw Kokoro back.
+    effect_profile: VoiceProfile = VoiceProfile.JARVIS
+    #: How far the profile is dialled in. 0.0 bypasses the rack entirely.
+    effect_intensity: float = Field(default=0.75, ge=0.0, le=1.0)
 
 
 class LlmConfig(_Section):

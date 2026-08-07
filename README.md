@@ -237,6 +237,42 @@ everything else keeps working.
 
 ---
 
+## The voice
+
+Kokoro supplies the accent and the register. What makes it sound like the assistant rather than
+like a person reading British English is a small effects rack applied to every synthesised chunk:
+a metallic comb resonance, a second copy of the voice detuned against the first, a short dark
+plate, and compression flat enough that it never sounds like it is breathing.
+
+Four profiles, set under `tts.effect_profile`:
+
+| Profile | What it is |
+|---|---|
+| `none` | Raw Kokoro. A person reading. |
+| `clean` | Broadcast polish only. Rumble out, presence up, level held steady. |
+| `jarvis` | The default. Metallic resonance, detuned double, short dark plate. |
+| `robot` | The same pushed towards the machine. Deeper modulation, tighter comb. |
+
+`tts.effect_intensity` dials the profile between 0.0 and 1.0. Zero is a genuine bypass, not a
+neutral setting. Hear all of them before choosing:
+
+```powershell
+uv run --extra tts python scripts/preview_voice.py
+```
+
+That writes a WAV per profile into `build/voice-preview`, all from a single Kokoro take, so the
+only difference between the files is the processing.
+
+Two things about the rack are worth knowing because they are easy to assume are broken. It
+measures itself at startup and trims its own output, so switching profiles changes the character
+and not the volume. And it is numpy only, costing single digit milliseconds per sentence, so it
+does not eat into the time-to-first-audio budget.
+
+Changing the voice itself rather than its processing is `tts.voice`. The British male Kokoro
+voices are `bm_george` (default), `bm_daniel`, `bm_lewis`, and `bm_fable`.
+
+---
+
 ## The HUD
 
 ```powershell

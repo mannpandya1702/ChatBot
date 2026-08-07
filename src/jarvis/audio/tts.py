@@ -20,6 +20,7 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 
+from jarvis.audio.effects import VoiceEffect, build_voice_effect
 from jarvis.config import JarvisConfig
 from jarvis.util.errors import TtsError
 from jarvis.util.platform import require_module
@@ -185,21 +186,36 @@ class SentenceChunker:
 
 
 class KokoroSynthesizer:
-    """Kokoro-82M text to speech.
+    """Kokoro-82M text to speech, followed by the JARVIS voice rack.
+
+    Kokoro supplies the accent and the register. What makes the output sound
+    like the assistant rather than like a person reading is
+    :mod:`jarvis.audio.effects`, applied to every chunk on the way out. It is
+    part of the voice, not a decoration, so it lives here rather than in the
+    player: anything that asks this class to speak gets the same voice.
 
     Args:
-        config: Supplies the voice, language code, speed, and sample rate.
+        config: Supplies the voice, language code, speed, sample rate, and
+            which effect profile to apply.
         pipeline: A preloaded Kokoro pipeline. Tests inject a fake, so nothing
             here needs the real 82M model or its weights.
+        effect: An override for the voice rack. Defaults to whatever the config
+            asks for; pass a bypassed one to hear raw synthesis.
     """
 
-    def __init__(self, config: JarvisConfig, pipeline: Any | None = None) -> None:
+    def __init__(
+        self,
+        config: JarvisConfig,
+        pipeline: Any | None = None,
+        effect: VoiceEffect | None = None,
+    ) -> None:
         self._config = config
         self._pipeline = pipeline
         self._voice = config.tts.voice
         self._lang_code = config.tts.lang_code
         self._speed = config.tts.speed
         self._sample_rate = config.tts.sample_rate
+        self._effect = effect if effect is not None else build_voice_effect(config)
 
     @property
     def sample_rate(self) -> int:
@@ -210,6 +226,21 @@ class KokoroSynthesizer:
     def voice(self) -> str:
         """The configured voice."""
         return self._voice
+
+    @property
+    def effect(self) -> VoiceEffect:
+        """The voice rack applied after synthesis."""
+        return self._effect
+
+    def begin_utterance(self) -> None:
+        """Start a fresh reply.
+
+        Clears the rack's delay lines so the previous reply's reverb tail does
+        not lead into this one. Within a reply the state is deliberately kept:
+        sentences are synthesised separately but played back to back, and
+        resetting between them would click on every full stop.
+        """
+        self._effect.reset()
 
     @property
     def is_loaded(self) -> bool:
@@ -265,7 +296,8 @@ class KokoroSynthesizer:
 
         if not pieces:
             return np.zeros(0, dtype=np.float32)
-        return np.concatenate(pieces).astype(np.float32, copy=False)
+        raw = np.concatenate(pieces).astype(np.float32, copy=False)
+        return self._effect.process(raw)
 
     def stream(self, chunks: Iterable[str]) -> Iterator[Samples]:
         """Synthesise chunks lazily, yielding each as soon as it is ready.
@@ -273,7 +305,11 @@ class KokoroSynthesizer:
         Laziness is the point: the caller can start playing the first chunk
         while this generator is still working on the second, which is what keeps
         time to first audio inside the §3 budget.
+
+        Treated as one utterance, so the voice rack is reset once at the start
+        and then carries its state across the chunks.
         """
+        self.begin_utterance()
         for chunk in chunks:
             audio = self.synthesize(chunk)
             if audio.size:
@@ -307,6 +343,11 @@ def _extract_audio(result: Any) -> Samples | None:
     return array.reshape(-1) if array.ndim > 1 else array
 
 
-def build_synthesizer(config: JarvisConfig, *, pipeline: Any | None = None) -> KokoroSynthesizer:
-    """Build the configured synthesiser."""
-    return KokoroSynthesizer(config, pipeline=pipeline)
+def build_synthesizer(
+    config: JarvisConfig,
+    *,
+    pipeline: Any | None = None,
+    effect: VoiceEffect | None = None,
+) -> KokoroSynthesizer:
+    """Build the configured synthesiser, voice rack included."""
+    return KokoroSynthesizer(config, pipeline=pipeline, effect=effect)

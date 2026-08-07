@@ -106,6 +106,14 @@ tts:
   min_chunk_chars: 24
   max_chunk_chars: 240
   stop_latency_ms: 100
+  # Voice character applied after synthesis. Kokoro gives the accent, this gives
+  # the machine. Preview them all with: uv run python scripts/preview_voice.py
+  #   none    raw Kokoro, a person reading British English
+  #   clean   broadcast polish only, no synthetic character
+  #   jarvis  metallic resonance, detuned double, short dark plate
+  #   robot   the same pushed further towards the machine
+  effect_profile: jarvis
+  effect_intensity: 0.75    # 0.0 bypasses the rack entirely, 1.0 is full strength
 
 # ---------------------------------------------------------------------------
 # Local LLM via Ollama. model null inherits from the hardware tier profile.

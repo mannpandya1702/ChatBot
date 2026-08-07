@@ -79,10 +79,19 @@ class FakeTranscriber:
 
 
 class FakeSynth:
-    """Produces a short buffer per chunk and records what it was asked to say."""
+    """Produces a short buffer per chunk and records what it was asked to say.
+
+    Carries ``begin_utterance`` as well as ``synthesize`` because the loop calls
+    both: the voice rack has to be told where one reply ends and the next
+    begins, or the previous answer's reverb tail leads into this one.
+    """
 
     def __init__(self) -> None:
         self.said: list[str] = []
+        self.utterances = 0
+
+    def begin_utterance(self) -> None:
+        self.utterances += 1
 
     def synthesize(self, text: str) -> Any:
         self.said.append(text)
@@ -195,7 +204,63 @@ def _wire(assistant: Assistant, config: JarvisConfig, utterances: list[str]) -> 
     return {"llm": llm, "synth": synth, "transcriber": transcriber, "streams": streams}
 
 
+class TestTheFakesMatchTheRealThing:
+    """Pin the fakes to the interfaces they stand in for.
+
+    Every fake in this module exists so the loop can be tested without a GPU or
+    a microphone, and each one is a copy of an interface that is free to drift
+    away from it. When the loop started resetting the voice rack between
+    replies, ``FakeSynth`` did not grow the method and the audio worker crashed
+    in a restart loop, which the loop tests could only report as "no response
+    was produced". A missing method should say so.
+    """
+
+    def test_the_synthesiser_fake_is_complete(self) -> None:
+        """Read what the loop calls out of the loop, rather than listing it here.
+
+        A hand written list is the same drift one level up: it would have to be
+        remembered too. This walks ``main.py`` for every ``self._synth.x`` and
+        demands the fake have each one.
+        """
+        import ast
+        import inspect
+
+        from jarvis import main as main_module
+        from jarvis.audio.tts import KokoroSynthesizer
+
+        tree = ast.parse(inspect.getsource(main_module))
+        called = {
+            node.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == "_synth"
+            and isinstance(node.value.value, ast.Name)
+            and node.value.value.id == "self"
+        }
+        assert called, "found no calls on self._synth, so this test proves nothing"
+
+        real = {name for name in called if hasattr(KokoroSynthesizer, name)}
+        missing = {name for name in real if not hasattr(FakeSynth, name)}
+        assert not missing, f"the loop calls {sorted(missing)} but FakeSynth has no such method"
+
+
 class TestFullLoop:
+    def test_each_reply_starts_a_fresh_utterance(self, config: JarvisConfig) -> None:
+        """Otherwise the previous answer's reverb tail leads into this one."""
+        assistant = Assistant(config, headless=True)
+        parts = _wire(assistant, config, ["how busy is the cpu"])
+
+        answered = threading.Event()
+        assistant.bus.subscribe(lambda _e: answered.set(), [EventType.RESPONSE])
+
+        try:
+            assistant.start()
+            assert answered.wait(15), "no response was produced"
+            assert parts["synth"].utterances >= 1
+        finally:
+            assistant.stop()
+
     def test_a_spoken_question_produces_a_spoken_answer(self, config: JarvisConfig) -> None:
         """The whole path: capture, endpoint, transcribe, think, speak."""
         assistant = Assistant(config, headless=True)

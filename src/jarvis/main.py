@@ -239,6 +239,10 @@ class Assistant:
                         break
                     continue
 
+                # One reply is one utterance for the voice rack: its delay lines
+                # carry across the sentences within a reply, but the previous
+                # reply's tail must not lead into this one.
+                self._synth.begin_utterance()
                 self._orchestrator.run_turn(text, speak=self._speak)
                 self._player.wait(timeout=self.config.orchestrator.max_turn_seconds)
                 # Each answered question extends the window, so a follow-up

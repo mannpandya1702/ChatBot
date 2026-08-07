@@ -23,9 +23,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from jarvis.audio.effects import VoiceEffect
 from jarvis.audio.stt import FasterWhisperTranscriber, build_transcriber
 from jarvis.audio.tts import build_synthesizer
-from jarvis.config import JarvisConfig, load_config
+from jarvis.config import JarvisConfig, VoiceProfile, load_config
 from jarvis.util.platform import has_module
 
 pytestmark = pytest.mark.manual
@@ -161,6 +162,48 @@ class TestTheTwoEnginesAgree:
         assert transcript.language == "en"
         assert transcript.segments, "no segments, so no timing information"
         assert transcript.duration_s == pytest.approx(speech.size / WHISPER_RATE, abs=0.5)
+
+
+@needs_tts
+@needs_stt
+class TestTheVoiceRackKeepsTheWords:
+    """Every voice profile, transcribed back, against the raw voice.
+
+    The unit tests in ``tests/test_effects.py`` pin the mechanism: the ring
+    modulator only touches the low band, so the formants survive. This is the
+    claim that mechanism exists to support, measured the only way it can
+    honestly be measured, by asking a transcriber what it heard.
+
+    It matters because the failure is silent. An over-processed voice does not
+    throw, does not clip, and passes every DSP invariant. It just stops being
+    understood, and the only way that shows up otherwise is a user saying the
+    assistant sounds wrong.
+    """
+
+    def _heard(self, config: JarvisConfig, profile: VoiceProfile) -> set[str]:
+        effect = VoiceEffect(config.tts.sample_rate, profile, intensity=1.0)
+        synth = build_synthesizer(config, effect=effect)
+        speech = _resample(synth.synthesize(SPOKEN), synth.sample_rate, WHISPER_RATE)
+        transcript = build_transcriber(config).transcribe(speech, sample_rate=WHISPER_RATE)
+        return set(transcript.text.lower().replace(".", "").replace("?", "").split())
+
+    @pytest.mark.parametrize(
+        "profile", [VoiceProfile.CLEAN, VoiceProfile.JARVIS, VoiceProfile.ROBOT]
+    )
+    def test_a_profile_does_not_cost_more_than_a_word(
+        self, live_config: JarvisConfig, profile: VoiceProfile
+    ) -> None:
+        said = set(SPOKEN.lower().replace(".", "").split())
+        dry = self._heard(live_config, VoiceProfile.NONE) & said
+        wet = self._heard(live_config, profile) & said
+
+        # Against the raw voice rather than against the script, because tiny.en
+        # mishears a word or two of the raw voice too and that is not the rack's
+        # fault. What is being asserted is that processing does not make it
+        # worse. Full band ring modulation used to cost four words here.
+        assert len(wet) >= len(dry) - 1, (
+            f"{profile} lost {sorted(dry - wet)}; heard {sorted(wet)} against {sorted(dry)}"
+        )
 
 
 needs_vad = pytest.mark.skipif(
