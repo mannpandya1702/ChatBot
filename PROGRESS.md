@@ -221,6 +221,14 @@ npm run tauri build
 Pass: the build succeeds and the window renders transparent over the desktop with no frame and no
 taskbar entry. Clicking through to the desktop works everywhere except the drag handle.
 
+The compile and bundle half of this is no longer unverified: `npm run build` and a full
+`cargo build --release` both run in CI here and produce a `jarvis-hud` binary, so a code error in
+the shell or the frontend is caught before you see it. What still needs the Windows host is
+everything the Linux build cannot exercise: WebView2 rather than webkit2gtk, the MSI and NSIS
+bundling, and every visual claim above. The click-through behaviour in particular is worth
+watching closely, because it was completely broken until this pass and the fix polls the cursor
+rather than reacting to events.
+
 **M-7. Orb and panels (T-3.3, T-3.4)**
 Run JARVIS and watch the orb through idle, listening, thinking, speaking, and an induced error.
 Pass: each state has a visibly distinct palette, the orb reacts to your voice amplitude, and the
