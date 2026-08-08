@@ -404,6 +404,8 @@ All 23 confirmed findings are closed.
 |---|---|---|
 | 24 | high | The wake phrase reached the model as the question. Fix 5 above prepends the pre-roll so the front of a request is not clipped, which also puts "hey jarvis" inside the audio sent to STT, and nothing removed it. Pause between the trigger and the question and the utterance is the trigger alone: the machine transcribed "Hey, Jardubyse." and answered that. `strip_wake_word` now takes the phrase off the front, fuzzily, because the transcriber has no reason to know the word; an utterance that was nothing but the trigger listens again instead of answering, on the same ring cursor so the question the user is already speaking is not lost, and inside the caller's own deadline so §6's fifteen second confirmation window is unchanged. |
 
+| 25 | high | Qwen3 was thinking anyway, and the deliberation was generated before being discarded. `think: false` goes in the request body and `ReasoningFilter` catches the inline `<think>` that an Ollama or a template which ignores that key still emits, so the reasoning never reaches the ear, the transcript, or the first-token measurement. It reaches the clock: on the `cpu` tier at a few tokens a second a couple of hundred thrown-away tokens is fifteen seconds of silence before the answer starts, which is what "it replies late" sounds like. The wire payload now also carries Qwen3's own `/no_think` switch on the last user turn, and a turn that discards reasoning says so at info with the character count and the seconds it cost. |
+
 ### Notes
 
 * Two tests in this repo asserted bugs as correct behaviour and so kept them

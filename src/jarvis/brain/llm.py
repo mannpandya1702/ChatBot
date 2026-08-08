@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -75,6 +76,50 @@ REASONING_TAGS: tuple[tuple[str, str], ...] = (
     ("<think>", "</think>"),
     ("<thinking>", "</thinking>"),
 )
+
+
+#: Qwen3's in-prompt switches for its thinking mode. The API parameter is the
+#: right way to ask and these are the fallback for when it is not honoured.
+_THINK_SWITCH = {True: "/think", False: "/no_think"}
+
+#: Models that read the switches above. Matched loosely against the model name,
+#: so ``qwen3:4b``, ``qwen3:8b-q4_K_M`` and a local retag all count. Anything
+#: else never sees the string: on a model whose template does not strip it, a
+#: stray ``/no_think`` is just a line of nonsense in the prompt.
+_SWITCHABLE_MODELS = ("qwen3",)
+
+
+def _switch_thinking(
+    messages: Sequence[dict[str, Any]], model: str, *, thinking: bool
+) -> list[dict[str, Any]]:
+    """Add Qwen3's thinking switch to the last user turn.
+
+    Belt and braces for the failure :class:`ReasoningFilter` was written
+    against. ``think`` in the request body is the documented control, but an
+    older Ollama ignores an unknown key and a model whose template does not read
+    it thinks anyway. The filter catches the result, so the deliberation is
+    never spoken, and that is the point: it is generated, and then thrown away.
+    On the ``cpu`` tier at a few tokens a second a couple of hundred discarded
+    tokens is fifteen seconds of silence before the answer starts, which is what
+    "it replies late" sounds like from the outside.
+
+    The switch goes on the last user message because that is what Qwen3's
+    template scans for. Applied to the wire payload only, so conversation memory
+    keeps what the user actually said.
+    """
+    conversation = [dict(m) for m in messages]
+    if not any(tag in model.lower() for tag in _SWITCHABLE_MODELS):
+        return conversation
+    switch = _THINK_SWITCH[thinking]
+    for message in reversed(conversation):
+        if message.get("role") != "user":
+            continue
+        content = str(message.get("content") or "")
+        if _THINK_SWITCH[True] in content or _THINK_SWITCH[False] in content:
+            return conversation
+        message["content"] = f"{content} {switch}".strip()
+        return conversation
+    return conversation
 
 
 def _pending_prefix(text: str, tags: Sequence[str]) -> int:
@@ -303,9 +348,12 @@ class OllamaClient:
     ) -> dict[str, Any]:
         """Build the /api/chat request body."""
         llm = self._config.llm
+        name = model or self._config.llm_model()
+        # Qwen3 thinking costs time to first token, so it is opt in (§3).
+        thinking = llm.think if think is None else think
         body: dict[str, Any] = {
-            "model": model or self._config.llm_model(),
-            "messages": list(messages),
+            "model": name,
+            "messages": _switch_thinking(messages, name, thinking=thinking),
             "stream": stream,
             "keep_alive": llm.keep_alive,
             "options": {
@@ -315,8 +363,7 @@ class OllamaClient:
                 "num_predict": llm.num_predict,
             },
         }
-        # Qwen3 thinking costs time to first token, so it is opt in (§3).
-        body["think"] = llm.think if think is None else think
+        body["think"] = thinking
         if tools:
             body["tools"] = list(tools)
         return body
@@ -355,6 +402,8 @@ class OllamaClient:
             malformed = False
             finished = False
             reasoning = ReasoningFilter()
+            discarded = 0
+            started = time.perf_counter()
 
             for chunk, bad in self._stream_once(
                 conversation, tools=tools, model=model, think=think, attempt=attempt
@@ -365,11 +414,7 @@ class OllamaClient:
                 if chunk.done:
                     spoken += reasoning.flush()
                 dropped = reasoning.take_reasoning()
-                if dropped:
-                    _log.debug(
-                        "dropped inline reasoning from the spoken channel",
-                        extra={"context": {"characters": len(dropped)}},
-                    )
+                discarded += len(dropped)
                 if speaking and spoken:
                     said.append(spoken)
 
@@ -390,6 +435,26 @@ class OllamaClient:
                     finished = True
                     break
 
+            if discarded:
+                # At info, not debug. This is time the user waited through for
+                # nothing, and it is invisible from every other angle: the
+                # reasoning never reaches the transcript, the HUD, or the
+                # first-token measurement. A turn that reads "late for no
+                # reason" in the log is explained by this line and by nothing
+                # else, so it has to be in the log the user actually keeps.
+                _log.info(
+                    "the model produced reasoning that was generated and thrown away",
+                    extra={
+                        "context": {
+                            "characters": discarded,
+                            "seconds": round(time.perf_counter() - started, 2),
+                            "model": model or self._config.llm_model(),
+                            "think_requested": (
+                                self._config.llm.think if think is None else think
+                            ),
+                        }
+                    },
+                )
             if not finished:
                 raise LlmError(
                     "the model's response ended without completing",

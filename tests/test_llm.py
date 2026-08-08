@@ -628,3 +628,130 @@ class TestReasoningNeverReachesTheVoice:
         )
         with _client(cfg, _stream_handler(body)) as client:
             assert client.chat([]).content == "Sixty one degrees."
+
+
+class TestTheThinkingSwitchIsBeltAndBraces:
+    """``think: false`` in the body is the ask. Qwen3's switch is the guarantee.
+
+    ReasoningFilter exists because that request is not always honoured: an older
+    Ollama ignores an unknown key and a model whose template does not read it
+    thinks anyway. The filter keeps the deliberation out of the user's ears, and
+    that is the whole problem: it is generated first, then discarded. On the
+    ``cpu`` tier at a few tokens a second, a couple of hundred thrown-away
+    tokens is fifteen seconds of silence before the answer starts.
+    """
+
+    @staticmethod
+    def _capture(config: JarvisConfig, messages: Any, **kwargs: Any) -> dict[str, Any]:
+        seen: list[dict[str, Any]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(json.loads(request.content))
+            return httpx.Response(200, text=_ndjson({"message": {}, "done": True}))
+
+        with _client(config, handler) as client:
+            list(client.chat_stream(messages, **kwargs))
+        return seen[0]
+
+    @staticmethod
+    def _config(tmp_path: Path, model: str, **llm: Any) -> JarvisConfig:
+        return load_config(tmp_path / "absent.yaml", llm={"model": model, **llm})
+
+    def test_qwen3_is_told_not_to_think_in_the_prompt_as_well(
+        self, tmp_path: Path
+    ) -> None:
+        body = self._capture(
+            self._config(tmp_path, "qwen3:4b"),
+            [{"role": "user", "content": "what time is it"}],
+        )
+        assert body["think"] is False
+        assert body["messages"][-1]["content"] == "what time is it /no_think"
+
+    def test_asking_for_thinking_switches_it_on_in_both_places(
+        self, tmp_path: Path
+    ) -> None:
+        body = self._capture(
+            self._config(tmp_path, "qwen3:4b", think=True),
+            [{"role": "user", "content": "plan this out"}],
+        )
+        assert body["think"] is True
+        assert body["messages"][-1]["content"] == "plan this out /think"
+
+    def test_only_the_last_user_turn_carries_it(self, tmp_path: Path) -> None:
+        """Qwen3's template reads the most recent one, and repeats add nothing."""
+        body = self._capture(
+            self._config(tmp_path, "qwen3:4b"),
+            [
+                {"role": "system", "content": "you are jarvis"},
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "answered"},
+                {"role": "user", "content": "second"},
+            ],
+        )
+        contents = [m["content"] for m in body["messages"]]
+        assert contents == ["you are jarvis", "first", "answered", "second /no_think"]
+
+    def test_a_model_that_does_not_read_the_switch_never_sees_it(
+        self, tmp_path: Path
+    ) -> None:
+        """On a template that does not strip it, the string is prompt noise."""
+        body = self._capture(
+            self._config(tmp_path, "llama3.1:8b"),
+            [{"role": "user", "content": "what time is it"}],
+        )
+        assert body["messages"][-1]["content"] == "what time is it"
+
+    def test_a_switch_the_user_already_wrote_is_left_alone(self, tmp_path: Path) -> None:
+        """Saying "/think" out loud should not be overruled by the default."""
+        body = self._capture(
+            self._config(tmp_path, "qwen3:4b"),
+            [{"role": "user", "content": "work through this /think"}],
+        )
+        assert body["messages"][-1]["content"] == "work through this /think"
+
+    def test_a_conversation_with_no_user_turn_is_untouched(self, tmp_path: Path) -> None:
+        body = self._capture(
+            self._config(tmp_path, "qwen3:4b"), [{"role": "system", "content": "hello"}]
+        )
+        assert body["messages"] == [{"role": "system", "content": "hello"}]
+
+    def test_the_caller_s_messages_are_not_modified(self, tmp_path: Path) -> None:
+        """Memory keeps what was said, not what went on the wire."""
+        messages = [{"role": "user", "content": "what time is it"}]
+        self._capture(self._config(tmp_path, "qwen3:4b"), messages)
+        assert messages == [{"role": "user", "content": "what time is it"}]
+
+    def test_discarded_reasoning_is_reported_at_info(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Otherwise a turn that was slow for this reason looks slow for none.
+
+        The reasoning reaches no transcript, no HUD, and not the first-token
+        measurement, so at debug level the cost of it is invisible in the only
+        log the user keeps.
+        """
+        body = _ndjson(
+            {"message": {"content": "<think>weighing it up</think>"}, "done": False},
+            {"message": {"content": "It is four."}, "done": True},
+        )
+        with (
+            caplog.at_level("INFO", logger="jarvis.brain.llm"),
+            _client(self._config(tmp_path, "qwen3:4b"), _stream_handler(body)) as client,
+        ):
+            spoken = "".join(c.content for c in client.chat_stream([]))
+
+        assert spoken == "It is four."
+        records = [r for r in caplog.records if "thrown away" in r.getMessage()]
+        assert records, "the discarded reasoning was never reported"
+        assert records[0].context["characters"] == len("weighing it up")  # type: ignore[attr-defined]
+
+    def test_a_turn_with_no_reasoning_says_nothing(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        body = _ndjson({"message": {"content": "It is four."}, "done": True})
+        with (
+            caplog.at_level("INFO", logger="jarvis.brain.llm"),
+            _client(self._config(tmp_path, "qwen3:4b"), _stream_handler(body)) as client,
+        ):
+            list(client.chat_stream([]))
+        assert not [r for r in caplog.records if "thrown away" in r.getMessage()]
