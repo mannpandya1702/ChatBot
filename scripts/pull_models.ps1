@@ -7,7 +7,7 @@
       1. the tier-appropriate Qwen3 model through ollama,
       2. the openWakeWord hey_jarvis model plus its shared feature extractors,
       3. the Silero VAD ONNX graph,
-      4. the Kokoro-82M weights, config, and the bm_george voice,
+      4. the Kokoro-82M weights, config, and the am_onyx and bm_george voices,
       5. the Whisper checkpoint the resolved tier transcribes with,
       6. the spaCy English model Kokoro's phonemiser downloads on first use.
 
@@ -151,11 +151,18 @@ $FileDownloads = @(
         Hint         = 'Voice pack metadata.'
     },
     [pscustomobject]@{
+        Label        = 'Kokoro voice am_onyx'
+        Relative     = 'kokoro\voices\am_onyx.pt'
+        Urls         = @("$KokoroRepo/voices/am_onyx.pt")
+        MinimumBytes = 4096
+        Hint         = 'The voice tts.voice defaults to. Change both together.'
+    },
+    [pscustomobject]@{
         Label        = 'Kokoro voice bm_george'
         Relative     = 'kokoro\voices\bm_george.pt'
         Urls         = @("$KokoroRepo/voices/bm_george.pt")
         MinimumBytes = 4096
-        Hint         = 'The British butler voice named in CLAUDE.md section 9.'
+        Hint         = 'The British alternative. Half a megabyte, worth having to compare.'
     }
 )
 

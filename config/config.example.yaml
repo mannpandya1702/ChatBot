@@ -110,8 +110,15 @@ stt:
 # ---------------------------------------------------------------------------
 tts:
   enabled: true
-  voice: bm_george
-  lang_code: b              # "b" is British English, matching the bm_* voices.
+  voice: am_onyx            # Kokoro names voices <lang><gender>_<name>. Male English:
+                            #   am_onyx am_adam am_michael am_eric am_liam am_echo
+                            #   am_fenrir am_puck   (American)
+                            #   bm_george bm_daniel bm_lewis bm_fable  (British)
+                            # Compare them all through the same rack with:
+                            #   uv run --extra tts python scripts/preview_voice.py \
+                            #     --profile jarvis --voice am_onyx bm_george ...
+  lang_code: null           # Follows the voice prefix. Set it only to read one
+                            # language deliberately in another's accent.
   speed: 1.0
   sample_rate: 24000        # Kokoro emits this and only this. Not adjustable.
   min_chunk_chars: 24

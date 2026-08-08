@@ -28,7 +28,7 @@ class TestDefaults:
     def test_loads_with_no_file_present(self, tmp_path: Path) -> None:
         cfg = load_config(tmp_path / "does-not-exist.yaml")
         assert cfg.persona.assistant_name == "Jarvis"
-        assert cfg.tts.voice == "bm_george"
+        assert cfg.tts.voice == "am_onyx"
         assert cfg.llm.base_url == "http://localhost:11434"
 
     def test_safety_defaults_are_closed(self, tmp_path: Path) -> None:
@@ -104,7 +104,7 @@ class TestYamlLoading:
         assert example.is_file()
         cfg = load_config(example)
         assert cfg.persona.assistant_name == "Jarvis"
-        assert cfg.tts.voice == "bm_george"
+        assert cfg.tts.voice == "am_onyx"
 
     def test_example_file_covers_every_section(self) -> None:
         """Every top-level section in the model must appear in the template."""
@@ -415,3 +415,50 @@ class TestASmallCardStillTranscribes:
                 profile.stt_device,
                 profile.stt_compute_type,
             )
+
+
+class TestTheLanguageCodeFollowsTheVoice:
+    """Kokoro picks its phonemiser from the language code, not the voice name.
+
+    Both have to agree and only one of them is worth thinking about. A British
+    voice given the American phonemiser mispronounces enough words to be
+    obvious, and nothing anywhere reports it: no error, no warning, just a voice
+    that says things slightly wrong. Deriving the code removes the mismatch
+    rather than documenting it.
+    """
+
+    @pytest.mark.parametrize(
+        ("voice", "code"),
+        [
+            ("am_onyx", "a"),
+            ("am_michael", "a"),
+            ("bm_george", "b"),
+            ("bf_emma", "b"),
+            ("jf_alpha", "j"),
+            ("zm_yunxi", "z"),
+            ("if_sara", "i"),
+        ],
+    )
+    def test_it_follows_the_prefix(self, voice: str, code: str) -> None:
+        assert JarvisConfig(tts={"voice": voice}).tts.resolved_lang_code() == code
+
+    def test_an_explicit_code_still_wins(self) -> None:
+        """Reading one language in another's accent is a real, if odd, choice."""
+        config = JarvisConfig(tts={"voice": "am_onyx", "lang_code": "b"})
+        assert config.tts.resolved_lang_code() == "b"
+
+    def test_an_unrecognised_voice_falls_back(self) -> None:
+        """A custom voice pack should synthesise, not raise."""
+        assert JarvisConfig(tts={"voice": "custom"}).tts.resolved_lang_code() == "a"
+
+    def test_the_default_voice_resolves(self) -> None:
+        config = JarvisConfig()
+        assert config.tts.voice == "am_onyx"
+        assert config.tts.resolved_lang_code() == "a"
+
+    def test_the_synthesiser_uses_the_resolved_code(self) -> None:
+        """Reading tts.lang_code directly would now get None."""
+        from jarvis.audio.tts import KokoroSynthesizer
+
+        synth = KokoroSynthesizer(JarvisConfig(tts={"voice": "bm_george"}))
+        assert synth._lang_code == "b"

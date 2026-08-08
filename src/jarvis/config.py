@@ -91,6 +91,12 @@ class SttEngine(StrEnum):
     WHISPERCPP = "whispercpp"
 
 
+#: Language codes Kokoro ships a phonemiser for, which are also the first
+#: character of every voice name it publishes: American and British English,
+#: Spanish, French, Hindi, Italian, Japanese, Portuguese, Chinese.
+_KOKORO_LANG_CODES = frozenset("abefhijpz")
+
+
 class VoiceProfile(StrEnum):
     """Post-processing applied to Kokoro's output.
 
@@ -327,9 +333,17 @@ class TtsConfig(_Section):
     """Kokoro synthesis (§1)."""
 
     enabled: bool = True
-    voice: str = "bm_george"
-    #: Kokoro language code. "b" is British English, which matches bm_* voices.
-    lang_code: str = "b"
+    voice: str = "am_onyx"
+    #: Kokoro language code, which selects the phonemiser rather than the voice.
+    #:
+    #: Left unset it follows the voice's own prefix, because the two have to
+    #: agree and only one of them is worth thinking about. Kokoro names every
+    #: voice ``<lang><gender>_<name>``, so ``am_onyx`` is American and
+    #: ``bm_george`` British; giving a British voice the American phonemiser
+    #: mispronounces enough words to be obvious, and nothing reports it. Set it
+    #: explicitly to override, which is only useful for deliberately reading one
+    #: language in another's accent.
+    lang_code: str | None = None
     speed: float = Field(default=1.0, ge=0.5, le=2.0)
     #: Kokoro emits 24 kHz and nothing else, and every consumer trusts this
     #: number: the player clocks the device with it and the voice rack scales
@@ -350,6 +364,17 @@ class TtsConfig(_Section):
     effect_profile: VoiceProfile = VoiceProfile.JARVIS
     #: How far the profile is dialled in. 0.0 bypasses the rack entirely.
     effect_intensity: float = Field(default=0.75, ge=0.0, le=1.0)
+
+    def resolved_lang_code(self) -> str:
+        """The phonemiser to use, derived from the voice unless set explicitly.
+
+        Returns:
+            A single character Kokoro language code.
+        """
+        if self.lang_code:
+            return self.lang_code
+        prefix = self.voice[:1]
+        return prefix if prefix in _KOKORO_LANG_CODES else "a"
 
 
 class LlmConfig(_Section):

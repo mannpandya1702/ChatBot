@@ -305,6 +305,54 @@ Recorded here rather than silently applied.
 
 ---
 
+---
+
+## Deviation 7: the voice is `am_onyx`, not `bm_george`
+
+§1 and §9 both name `bm_george`, and §7 T-1.8 asks for a "British-butler register". The operator
+listened to all twelve male English voices Kokoro publishes, each through the same effect rack, and
+chose `am_onyx`. §9 is the record of resolved operator configuration rather than a constraint, so
+the shipped default follows the choice and the §9 line is annotated. §1's entry is untouched: it
+locks Kokoro-82M as the component, and the voice is a parameter of it.
+
+Verified rather than assumed, since the rack was tuned against `bm_george`:
+
+    voice am_onyx, lang_code 'a', profile jarvis
+    dry -26.89 dBFS -> wet -25.08 dBFS (delta +1.82 dB), peak 0.488
+      raw kokoro         wer~0.000
+      through the rack   wer~0.000
+
+No re-tuning was needed. The rack calibrates its own level, and it costs this voice nothing
+measurable in intelligibility.
+
+Two consequences were handled:
+
+* `tts.lang_code` now follows the voice's prefix rather than being configured. Kokoro selects its
+  phonemiser from that code, not from the voice, so `am_onyx` with the British phonemiser
+  mispronounces words and reports nothing. Deriving it removes the whole class of mismatch; setting
+  it explicitly still wins, which is only useful for reading one language in another's accent.
+* `pull_models.ps1` fetched `bm_george.pt` only, so the new default would have downloaded its voice
+  from the hub on first speech and failed outright offline. It now fetches both. A voice pack is
+  about half a megabyte. `tests/test_setup_scripts.py` caught this, because it derives the expected
+  filename from `TtsConfig()` rather than hardcoding one.
+
+The persona's wording still says "British butler". That describes word choice and manner, not
+accent, and both still hold; changing it was not asked for. Worth a look if the American voice makes
+the phrasing feel odd.
+
+### Not done: the ElevenLabs voice
+
+The operator first linked an ElevenLabs voice. It cannot be used: §0.1 forbids hosted TTS and API
+keys, §0.2 forbids paid services and accounts, and the voice is proprietary. The API says so
+plainly, without credentials::
+
+    {"detail":{"message":"You must be logged in to fetch more than 3 voices."}}
+
+Cloning it locally is closed off by §1 as well, which rejects XTTS-v2 (CPML), F5-TTS (CC-BY-NC) and
+Fish Speech (CC-BY-NC-SA) by name: every capable local voice-cloning model. Per §10 this was
+reported rather than worked around, and the operator chose a Kokoro voice instead.
+
+
 ## Nine-dimension adversarial review
 
 Run after the first spoken round trip on the Windows host. 64 agents across nine

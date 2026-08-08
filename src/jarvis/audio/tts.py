@@ -212,7 +212,7 @@ class KokoroSynthesizer:
         self._config = config
         self._pipeline = pipeline
         self._voice = config.tts.voice
-        self._lang_code = config.tts.lang_code
+        self._lang_code = config.tts.resolved_lang_code()
         self._speed = config.tts.speed
         self._sample_rate = config.tts.sample_rate
         self._effect = effect if effect is not None else build_voice_effect(config)

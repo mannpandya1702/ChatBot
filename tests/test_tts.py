@@ -210,7 +210,7 @@ class TestSynthesizer:
         assert synth.synthesize("   ").size == 0
 
     def test_the_voice_is_passed_through(self, cfg: JarvisConfig) -> None:
-        assert KokoroSynthesizer(cfg, pipeline=FakePipeline()).voice == "bm_george"
+        assert KokoroSynthesizer(cfg, pipeline=FakePipeline()).voice == "am_onyx"
 
     def test_stream_preserves_order(self, cfg: JarvisConfig) -> None:
         pipeline = FakePipeline()

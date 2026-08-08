@@ -268,8 +268,26 @@ measures itself at startup and trims its own output, so switching profiles chang
 and not the volume. And it is numpy only, costing single digit milliseconds per sentence, so it
 does not eat into the time-to-first-audio budget.
 
-Changing the voice itself rather than its processing is `tts.voice`. The British male Kokoro
-voices are `bm_george` (default), `bm_daniel`, `bm_lewis`, and `bm_fable`.
+Changing the voice itself rather than its processing is `tts.voice`, which defaults to `am_onyx`.
+Kokoro names every voice `<lang><gender>_<name>`, and the male English ones are:
+
+| | |
+|---|---|
+| American | `am_onyx` (default), `am_adam`, `am_michael`, `am_eric`, `am_liam`, `am_echo`, `am_fenrir`, `am_puck` |
+| British | `bm_george`, `bm_daniel`, `bm_lewis`, `bm_fable` |
+
+`tts.lang_code` follows the voice's prefix on its own, and only needs setting to read one language
+deliberately in another's accent. Getting it wrong is not an error, it just mispronounces things,
+which is why it is derived rather than configured.
+
+Compare any set of them through the same rack, so the only thing that changes is the speaker:
+
+```powershell
+uv run --extra tts python scripts/preview_voice.py --profile jarvis --voice am_onyx bm_george am_adam
+```
+
+`scripts/pull_models.ps1` downloads `am_onyx` and `bm_george`. A voice pack is about half a
+megabyte, so fetching another is quick, but it does need network the first time.
 
 ---
 

@@ -376,7 +376,7 @@ speaker_device_name:  auto        # default output device, overridable in config
 ```yaml
 wake_word:            hey_jarvis
 assistant_name:       Jarvis
-tts_voice:            bm_george
+tts_voice:            am_onyx     # was bm_george; changed by the operator, see PROGRESS.md
 user_address_form:    sir
 response_style:       "terse, one or two spoken sentences unless asked to elaborate"
 ```
