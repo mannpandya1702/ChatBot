@@ -64,12 +64,74 @@ def _synthesize_dry(config: JarvisConfig, text: str) -> np.ndarray:
     return synth.synthesize(text)
 
 
+def _lang_code_for(voice: str) -> str:
+    """Kokoro picks its phonemiser from the language code, not the voice name.
+
+    Handing a British voice the American code mispronounces enough words to be
+    obvious, so it is derived from the voice prefix rather than left at whatever
+    the config happens to say.
+    """
+    return voice[0] if voice[:1] in {"a", "b", "e", "f", "h", "i", "j", "p", "z"} else "b"
+
+
+def _sweep_voices(
+    config: JarvisConfig, args: argparse.Namespace, out_dir: Path, rate: int
+) -> int:
+    """Render one line in each requested voice, through one effect profile.
+
+    For choosing a base voice rather than an effect: the rack is held constant so
+    the only thing that changes between files is who is speaking.
+    """
+    from jarvis.audio.tts import KokoroSynthesizer
+
+    profile = VoiceProfile(args.profile) if args.profile else config.tts.effect_profile
+    intensity = args.intensity[0] if args.intensity else config.tts.effect_intensity
+    print(f"profile {profile} at intensity {intensity:g}\n")
+
+    for voice in args.voice:
+        tts = config.tts.model_copy(
+            update={"voice": voice, "lang_code": _lang_code_for(voice)}
+        )
+        scoped = config.model_copy(update={"tts": tts})
+        try:
+            dry = KokoroSynthesizer(
+                scoped, effect=VoiceEffect(rate, VoiceProfile.NONE)
+            ).synthesize(args.text)
+        except Exception as exc:  # noqa: BLE001 - one bad voice must not stop the sweep
+            print(f"  {voice:12} failed: {exc}")
+            continue
+        if dry.size == 0:
+            print(f"  {voice:12} produced no audio")
+            continue
+
+        wet = VoiceEffect(rate, profile, intensity).process(dry)
+        name = f"{voice}-{profile}.wav"
+        _write_wav(out_dir / name, wet, rate)
+        print(f"  {name:28} {dry.size / rate:.1f}s")
+
+    print(f"\nwritten to {out_dir}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Render one line in every profile."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=None, help="Path to config.yaml.")
     parser.add_argument("--text", default=DEFAULT_TEXT, help="What to say.")
-    parser.add_argument("--voice", default=None, help="Override the Kokoro voice.")
+    parser.add_argument(
+        "--voice",
+        default=None,
+        nargs="+",
+        help=(
+            "Kokoro voices to render, instead of the configured one. "
+            "The language code follows the prefix: bm_/bf_ are British, am_/af_ American."
+        ),
+    )
+    parser.add_argument(
+        "--profile",
+        default=None,
+        help="Render only this effect profile. Useful when sweeping many voices.",
+    )
     parser.add_argument(
         "--intensity",
         type=float,
@@ -86,13 +148,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     config = load_config(args.config)
-    if args.voice:
-        tts = config.tts.model_copy(update={"voice": args.voice})
-        config = config.model_copy(update={"tts": tts})
-
     out_dir = args.out or (Path(__file__).resolve().parents[1] / "build" / "voice-preview")
     out_dir.mkdir(parents=True, exist_ok=True)
     rate = config.tts.sample_rate
+
+    if args.voice:
+        return _sweep_voices(config, args, out_dir, rate)
 
     print(f"voice {config.tts.voice}, {rate} Hz")
     print(f"synthesising: {args.text}")
