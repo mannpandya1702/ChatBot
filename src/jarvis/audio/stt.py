@@ -70,6 +70,7 @@ __all__ = [
     "TranscriptSegment",
     "WhisperCppTranscriber",
     "build_transcriber",
+    "cuda_runtime_usable",
     "faster_whisper_cache",
     "to_float32_mono",
     "whispercpp_cache",
@@ -144,6 +145,49 @@ _CUDA_REMEDIATION = (
     "cudnn_ops64_9.dll and cublas64_12.dll into a directory already on PATH, or set "
     "stt.device to cpu and stt.compute_type to int8 in config.yaml to run on the CPU."
 )
+
+def cuda_runtime_usable() -> tuple[bool, str]:
+    """Whether CTranslate2 can actually place a model on the GPU.
+
+    A card nvidia-smi can see is not a CUDA runtime. CTranslate2 loads cuBLAS
+    and cuDNN 9 lazily, so a machine with a healthy driver and no runtime
+    libraries reports a GPU everywhere and then fails at the first
+    transcription. ``--check`` said "cuda yes" seven seconds before
+    ``cublas64_12.dll is not found`` on exactly such a machine, which is worse
+    than saying nothing.
+
+    Returns:
+        ``(usable, detail)``. The detail names what is missing when it is not.
+    """
+    if not has_module("ctranslate2"):
+        return False, "ctranslate2 is not installed"
+    try:
+        import ctranslate2
+
+        if ctranslate2.get_cuda_device_count() < 1:
+            return False, "no CUDA device visible to ctranslate2"
+    except Exception as exc:  # noqa: BLE001 - any probe failure means unusable
+        return False, str(exc)
+
+    # Device count alone does not load the support libraries. Only building
+    # something on the device does, which is what fails in practice.
+    try:
+        ctranslate2.models.Whisper  # noqa: B018 - attribute presence check
+    except AttributeError:  # pragma: no cover - very old ctranslate2
+        return True, "usable"
+    try:
+        from ctypes import CDLL
+
+        for name in ("cublas64_12.dll", "cublas64_11.dll", "libcublas.so.12"):
+            try:
+                CDLL(name)
+            except OSError:
+                continue
+            return True, "usable"
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)
+    return False, "cuBLAS is not on the library path"
+
 
 #: Checkpoints whisper.cpp actually ships as ggml weights. Anything outside this
 #: set has to be mapped before pywhispercpp is asked to download it.
@@ -636,11 +680,33 @@ class _BaseTranscriber:
                 model = self._ensure_model()
                 self._run(model, padding)
         except Exception as exc:  # noqa: BLE001 - warmup is best effort by design
-            _log.warning(
-                "speech recogniser warmup failed, continuing without it",
-                extra={"context": {"engine": self.engine_name, "error": str(exc)}},
-            )
-            return False
+            # A missing CUDA library is exactly what warming up is for. Left to
+            # the first real utterance, the same failure arrives while the user
+            # is waiting and costs a full model reload on top of it, which is a
+            # silent multi-second stall at the worst possible moment. Moving to
+            # the processor here spends that time before anyone has spoken.
+            if self._fall_back_to_cpu(exc):
+                try:
+                    with self._lock:
+                        model = self._ensure_model()
+                        self._run(model, padding)
+                except Exception as retry_exc:  # noqa: BLE001 - still best effort
+                    _log.warning(
+                        "speech recogniser warmup failed on the processor too",
+                        extra={
+                            "context": {
+                                "engine": self.engine_name,
+                                "error": str(retry_exc),
+                            }
+                        },
+                    )
+                    return False
+            else:
+                _log.warning(
+                    "speech recogniser warmup failed, continuing without it",
+                    extra={"context": {"engine": self.engine_name, "error": str(exc)}},
+                )
+                return False
         _log.info(
             "speech recogniser ready",
             extra={

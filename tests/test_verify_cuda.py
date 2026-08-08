@@ -15,6 +15,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import platform
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -128,10 +129,34 @@ CUDNN_FAILURES = [
 
 
 def test_script_imports_without_gpu_modules() -> None:
-    """Importing the script must not drag in pynvml or ctranslate2."""
-    assert "pynvml" not in sys.modules
-    assert "ctranslate2" not in sys.modules
+    """Importing the script must not drag in pynvml or ctranslate2.
+
+    Checked in a subprocess. Asserting on this process's sys.modules made the
+    result depend on what every other test happened to have imported first: any
+    test that legitimately probes CUDA leaves ctranslate2 loaded, and this then
+    failed in the full run while passing on its own. A fresh interpreter is the
+    only place the question means anything.
+    """
     assert callable(vc.main)
+
+    probe = (
+        "import importlib.util, sys;"
+        "spec = importlib.util.spec_from_file_location('vc', sys.argv[1]);"
+        "mod = importlib.util.module_from_spec(spec);"
+        "sys.modules['vc'] = mod;"
+        "spec.loader.exec_module(mod);"
+        "leaked = [m for m in ('pynvml', 'ctranslate2') if m in sys.modules];"
+        "print(','.join(leaked))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe, str(SCRIPT)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "", f"importing the script loaded {result.stdout.strip()}"
 
 
 def test_public_api_is_exported() -> None:

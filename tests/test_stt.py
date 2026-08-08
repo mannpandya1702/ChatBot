@@ -36,6 +36,7 @@ from jarvis.audio.stt import (
     TranscriptSegment,
     WhisperCppTranscriber,
     build_transcriber,
+    cuda_runtime_usable,
     to_float32_mono,
 )
 from jarvis.config import JarvisConfig, SttEngine, load_config
@@ -1275,3 +1276,103 @@ def test_an_unrelated_failure_does_not_move_to_the_processor(
         transcriber.transcribe(speech(1.0))
 
     assert loaded == ["cuda"], "an unrelated error should not have moved the device"
+
+
+class TestWarmupMovesToTheProcessor:
+    """Discovering a broken CUDA runtime is what warming up is for.
+
+    Reported from the Windows host: warmup failed on cublas64_12.dll, logged a
+    warning, and left the model pinned to CUDA. The first real utterance then
+    hit the identical failure, fell back, and reloaded the whole model, all
+    while the user waited for a reply that never came in time. transcribe()
+    already had the fallback; warmup did not use it, which made warming up
+    worse than useless on exactly the machine it was meant to help.
+    """
+
+    class _CudalessWhisper(FasterWhisperTranscriber):
+        """Loads only on the CPU. Anything else fails the way CTranslate2 does."""
+
+        def __init__(self, config: JarvisConfig) -> None:
+            super().__init__(config)
+            self.loads: list[str] = []
+
+        def _load_model(self) -> Any:
+            self.loads.append(self._device)
+            if self._device != "cpu":
+                msg = "Library cublas64_12.dll is not found or cannot be loaded"
+                raise OSError(msg)
+            return FakeWhisperModel()
+
+    def _config(self, tmp_path: Path) -> JarvisConfig:
+        return load_config(
+            tmp_path / "absent.yaml",
+            stt={
+                "engine": "faster-whisper",
+                "model": "small.en",
+                "device": "cuda",
+                "compute_type": "int8",
+            },
+        )
+
+    def test_it_falls_back_rather_than_giving_up(self, tmp_path: Path) -> None:
+        transcriber = self._CudalessWhisper(self._config(tmp_path))
+
+        assert transcriber.warmup() is True
+        assert transcriber.device == "cpu", "warmup left the model on a device it cannot use"
+        assert transcriber.loads == ["cuda", "cpu"]
+
+    def test_the_first_utterance_no_longer_pays_for_it(self, tmp_path: Path) -> None:
+        """The reload has to happen before anyone speaks, not during."""
+        transcriber = self._CudalessWhisper(self._config(tmp_path))
+        transcriber.warmup()
+        during_warmup = list(transcriber.loads)
+
+        transcriber.transcribe(speech(1.0), WHISPER_SAMPLE_RATE)
+        assert transcriber.loads == during_warmup, (
+            "the model was rebuilt during the first utterance"
+        )
+
+    def test_a_failure_that_is_not_cuda_still_just_warns(self, tmp_path: Path) -> None:
+        """Only a missing CUDA library is worth changing device over."""
+
+        class Broken(FasterWhisperTranscriber):
+            def _load_model(self) -> Any:
+                msg = "the checkpoint is corrupt"
+                raise RuntimeError(msg)
+
+        transcriber = Broken(self._config(tmp_path))
+        assert transcriber.warmup() is False
+        assert transcriber.device == "cuda"
+
+
+class TestTheCudaProbeTellsTheTruth:
+    """A visible card is not a usable one.
+
+    --check reported "cuda yes" seven seconds before cublas64_12.dll failed to
+    load on the same machine, which sent the user looking in the wrong place.
+    has_cuda() asks the driver; this asks the library that actually has to work.
+    """
+
+    def test_it_returns_a_reason_when_unusable(self) -> None:
+        usable, detail = cuda_runtime_usable()
+        assert isinstance(usable, bool)
+        assert detail, "an unusable runtime must say why"
+
+    def test_it_reports_unusable_without_ctranslate2(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("jarvis.audio.stt.has_module", lambda _name: False)
+        usable, detail = cuda_runtime_usable()
+        assert usable is False
+        assert "ctranslate2" in detail
+
+    def test_it_never_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """--check must not crash on a machine with a half installed CUDA."""
+
+        def explode(_name: str) -> bool:
+            msg = "boom"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr("jarvis.audio.stt.has_module", explode)
+        with pytest.raises(RuntimeError):
+            cuda_runtime_usable()

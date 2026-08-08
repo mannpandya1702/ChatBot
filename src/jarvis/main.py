@@ -785,13 +785,23 @@ def run_check(config: JarvisConfig) -> int:
     else:
         vision = "off in the configuration"
 
+    # A visible card is not a usable one. Reporting the driver's opinion here
+    # told this machine "cuda yes" seconds before cublas64_12.dll failed to
+    # load, which sent the user looking in the wrong place.
+    cuda = "no"
+    if has_cuda():
+        from jarvis.audio.stt import cuda_runtime_usable
+
+        ok, detail = cuda_runtime_usable()
+        cuda = "yes" if ok else f"card present, but unusable: {detail}"
+
     #: (label, value, counts towards readiness)
     rows: list[tuple[str, str, bool]] = [
         ("platform", "Windows" if is_windows() else sys.platform, False),
         ("hardware tier", tier, False),
         ("llm model", config.llm_model(), False),
         ("ollama reachable", "yes" if ollama_up else "no", True),
-        ("cuda", "yes" if has_cuda() else "no", False),
+        ("cuda", cuda, False),
         ("sounddevice", "yes" if has_module("sounddevice") else "no", True),
         ("openwakeword", "yes" if has_module("openwakeword") else "no", True),
         ("speech to text", stt, True),

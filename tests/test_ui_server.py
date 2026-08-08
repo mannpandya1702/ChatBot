@@ -419,20 +419,25 @@ class TestTheHudGetsItsConfiguration:
     "injected at build time". No launcher and no injector existed anywhere in
     the tree. So changing ui.port moved the server and left the HUD dialling
     8765 forever, reconnecting with backoff against nothing.
+
+    Every test here writes into tmp_path rather than the repository. Writing to
+    the real app directory made these tests fight each other over one file, and
+    fail only in the full run.
     """
 
-    def _written(self, server: UiServer) -> str:
-        from jarvis.ui import server as server_module
-
-        app_src = Path(server_module.__file__).resolve().parent / "app" / "src"
-        return (app_src / "hud-config.js").read_text(encoding="utf-8")
+    def _write_to(self, server: UiServer, tmp_path: Any) -> str:
+        app = Path(tmp_path) / "app"
+        (app / "src").mkdir(parents=True)
+        written = server.write_hud_config(app_dir=app)
+        assert written, "nothing was written"
+        return (app / "src" / "hud-config.js").read_text(encoding="utf-8")
 
     async def test_the_bound_port_is_published(
-        self, ui_config: JarvisConfig, bus: EventBus
+        self, ui_config: JarvisConfig, bus: EventBus, tmp_path: Any
     ) -> None:
         """The bound one, not the configured one: port 0 means the OS chooses."""
         with UiServer(ui_config, bus) as server:
-            body = self._written(server)
+            body = self._write_to(server, tmp_path)
             assert f"window.JARVIS_PORT = {server.port};" in body
             assert server.port != 0
 
@@ -444,7 +449,7 @@ class TestTheHudGetsItsConfiguration:
             ui={"port": 0, "host": "127.0.0.1", "accent_color": "#ff8800"},
         )
         with UiServer(config, bus) as server:
-            body = self._written(server)
+            body = self._write_to(server, tmp_path)
         assert '"127.0.0.1"' in body
         assert '"#ff8800"' in body
 
@@ -453,29 +458,40 @@ class TestTheHudGetsItsConfiguration:
             tmp_path / "absent.yaml", ui={"port": 0, "hud_position": "top-left"}
         )
         with UiServer(config, bus) as server:
-            body = self._written(server)
+            body = self._write_to(server, tmp_path)
         assert '"top-left"' in body
 
     async def test_it_is_valid_javascript_assignment_syntax(
-        self, ui_config: JarvisConfig, bus: EventBus
+        self, ui_config: JarvisConfig, bus: EventBus, tmp_path: Any
     ) -> None:
         """It is loaded as a plain script, so a syntax error blanks the HUD."""
         with UiServer(ui_config, bus) as server:
-            body = self._written(server)
+            body = self._write_to(server, tmp_path)
         for line in body.splitlines():
             if not line or line.startswith("//"):
                 continue
             assert line.startswith("window.") and line.endswith(";"), line
 
-    async def test_a_missing_app_directory_is_not_an_error(
-        self, ui_config: JarvisConfig, bus: EventBus, monkeypatch: pytest.MonkeyPatch
+    def test_a_missing_app_directory_is_not_an_error(
+        self, ui_config: JarvisConfig, bus: EventBus, tmp_path: Any
     ) -> None:
         """A source checkout that has never built the HUD still starts."""
         server = UiServer(ui_config, bus)
-        monkeypatch.setattr(
-            "jarvis.ui.server.Path", lambda *_a, **_kw: Path("/nonexistent/nope")
-        )
-        assert server.write_hud_config() == []
+        assert server.write_hud_config(app_dir=Path(tmp_path) / "absent") == []
+
+    def test_starting_writes_it_without_being_asked(
+        self, ui_config: JarvisConfig, bus: EventBus
+    ) -> None:
+        """The default target is the bundled app, which is what production uses."""
+        from jarvis.ui import server as server_module
+
+        app_src = Path(server_module.__file__).resolve().parent / "app" / "src"
+        if not app_src.is_dir():
+            pytest.skip("the HUD app directory is not present in this checkout")
+        target = app_src / "hud-config.js"
+        target.unlink(missing_ok=True)
+        with UiServer(ui_config, bus):
+            assert target.is_file(), "starting the server did not publish the config"
 
     def test_the_page_loads_it_before_the_module(self) -> None:
         """Otherwise main.js reads the defaults and the config never applies."""

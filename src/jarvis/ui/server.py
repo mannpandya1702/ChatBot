@@ -295,7 +295,7 @@ class UiServer:
             self._ready.set()
             await self._pump()
 
-    def write_hud_config(self) -> list[Path]:
+    def write_hud_config(self, app_dir: Path | None = None) -> list[Path]:
         """Hand the HUD the settings it is configured with.
 
         ``ui.port``, ``ui.host``, ``ui.accent_color`` and ``ui.hud_position``
@@ -310,6 +310,11 @@ class UiServer:
         user's and the bundle is not: a rebuild should not be the price of
         moving a port. Absent in a plain browser, where main.js falls back to
         its defaults.
+
+        Args:
+            app_dir: Where the HUD lives. Defaults to the bundled app. Injectable
+                so a test is not writing into the repository, which also stopped
+                concurrent tests overwriting each other's port.
 
         Returns:
             The files written. Empty when the app directory is not present,
@@ -329,9 +334,9 @@ class UiServer:
             f"window.{key} = {json.dumps(value)};\n" for key, value in payload.items()
         )
 
-        app_dir = Path(__file__).resolve().parent / "app"
+        root = app_dir if app_dir is not None else Path(__file__).resolve().parent / "app"
         written: list[Path] = []
-        for target in (app_dir / "src", app_dir / "dist"):
+        for target in (root / "src", root / "dist"):
             if not target.is_dir():
                 continue
             try:
