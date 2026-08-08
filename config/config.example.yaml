@@ -104,6 +104,13 @@ stt:
   condition_on_previous_text: false
   min_audio_ms: 200
   download_root: null
+  # Give up on a transcription that has not returned in this long. A hung engine
+  # is not hypothetical: a card with the CUDA driver but half the runtime loads
+  # the model, takes the audio, and never comes back, with no error to catch.
+  # The deadline is the larger of these two, since a long utterance genuinely
+  # takes longer.
+  timeout_s: 20.0
+  timeout_rtf: 8.0
 
 # ---------------------------------------------------------------------------
 # Text to speech (Kokoro-82M). Voices: bm_george, bm_fable, bm_lewis, bm_daniel.

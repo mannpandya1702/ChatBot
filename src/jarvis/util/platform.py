@@ -25,6 +25,7 @@ from jarvis.util.errors import DependencyMissingError, PlatformUnsupportedError
 __all__ = [
     "bundle_root",
     "cpu_model",
+    "cuda_runtime_usable",
     "has_cuda",
     "has_module",
     "has_nvml",
@@ -239,6 +240,49 @@ def windows_version() -> str:
     if release == "10" and build >= 22000:
         release = "11"
     return " ".join(p for p in (f"Windows {release}", edition, f"build {build or version}") if p)
+
+
+def cuda_runtime_usable() -> tuple[bool, str]:
+    """Whether CTranslate2 can actually place a model on the GPU.
+
+    A card nvidia-smi can see is not a CUDA runtime. CTranslate2 loads cuBLAS
+    and cuDNN 9 lazily, so a machine with a healthy driver and no runtime
+    libraries reports a GPU everywhere and then fails at the first
+    transcription. ``--check`` said "cuda yes" seven seconds before
+    ``cublas64_12.dll is not found`` on exactly such a machine, which is worse
+    than saying nothing.
+
+    Returns:
+        ``(usable, detail)``. The detail names what is missing when it is not.
+    """
+    if not has_module("ctranslate2"):
+        return False, "ctranslate2 is not installed"
+    try:
+        import ctranslate2
+
+        if ctranslate2.get_cuda_device_count() < 1:
+            return False, "no CUDA device visible to ctranslate2"
+    except Exception as exc:  # noqa: BLE001 - any probe failure means unusable
+        return False, str(exc)
+
+    # Device count alone does not load the support libraries. Only building
+    # something on the device does, which is what fails in practice.
+    try:
+        ctranslate2.models.Whisper  # noqa: B018 - attribute presence check
+    except AttributeError:  # pragma: no cover - very old ctranslate2
+        return True, "usable"
+    try:
+        from ctypes import CDLL
+
+        for name in ("cublas64_12.dll", "cublas64_11.dll", "libcublas.so.12"):
+            try:
+                CDLL(name)
+            except OSError:
+                continue
+            return True, "usable"
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)
+    return False, "cuBLAS is not on the library path"
 
 
 def is_frozen() -> bool:

@@ -16,6 +16,7 @@ project root discovered at import time.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from enum import StrEnum
@@ -31,7 +32,9 @@ from pydantic_settings import (
 )
 
 from jarvis.util.errors import ConfigError
-from jarvis.util.platform import project_root
+from jarvis.util.platform import cuda_runtime_usable, project_root
+
+_log = logging.getLogger(__name__)
 
 __all__ = [
     "TIER_PROFILES",
@@ -138,6 +141,13 @@ _STT_GPU_MIN_VRAM_GB = 2.0
 #: What such a card runs. The same model the gpu-6 tier uses, since the two
 #: cases differ in how much VRAM is spare, not in what Whisper needs.
 _STT_SMALL_GPU_MODEL = "small.en"
+
+#: How to make a card with a driver but no runtime actually usable.
+_CUDA_HINT = (
+    "install the CUDA runtime with "
+    "'uv pip install nvidia-cublas-cu12 nvidia-cudnn-cu12', or set stt.device "
+    "explicitly in config.yaml to override this"
+)
 
 TIER_PROFILES: dict[Tier, TierProfile] = {
     Tier.CPU: TierProfile(
@@ -327,6 +337,18 @@ class SttConfig(_Section):
     #: Utterances shorter than this are discarded as accidental triggers.
     min_audio_ms: int = Field(default=200, ge=0, le=5_000)
     download_root: Path | None = None
+    #: Give up on a transcription that has not returned in this long.
+    #:
+    #: A hung engine is not hypothetical. A card with the CUDA driver but a
+    #: half-installed runtime loaded the model, accepted the audio, and never
+    #: came back: no exception to catch, no fallback to trigger, and the turn
+    #: loop simply stopped with the user waiting. The deadline scales with the
+    #: audio, since a long utterance legitimately takes longer, and this is the
+    #: floor.
+    timeout_s: float = Field(default=20.0, ge=1.0, le=600.0)
+    #: Multiple of the audio's own duration allowed before giving up, for
+    #: utterances long enough that the floor above would be unfair.
+    timeout_rtf: float = Field(default=8.0, ge=1.0, le=100.0)
 
 
 class TtsConfig(_Section):
@@ -815,10 +837,26 @@ class JarvisConfig(BaseSettings):
             and self.hardware.cuda_available
             and (self.hardware.gpu_vram_gb or 0.0) >= _STT_GPU_MIN_VRAM_GB
         ):
-            engine = SttEngine.FASTER_WHISPER
-            model = self.stt.model or _STT_SMALL_GPU_MODEL
-            device = self.stt.device or "cuda"
-            compute_type = self.stt.compute_type or "int8"
+            # hardware.cuda_available is what nvidia-smi said at setup, which is
+            # a statement about the driver. CTranslate2 also needs cuBLAS and
+            # cuDNN 9, and on a machine with the driver and not the runtime this
+            # moved transcription onto a device that could not run it: first a
+            # missing-DLL error, then, once cuBLAS was installed and cuDNN still
+            # was not, a silent hang with no exception to fall back from. Ask
+            # the library that has to do the work, not the one that reports the
+            # card.
+            usable, reason = cuda_runtime_usable()
+            if usable:
+                engine = SttEngine.FASTER_WHISPER
+                model = self.stt.model or _STT_SMALL_GPU_MODEL
+                device = self.stt.device or "cuda"
+                compute_type = self.stt.compute_type or "int8"
+            else:
+                _log.info(
+                    "keeping transcription on the processor: %s",
+                    reason,
+                    extra={"context": {"reason": reason, "remediation": _CUDA_HINT}},
+                )
 
         return (engine, model, device, compute_type)
 

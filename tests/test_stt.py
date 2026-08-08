@@ -1361,18 +1361,111 @@ class TestTheCudaProbeTellsTheTruth:
     def test_it_reports_unusable_without_ctranslate2(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("jarvis.audio.stt.has_module", lambda _name: False)
+        monkeypatch.setattr("jarvis.util.platform.has_module", lambda _name: False)
         usable, detail = cuda_runtime_usable()
         assert usable is False
         assert "ctranslate2" in detail
 
-    def test_it_never_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """--check must not crash on a machine with a half installed CUDA."""
+    def test_a_broken_probe_is_reported_not_raised(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """--check and stt_settings both call this; neither may crash on it."""
+        import types
 
-        def explode(_name: str) -> bool:
-            msg = "boom"
+        broken = types.ModuleType("ctranslate2")
+
+        def explode() -> int:
+            msg = "CUDA driver version is insufficient"
             raise RuntimeError(msg)
 
-        monkeypatch.setattr("jarvis.audio.stt.has_module", explode)
-        with pytest.raises(RuntimeError):
-            cuda_runtime_usable()
+        broken.get_cuda_device_count = explode  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "ctranslate2", broken)
+        monkeypatch.setattr("jarvis.util.platform.has_module", lambda _n: True)
+
+        usable, detail = cuda_runtime_usable()
+        assert usable is False
+        assert "insufficient" in detail
+
+
+class TestAWedgedEngineDoesNotWedgeJarvis:
+    """A hung engine used to stop the assistant with nothing to show for it.
+
+    From the Windows host: a card with the CUDA driver and half the runtime
+    loaded the model, took the audio, and never returned. No exception, so the
+    CPU fallback never fired, and the turn loop simply stopped. The log ended at
+    "utterance endpointed" and the user waited, then pressed Ctrl-C.
+
+    §5 says a slow stage must never stall the loop. Against a native library
+    that will not return, the only way to keep that is to stop waiting.
+    """
+
+    class _Wedged(FasterWhisperTranscriber):
+        """Loads fine, then blocks forever, the way a bad CUDA runtime does."""
+
+        def __init__(self, config: JarvisConfig) -> None:
+            super().__init__(config)
+            self.released = threading.Event()
+            self.runs = 0
+
+        def _load_model(self) -> Any:
+            return FakeWhisperModel([FakeSegment("all quiet, sir.", 0.0, 1.0)])
+
+        def _run(self, model: Any, samples: Any) -> Any:
+            self.runs += 1
+            if self._device != "cpu":
+                self.released.wait(30)
+                msg = "never getting here in the test"
+                raise RuntimeError(msg)
+            return super()._run(model, samples)
+
+    def _config(self, tmp_path: Path, **stt: Any) -> JarvisConfig:
+        settings: dict[str, Any] = {
+            "engine": "faster-whisper",
+            "model": "small.en",
+            "device": "cuda",
+            "timeout_s": 1.0,
+            "timeout_rtf": 1.0,
+        }
+        settings.update(stt)
+        return load_config(tmp_path / "absent.yaml", stt=settings)
+
+    def test_it_gives_up_rather_than_blocking_forever(self, tmp_path: Path) -> None:
+        transcriber = self._Wedged(self._config(tmp_path))
+        started = time.perf_counter()
+        with pytest.raises(SttError, match="did not finish"):
+            transcriber.transcribe(speech(1.0), WHISPER_SAMPLE_RATE)
+        elapsed = time.perf_counter() - started
+        transcriber.released.set()
+        assert elapsed < 10.0, f"waited {elapsed:.1f}s on a one second deadline"
+
+    def test_the_failure_is_speakable(self, tmp_path: Path) -> None:
+        """§5: fail loud in the log, soft in the voice."""
+        transcriber = self._Wedged(self._config(tmp_path))
+        with pytest.raises(SttError) as excinfo:
+            transcriber.transcribe(speech(1.0), WHISPER_SAMPLE_RATE)
+        transcriber.released.set()
+        assert excinfo.value.speakable
+        assert ".dll" not in (excinfo.value.speakable or "")
+
+    def test_the_next_turn_runs_on_the_processor(self, tmp_path: Path) -> None:
+        """Otherwise every turn queues behind a thread that is never coming back."""
+        transcriber = self._Wedged(self._config(tmp_path))
+        with pytest.raises(SttError):
+            transcriber.transcribe(speech(1.0), WHISPER_SAMPLE_RATE)
+
+        assert transcriber.device == "cpu"
+        result = transcriber.transcribe(speech(1.0), WHISPER_SAMPLE_RATE)
+        transcriber.released.set()
+        assert result.text, "the second turn was still wedged"
+
+    def test_the_deadline_scales_with_the_audio(self, tmp_path: Path) -> None:
+        """A long utterance legitimately takes longer than a short one."""
+        transcriber = self._Wedged(self._config(tmp_path, timeout_s=5.0, timeout_rtf=8.0))
+        assert transcriber._deadline_for(0.5) == 5.0
+        assert transcriber._deadline_for(30.0) == 240.0
+
+    def test_a_healthy_engine_is_untouched(self, tmp_path: Path) -> None:
+        config = self._config(tmp_path, device="cpu")
+        model = FakeWhisperModel([FakeSegment("all quiet, sir.", 0.0, 1.0)])
+        transcriber = FasterWhisperTranscriber(config, model)
+        assert transcriber.transcribe(speech(1.0), WHISPER_SAMPLE_RATE).text

@@ -54,7 +54,7 @@ import numpy.typing as npt
 from jarvis.config import TIER_PROFILES, SttEngine, Tier
 from jarvis.state import EventType
 from jarvis.util.errors import JarvisError, SttError
-from jarvis.util.platform import has_module, require_module
+from jarvis.util.platform import cuda_runtime_usable, has_module, require_module
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from jarvis.config import JarvisConfig
@@ -145,49 +145,6 @@ _CUDA_REMEDIATION = (
     "cudnn_ops64_9.dll and cublas64_12.dll into a directory already on PATH, or set "
     "stt.device to cpu and stt.compute_type to int8 in config.yaml to run on the CPU."
 )
-
-def cuda_runtime_usable() -> tuple[bool, str]:
-    """Whether CTranslate2 can actually place a model on the GPU.
-
-    A card nvidia-smi can see is not a CUDA runtime. CTranslate2 loads cuBLAS
-    and cuDNN 9 lazily, so a machine with a healthy driver and no runtime
-    libraries reports a GPU everywhere and then fails at the first
-    transcription. ``--check`` said "cuda yes" seven seconds before
-    ``cublas64_12.dll is not found`` on exactly such a machine, which is worse
-    than saying nothing.
-
-    Returns:
-        ``(usable, detail)``. The detail names what is missing when it is not.
-    """
-    if not has_module("ctranslate2"):
-        return False, "ctranslate2 is not installed"
-    try:
-        import ctranslate2
-
-        if ctranslate2.get_cuda_device_count() < 1:
-            return False, "no CUDA device visible to ctranslate2"
-    except Exception as exc:  # noqa: BLE001 - any probe failure means unusable
-        return False, str(exc)
-
-    # Device count alone does not load the support libraries. Only building
-    # something on the device does, which is what fails in practice.
-    try:
-        ctranslate2.models.Whisper  # noqa: B018 - attribute presence check
-    except AttributeError:  # pragma: no cover - very old ctranslate2
-        return True, "usable"
-    try:
-        from ctypes import CDLL
-
-        for name in ("cublas64_12.dll", "cublas64_11.dll", "libcublas.so.12"):
-            try:
-                CDLL(name)
-            except OSError:
-                continue
-            return True, "usable"
-    except Exception as exc:  # noqa: BLE001
-        return False, str(exc)
-    return False, "cuBLAS is not on the library path"
-
 
 #: Checkpoints whisper.cpp actually ships as ggml weights. Anything outside this
 #: set has to be mapped before pywhispercpp is asked to download it.
@@ -465,6 +422,8 @@ class _BaseTranscriber:
         self._device = device
         self._compute_type = compute_type
         self._min_audio_ms = float(config.stt.min_audio_ms)
+        self._timeout_s = float(config.stt.timeout_s)
+        self._timeout_rtf = float(config.stt.timeout_rtf)
         language = config.stt.language.strip()
         self._language: str | None = None if language.lower() in ("", "auto") else language
         # Whisper models are not re-entrant. One lock covers loading and calling.
@@ -520,6 +479,90 @@ class _BaseTranscriber:
         return self._empty_results
 
     # -- the contract ------------------------------------------------------
+
+    def _deadline_for(self, duration_s: float) -> float:
+        """Seconds to allow one transcription before calling it hung."""
+        return max(self._timeout_s, duration_s * self._timeout_rtf)
+
+    def _guarded_run(self, samples: Samples, duration_s: float) -> _RawResult:
+        """Transcribe with a deadline, on a thread that can be abandoned.
+
+        A hung engine is not hypothetical. A card carrying the CUDA driver but
+        only half of the runtime loaded the model, took the audio, and never
+        returned: no exception, so nothing to catch and nothing to fall back
+        from, and the turn loop stopped dead with the user waiting. §5 says a
+        slow stage must never stall the loop, and the only way to keep that
+        promise against a native library that will not return is to stop waiting
+        for it.
+
+        The worker is a daemon, so an abandoned one cannot hold up shutdown. It
+        also still holds the model lock, which is why a timeout moves the engine
+        to the processor: the next turn builds a fresh model rather than queueing
+        behind the wedged one forever.
+
+        Raises:
+            SttError: The deadline passed.
+        """
+        deadline = self._deadline_for(duration_s)
+        outcome: dict[str, Any] = {}
+        done = threading.Event()
+
+        def work() -> None:
+            try:
+                with self._lock:
+                    model = self._ensure_model()
+                    outcome["raw"] = self._run(model, samples)
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread
+                outcome["error"] = exc
+            finally:
+                done.set()
+
+        worker = threading.Thread(target=work, name="jarvis-stt-run", daemon=True)
+        worker.start()
+        if not done.wait(deadline):
+            self._abandon_wedged_engine(deadline, duration_s)
+            raise SttError(
+                f"transcription did not finish within {deadline:.0f}s",
+                speakable="My speech recogniser stopped responding.",
+                context={
+                    "engine": self.engine_name,
+                    "device": self._device,
+                    "audio_seconds": round(duration_s, 2),
+                    "deadline_s": round(deadline, 1),
+                },
+            )
+
+        error = outcome.get("error")
+        if error is not None:
+            raise error
+        raw: _RawResult = outcome["raw"]
+        return raw
+
+    def _abandon_wedged_engine(self, deadline: float, duration_s: float) -> None:
+        """Give up on the current model and rebuild on the processor next time.
+
+        Deliberately does not take the lock: the abandoned worker still holds it
+        and may never let go. Rebinding the attributes is enough, because
+        ``_ensure_model`` reads them when it builds, and a fresh lock means the
+        next turn is not queued behind a thread that is never coming back.
+        """
+        _log.error(
+            "transcription wedged, abandoning the engine and moving to the processor",
+            extra={
+                "context": {
+                    "engine": self.engine_name,
+                    "was_device": self._device,
+                    "deadline_s": round(deadline, 1),
+                    "audio_seconds": round(duration_s, 2),
+                    "remediation": _CUDA_REMEDIATION,
+                }
+            },
+        )
+        if self._owns_model:
+            self._device = "cpu"
+            self._compute_type = "int8"
+            self._model = None
+            self._lock = threading.RLock()
 
     def _fall_back_to_cpu(self, exc: BaseException) -> bool:
         """Move to the CPU after a missing CUDA library, once.
@@ -611,9 +654,7 @@ class _BaseTranscriber:
 
         started = self._clock()
         try:
-            with self._lock:
-                model = self._ensure_model()
-                raw = self._run(model, samples)
+            raw = self._guarded_run(samples, duration_s)
         except JarvisError:
             # Already structured and speakable. Re-raising keeps the install hint
             # from DependencyMissingError intact.
@@ -621,9 +662,7 @@ class _BaseTranscriber:
         except Exception as exc:
             if self._fall_back_to_cpu(exc):
                 try:
-                    with self._lock:
-                        model = self._ensure_model()
-                        raw = self._run(model, samples)
+                    raw = self._guarded_run(samples, duration_s)
                 except JarvisError:
                     raise
                 except Exception as retry_exc:

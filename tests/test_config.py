@@ -349,6 +349,18 @@ class TestASmallCardStillTranscribes:
         base = {"tier": "cpu", "cuda_available": True, "gpu_vram_gb": 4.0}
         return load_config("/nonexistent.yaml", hardware={**base, **hardware})
 
+    @pytest.fixture(autouse=True)
+    def _runtime_is_usable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """These test the tier logic, not this machine's CUDA install.
+
+        The upgrade now also requires a CUDA runtime CTranslate2 can actually
+        use, which no build host has. Without pinning it, these would pass or
+        fail depending on what happened to be installed, which is how a machine
+        with the driver and half the runtime ended up transcribing on a device
+        that hung.
+        """
+        monkeypatch.setattr("jarvis.config.cuda_runtime_usable", lambda: (True, "usable"))
+
     def test_a_four_gigabyte_card_transcribes_on_the_gpu(self) -> None:
         engine, model, device, compute = self._config().stt_settings()
 
@@ -462,3 +474,83 @@ class TestTheLanguageCodeFollowsTheVoice:
 
         synth = KokoroSynthesizer(JarvisConfig(tts={"voice": "bm_george"}))
         assert synth._lang_code == "b"
+
+
+class TestTheCudaUpgradeAsksTheRightQuestion:
+    """hardware.cuda_available is what nvidia-smi said, which is about the driver.
+
+    CTranslate2 also needs cuBLAS and cuDNN 9. On a machine with the driver and
+    not the runtime, moving transcription onto the card produced first a missing
+    DLL error and then, once cuBLAS was installed and cuDNN still was not, a
+    silent hang with no exception to fall back from.
+    """
+
+    def _config(self, tmp_path: Path, **stt: object) -> JarvisConfig:
+        return load_config(
+            tmp_path / "absent.yaml",
+            hardware={"tier": "cpu", "cuda_available": True, "gpu_vram_gb": 4.0},
+            stt=stt or {},
+        )
+
+    def test_a_card_without_a_runtime_stays_on_the_processor(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "jarvis.config.cuda_runtime_usable", lambda: (False, "cuBLAS is not on the path")
+        )
+        _engine, _model, device, _compute = self._config(tmp_path).stt_settings()
+        assert device == "cpu"
+
+    def test_a_working_runtime_still_gets_the_card(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The upgrade is worth having; it just has to be earned."""
+        monkeypatch.setattr("jarvis.config.cuda_runtime_usable", lambda: (True, "usable"))
+        engine, model, device, _compute = self._config(tmp_path).stt_settings()
+        assert (engine, model, device) == (SttEngine.FASTER_WHISPER, "small.en", "cuda")
+
+    def test_an_explicit_device_is_never_second_guessed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("jarvis.config.cuda_runtime_usable", lambda: (False, "nope"))
+        config = self._config(tmp_path, engine="faster-whisper", device="cuda")
+        _engine, _model, device, _compute = config.stt_settings()
+        assert device == "cuda", "a deliberate choice was overridden"
+
+    def test_the_probe_is_not_consulted_without_a_card(self, tmp_path: Path) -> None:
+        """No GPU means no question to ask."""
+
+        def fail() -> tuple[bool, str]:
+            msg = "the probe should not have run"
+            raise AssertionError(msg)
+
+        config = load_config(
+            tmp_path / "absent.yaml",
+            hardware={"tier": "cpu", "cuda_available": False},
+        )
+        import jarvis.config as config_module
+
+        original = config_module.cuda_runtime_usable
+        config_module.cuda_runtime_usable = fail  # type: ignore[assignment]
+        try:
+            _engine, _model, device, _compute = config.stt_settings()
+        finally:
+            config_module.cuda_runtime_usable = original  # type: ignore[assignment]
+        assert device == "cpu"
+
+
+class TestTheTranscriptionDeadline:
+    def test_it_has_a_floor_and_a_ratio(self) -> None:
+        config = JarvisConfig()
+        assert config.stt.timeout_s > 0
+        assert config.stt.timeout_rtf > 1.0
+
+    def test_both_are_configurable(self, tmp_path: Path) -> None:
+        config = load_config(
+            tmp_path / "absent.yaml", stt={"timeout_s": 5.0, "timeout_rtf": 2.0}
+        )
+        assert (config.stt.timeout_s, config.stt.timeout_rtf) == (5.0, 2.0)
+
+    def test_a_nonsense_deadline_is_refused(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError):
+            load_config(tmp_path / "absent.yaml", stt={"timeout_s": 0.0})
