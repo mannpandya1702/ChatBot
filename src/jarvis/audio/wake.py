@@ -29,8 +29,10 @@ logged and skipped rather than allowed to unwind the thread (§5).
 
 from __future__ import annotations
 
+import difflib
 import importlib
 import logging
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -58,6 +60,7 @@ __all__ = [
     "WakeModelLoadError",
     "WakeWordDetector",
     "float_to_int16",
+    "strip_wake_word",
 ]
 
 _log = logging.getLogger(__name__)
@@ -142,6 +145,174 @@ def _as_float32(samples: Samples) -> Samples:
     if block.dtype != np.float32:
         return block.astype(np.float32)
     return block
+
+
+#: Everything a transcriber might put between words, stripped before matching.
+#: Apostrophes survive, because "jarvis's" should still read as the name.
+_NOT_WORD = re.compile(r"[^a-z0-9']+")
+
+#: How closely a leading token must match a fixed word of the wake phrase, for
+#: example "hey". These are short and common, so a loose threshold here starts
+#: eating real questions: "they" and "he" both score 0.80 against "hey".
+_PREFIX_RATIO = 0.8
+
+#: How closely a token must match the assistant's name when the phrase's fixed
+#: prefix already matched. Deliberately loose. openWakeWord has just told us the
+#: phrase was spoken, so whatever follows "hey" is almost certainly the mangled
+#: name, and the mangling is severe: this machine's transcriber produced
+#: "Jardubyse" (0.53), "Jadwis" (0.67) and "Jarvo" (0.73) for "Jarvis". A real
+#: question after a bare "hey" is nowhere near: "there" 0.18, "google" 0.00,
+#: "what" 0.20.
+_NAME_RATIO_AFTER_PREFIX = 0.5
+
+#: How closely a token must match the name when the prefix is absent, as in
+#: "Jarvis, how are you". There is no corroborating evidence here, so the bar is
+#: much higher: "java" (0.60) and "jarred" (0.50) are ordinary words that must
+#: survive, while "javis" (0.91) and "jarvix" (0.83) are the name.
+_NAME_RATIO_ALONE = 0.8
+
+#: Consecutive wake phrases removed from one transcript. "Hey Jarvis. Hey
+#: Jarvis. What time is it" happens when the user repeats themselves because the
+#: first try seemed to do nothing.
+_MAX_WAKE_REPEATS = 3
+
+
+def _words(text: str) -> list[tuple[str, int, int]]:
+    """Split ``text`` into lowercase words with their spans in the original.
+
+    The spans are what let the remainder be sliced back out of the caller's
+    string with its own casing and punctuation intact, rather than rebuilt from
+    the normalised tokens. Scanning the original rather than a case folded copy
+    keeps those spans exact: lowercasing is not length preserving for every
+    codepoint, and a fold that shifts by one character would slice the answer a
+    letter short.
+
+    Deliberately ASCII. Only the leading word or three are ever matched against
+    the wake phrase, and everything after them is sliced out untouched, so a
+    non-ASCII letter in the body of the question costs nothing.
+    """
+    return [
+        (match.group(0).lower(), match.start(), match.end())
+        for match in re.finditer(r"[A-Za-z0-9']+", text)
+    ]
+
+
+def _ratio(a: str, b: str) -> float:
+    """Similarity of two words in 0..1."""
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def wake_phrase_words(wake_word: str) -> list[str]:
+    """The wake phrase as lowercase words, for example ``["hey", "jarvis"]``.
+
+    Accepts either an openWakeWord model name (``hey_jarvis``) or a spoken
+    phrase (``"hey jarvis"``), since the same setting is read as both.
+    """
+    return [w for w in _NOT_WORD.split(wake_word.lower().replace("_", " ")) if w]
+
+
+def _match_name(
+    words: list[tuple[str, int, int]], start: int, name: str, *, anchored: bool
+) -> int:
+    """Words consumed by the name at ``start``, or 0 for no match.
+
+    Args:
+        anchored: Whether the phrase's fixed prefix already matched, which is
+            what buys the looser threshold and the two-token join.
+
+    When anchored, one token is tried and then two joined, because a
+    transcriber that does not know the word sometimes splits it: "jarv is"
+    scores 0.92 against "jarvis" while neither half alone would. Unanchored,
+    the join is off entirely: "java is" joins to "javais", which scores 0.83
+    and would swallow the front of "Java is a language".
+    """
+    if start >= len(words):
+        return 0
+    threshold = _NAME_RATIO_AFTER_PREFIX if anchored else _NAME_RATIO_ALONE
+    single = _ratio(words[start][0], name)
+    best, taken = single, 1
+    if anchored and start + 1 < len(words):
+        pair = _ratio(words[start][0] + words[start + 1][0], name)
+        if pair > single:
+            best, taken = pair, 2
+    return taken if best >= threshold else 0
+
+
+def _strip_once(text: str, phrase: list[str]) -> str | None:
+    """Remove one leading wake phrase. None when there is nothing to remove."""
+    words = _words(text)
+    if not words:
+        return None
+    name = phrase[-1]
+    prefix = phrase[:-1]
+
+    index = 0
+    # A phrase with no fixed prefix, such as a bare "jarvis", is never anchored:
+    # there is nothing corroborating the name, so it has to carry the match on
+    # its own at the stricter threshold.
+    anchored = bool(prefix)
+    for word in prefix:
+        if index < len(words) and _ratio(words[index][0], word) >= _PREFIX_RATIO:
+            index += 1
+        else:
+            anchored = False
+            break
+
+    taken = _match_name(words, index, name, anchored=anchored) if anchored or index == 0 else 0
+    if taken:
+        index += taken
+    elif not (anchored and index > 0):
+        # Neither the name nor a prefix leading into it. Not a wake phrase.
+        return None
+
+    # A bare "hey" with the name mangled beyond recognition still leaves filler
+    # at the front of the question, and it is filler the user did not say to be
+    # transcribed. Dropping it is safe: we are only here because the wake model
+    # fired.
+    return text[words[index - 1][2] :].lstrip(" \t\n,.!?;:-")
+
+
+def strip_wake_word(text: str, wake_word: str) -> str:
+    """Remove the wake phrase from the front of a transcript.
+
+    The wake word is not part of the question. The ring buffer hands the
+    endpointer a second of pre-roll so the front of the request is not clipped,
+    which means the phrase that triggered the turn is inside the audio sent to
+    STT, and every transcript arrives with it attached. Passed through, the
+    assistant answers "Hey, Jardubyse." as though it were the thing asked, which
+    is what it sounds like when it reads the wake word back instead of holding a
+    conversation.
+
+    Matching is fuzzy because the transcriber has no reason to know the word:
+    this machine produced "Hey, Jardubyse.", "Hey, Jadwis!" and "Hey Jarvo" for
+    the same two syllables. See the ratio constants above for where each
+    threshold sits and what it is holding off.
+
+    Args:
+        text: Raw transcript.
+        wake_word: The configured wake phrase, ``hey_jarvis`` or ``"hey jarvis"``.
+
+    Returns:
+        The request with the wake phrase removed, or an empty string when the
+        transcript was nothing but the wake phrase. Text that does not start
+        with the phrase is returned unchanged.
+    """
+    phrase = wake_phrase_words(wake_word)
+    if not phrase:
+        return text.strip()
+    current = text.strip()
+    for _ in range(_MAX_WAKE_REPEATS):
+        stripped = _strip_once(current, phrase)
+        if stripped is None:
+            break
+        current = stripped.strip()
+        if not current:
+            return ""
+    # Punctuation alone is not a question. "Hey Jarvis." leaves "." behind when
+    # the transcriber puts the stop after the phrase.
+    if not any(c.isalnum() for c in current):
+        return ""
+    return current
 
 
 @dataclass(frozen=True, slots=True, eq=False)

@@ -44,6 +44,12 @@ _METRICS_INTERVAL_S = 1.0
 #: is the difference between reporting a hiccup and reporting a mute assistant.
 _MUTE_ESCALATE_AFTER = 5
 
+#: Extra listens granted when an utterance turns out to be the wake phrase and
+#: nothing else. One covers the ordinary case of pausing after "hey jarvis";
+#: the bound is what stops a room that keeps producing wake-word-shaped noise
+#: from holding the turn open forever.
+_MAX_WAKE_ONLY_RETRIES = 2
+
 
 def _register_tools(config: JarvisConfig) -> int:
     """Import every tool module so its decorators register.
@@ -334,12 +340,71 @@ class Assistant:
                 deadline = time.monotonic() + self.config.orchestrator.idle_timeout_s
 
     def _listen(self, timeout_s: float, preroll: Any = None) -> tuple[str, Any]:
-        """Endpoint one utterance and transcribe it. Empty string on silence.
+        """Collect one spoken request. Empty string on silence.
 
         Args:
             timeout_s: How long to wait for the utterance to close.
             preroll: Audio captured before the wake word fired, from
-                :class:`~jarvis.audio.wake.WakeDetection`. Fed through the
+                :class:`~jarvis.audio.wake.WakeDetection`.
+
+        An utterance that turns out to be nothing but the wake phrase is not a
+        request, and answering it is what makes the assistant sound like it is
+        reading the trigger back rather than holding a conversation. It happens
+        whenever the user pauses between "hey jarvis" and the question: the
+        pre-roll opens the utterance on the wake word, the pause closes it, and
+        "Hey, Jardubyse." is handed to the model as the thing that was asked.
+
+        So this listens again instead of answering. The reader is deliberately
+        created once and kept across attempts. A fresh one attaches at the write
+        head, which would drop everything the user said while the first
+        utterance was being transcribed, and that is precisely the moment they
+        are speaking: the front of the question would be missing from the second
+        attempt exactly as often as the wake word polluted the first.
+
+        ``timeout_s`` bounds the whole call, not each attempt. The confirmation
+        gate depends on that: §6 gives the user fifteen seconds to approve a
+        mutating tool and says timeout equals denial, so a retry that restarted
+        the clock would quietly turn that into forty five.
+        """
+        from jarvis.audio.wake import strip_wake_word
+
+        reader = self._capture.reader()
+        deadline = time.monotonic() + timeout_s
+        for attempt in range(_MAX_WAKE_ONLY_RETRIES + 1):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
+            raw, latency = self._listen_once(
+                reader, remaining, preroll if attempt == 0 else None
+            )
+            if not raw:
+                return "", latency
+            text = strip_wake_word(raw, self.config.persona.wake_word)
+            if text:
+                if text != raw:
+                    _log.debug(
+                        "removed the wake phrase from the transcript",
+                        extra={"context": {"raw": raw, "text": text}},
+                    )
+                _log.info("heard", extra={"context": {"text": text}})
+                return text, latency
+            _log.info(
+                "that was only the wake word, still listening",
+                extra={"context": {"text": raw, "attempt": attempt + 1}},
+            )
+        _log.info("heard nothing but the wake word before the window closed")
+        return "", None
+
+    def _listen_once(
+        self, reader: Any, timeout_s: float, preroll: Any = None
+    ) -> tuple[str, Any]:
+        """Endpoint one utterance on ``reader`` and transcribe it verbatim.
+
+        Args:
+            reader: Cursor into the capture ring. Owned by the caller so that
+                consecutive attempts share one unbroken timeline.
+            timeout_s: How long to wait for the utterance to close.
+            preroll: Audio captured before the wake word fired. Fed through the
                 endpointer before the live stream so the utterance starts
                 unclipped.
 
@@ -351,7 +416,6 @@ class Assistant:
         "hey jarvis what time is it" as one phrase lost the front of the
         question, and the transcriber was handed a sentence starting mid-word.
         """
-        reader = self._capture.reader()
         self._endpointer.reset()
         frame_samples = self.config.vad.frame_samples
         deadline = time.monotonic() + timeout_s
@@ -569,8 +633,10 @@ class Assistant:
             # Endpointed but nothing came back. Worth a line: from outside it is
             # indistinguishable from never having heard anything.
             _log.info("the transcriber returned nothing for that utterance")
-        else:
-            _log.info("heard", extra={"context": {"text": text}})
+        # The verbatim transcript is logged by audio.stt. What was asked, once
+        # the wake phrase is off the front, is logged by the caller: those two
+        # differ on nearly every turn and it is the second one that explains the
+        # answer.
         return text, latency
 
     def _speak(self, text: str) -> None:

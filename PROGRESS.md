@@ -398,6 +398,12 @@ page the user had open could read the live transcript.
 
 All 23 confirmed findings are closed.
 
+### Found on the target host, third pass
+
+| # | Severity | What was wrong |
+|---|---|---|
+| 24 | high | The wake phrase reached the model as the question. Fix 5 above prepends the pre-roll so the front of a request is not clipped, which also puts "hey jarvis" inside the audio sent to STT, and nothing removed it. Pause between the trigger and the question and the utterance is the trigger alone: the machine transcribed "Hey, Jardubyse." and answered that. `strip_wake_word` now takes the phrase off the front, fuzzily, because the transcriber has no reason to know the word; an utterance that was nothing but the trigger listens again instead of answering, on the same ring cursor so the question the user is already speaking is not lost, and inside the caller's own deadline so §6's fifteen second confirmation window is unchanged. |
+
 ### Notes
 
 * Two tests in this repo asserted bugs as correct behaviour and so kept them

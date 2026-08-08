@@ -1205,3 +1205,183 @@ class TestALappedReaderIsNotSpliced:
 
         text, _latency = assistant._listen(2.0)
         assert text == "how busy is the cpu"
+
+
+class _AlwaysTheWakeWord:
+    """A transcriber that hears the trigger phrase and nothing else, forever."""
+
+    def __init__(self, text: str = "Hey, Jardubyse.") -> None:
+        self.text = text
+        self.calls = 0
+
+    def transcribe(self, audio: Any, sample_rate: int = 16_000) -> Transcript:
+        self.calls += 1
+        return Transcript(
+            text=self.text, language="en", duration_s=1.0, rtf=0.1, segments=(),
+            no_speech_prob=0.0,
+        )
+
+
+class TestTheWakeWordIsNotTheQuestion:
+    """A turn whose whole transcript is the trigger phrase is not a request.
+
+    The pre-roll that keeps the front of a question from being clipped also puts
+    the wake phrase into the audio sent to STT. Say "hey jarvis", pause, and the
+    endpointer opens on the phrase and closes on the pause: the utterance is the
+    trigger and nothing else, and it went to the model as the thing that was
+    asked. On the target host that produced replies to "Hey, Jardubyse.", which
+    is what it sounds like when the assistant reads the wake word back at you
+    instead of holding a conversation.
+    """
+
+    @staticmethod
+    def _ready(assistant: Assistant) -> None:
+        """Register the worker _listen polls, or it exits before reading a frame."""
+        assistant.supervisor.add("turn-loop", lambda: None)
+
+    def test_the_phrase_is_stripped_off_the_front_of_the_question(
+        self, config: JarvisConfig
+    ) -> None:
+        assistant = Assistant(config, headless=True)
+        parts = _wire(assistant, config, ["Hey Jarvis, what time is it"])
+        self._ready(assistant)
+        assistant._capture.start()
+        try:
+            text, _latency = assistant._listen(2.0)
+        finally:
+            assistant._capture.stop()
+
+        assert text == "what time is it"
+        assert parts["transcriber"].calls == 1, "one utterance should need one transcription"
+
+    def test_a_pause_after_the_phrase_does_not_end_the_turn(
+        self, config: JarvisConfig
+    ) -> None:
+        """The exact shape seen in the log: trigger, pause, then the question."""
+        assistant = Assistant(config, headless=True)
+        parts = _wire(assistant, config, ["Hey, Jardubyse.", "what time is it"])
+        self._ready(assistant)
+        assistant._capture.start()
+        try:
+            text, latency = assistant._listen(2.0)
+        finally:
+            assistant._capture.stop()
+
+        assert text == "what time is it", "the wake word was answered as the question"
+        assert parts["transcriber"].calls == 2, "it stopped listening after the wake word"
+        assert latency is not None, "the turn clock must run from the real question"
+
+    def test_a_trigger_with_nothing_after_it_answers_nothing(
+        self, config: JarvisConfig
+    ) -> None:
+        assistant = Assistant(config, headless=True)
+        _wire(assistant, config, ["Hey Jarvis"])
+        self._ready(assistant)
+        assistant._capture.start()
+        try:
+            text, _latency = assistant._listen(2.0)
+        finally:
+            assistant._capture.stop()
+        assert text == ""
+
+    def test_one_cursor_serves_every_attempt(self, config: JarvisConfig) -> None:
+        """A second cursor would attach at the write head and lose the question.
+
+        The user starts speaking while the first utterance is still being
+        transcribed, which on this hardware is over a second. Re-attaching then
+        drops exactly the audio the retry exists to catch, so the front of the
+        question would go missing as often as the wake word polluted it.
+        """
+        assistant = Assistant(config, headless=True)
+        parts = _wire(assistant, config, ["Hey, Jardubyse.", "what time is it"])
+        self._ready(assistant)
+        real = assistant._capture
+        real.start()
+        handed: list[Any] = []
+
+        class CountingCapture:
+            def reader(self, **kwargs: Any) -> Any:
+                handed.append(real.reader(**kwargs))
+                return handed[-1]
+
+            def stop(self) -> None:
+                real.stop()
+
+        assistant._capture = CountingCapture()
+        try:
+            text, _latency = assistant._listen(2.0)
+        finally:
+            real.stop()
+
+        assert text == "what time is it"
+        assert parts["transcriber"].calls == 2
+        assert len(handed) == 1, "the retry re-attached and lost what was said meanwhile"
+
+    def test_retrying_never_outlives_the_caller_s_deadline(
+        self, config: JarvisConfig
+    ) -> None:
+        """§6 gives fifteen seconds to approve a mutating tool, and no more.
+
+        The confirmation gate collects its yes or no through this same call, so
+        a retry that restarted the clock would quietly turn "timeout equals
+        denial" into three times the contract. The budget bounds the whole call,
+        not each attempt.
+        """
+        assistant = Assistant(config, headless=True)
+        _wire(assistant, config, [])
+        assistant._transcriber = _AlwaysTheWakeWord()
+        self._ready(assistant)
+        assistant._capture.start()
+
+        budget = 1.0
+        seen: list[tuple[float, float]] = []
+        original = assistant._listen_once
+
+        def spy(reader: Any, timeout_s: float, preroll: Any = None) -> Any:
+            seen.append((time.monotonic(), timeout_s))
+            return original(reader, timeout_s, preroll)
+
+        assistant._listen_once = spy  # type: ignore[method-assign]
+        started = time.monotonic()
+        try:
+            text, _latency = assistant._listen(budget)
+        finally:
+            assistant._capture.stop()
+
+        assert text == "", "the wake word was accepted as an answer"
+        assert len(seen) > 1, "nothing retried, so this proves nothing about the bound"
+        for at, granted in seen:
+            assert at + granted <= started + budget + 0.05, (
+                "an attempt was granted time past the caller's deadline"
+            )
+
+    def test_a_wake_word_only_turn_never_reaches_the_model(
+        self, config: JarvisConfig
+    ) -> None:
+        """End to end into the orchestrator, which is where it was observed."""
+        assistant = Assistant(config, headless=True)
+        parts = _wire(assistant, config, ["Hey, Jadwis!", "how much memory is free"])
+        self._ready(assistant)
+
+        sent: list[Any] = []
+        llm = parts["llm"]
+        original = llm.chat_stream
+
+        def record(messages: Any, **kwargs: Any) -> Any:
+            sent.append(list(messages))
+            return original(messages, **kwargs)
+
+        llm.chat_stream = record  # type: ignore[method-assign]
+
+        assistant._capture.start()
+        try:
+            text, latency = assistant._listen(2.0)
+            assistant._orchestrator.run_turn(text, speak=lambda _chunk: None, turn=latency)
+        finally:
+            assistant._capture.stop()
+
+        assert sent, "no turn reached the model"
+        asked = [m for m in sent[-1] if m.get("role") == "user"]
+        assert asked, "no user turn reached the model"
+        assert asked[-1]["content"] == "how much memory is free"
+        assert "Jadwis" not in str(sent[-1]), "the trigger phrase was sent as the question"

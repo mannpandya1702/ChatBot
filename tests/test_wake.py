@@ -1122,3 +1122,145 @@ class TestALappedListenerResyncs:
         frame = cfg.wake.frame_samples
         listener = self._listener(cfg, Weird([ramp(frame) for _ in range(2)]))
         assert listener._next_frame(frame) is not None
+
+
+class TestTheWakePhraseIsNotTheQuestion:
+    """The trigger phrase must not reach the model as the thing that was asked.
+
+    The pre-roll that stops the front of a request being clipped also puts the
+    wake phrase inside the audio sent to STT, so every transcript arrives with
+    it attached. On the target host that produced turns where the assistant
+    answered "Hey, Jardubyse." as though it were a question, which is what it
+    sounds like when it reads the trigger back instead of holding a
+    conversation.
+
+    The mangled forms below are verbatim from that machine's transcriber, not
+    invented: "Jarvis" is not in its vocabulary and it guesses differently every
+    time.
+    """
+
+    OBSERVED = ["Hey, Jardubyse.", "Hey, Jadwis!", "Hey Jarvis", "Hey Jarvo", "Hey Jarvis."]
+
+    @pytest.mark.parametrize("text", OBSERVED)
+    def test_a_transcript_of_only_the_wake_phrase_leaves_nothing(self, text: str) -> None:
+        assert wake_module.strip_wake_word(text, "hey_jarvis") == ""
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("Hey Jarvis, what time is it?", "what time is it?"),
+            ("Hey Jarvis what's my CPU doing", "what's my CPU doing"),
+            ("Hey Jardubyse, how much RAM do I have?", "how much RAM do I have?"),
+            ("Hey Jadwis! how hot is the GPU", "how hot is the GPU"),
+            ("Jarvis, how are you", "how are you"),
+            ("Javis how much disk space is left", "how much disk space is left"),
+        ],
+    )
+    def test_the_question_survives_with_its_own_casing_and_punctuation(
+        self, text: str, expected: str
+    ) -> None:
+        assert wake_module.strip_wake_word(text, "hey_jarvis") == expected
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "what time is it",
+            "How's my system doing",
+            "Java is a language",
+            "Jarred me the file",
+            "Is the harvest service running",
+            "yes",
+            "no",
+            "stop",
+        ],
+    )
+    def test_a_real_request_is_returned_untouched(self, text: str) -> None:
+        """The stripper is a scalpel, not a filter.
+
+        "Java" (0.60 against "jarvis") and "jarred" (0.50) are the dangerous
+        neighbours: both are ordinary words that a looser unanchored threshold
+        would eat the front of the sentence for.
+        """
+        assert wake_module.strip_wake_word(text, "hey_jarvis") == text
+
+    def test_a_split_name_still_counts_when_hey_anchors_it(self) -> None:
+        """A transcriber that does not know the word sometimes breaks it in two.
+
+        "jarv is" scores 0.92 against "jarvis" joined and neither half clears
+        anything alone.
+        """
+        assert wake_module.strip_wake_word("Hey Jarv is, how are you", "hey_jarvis") == (
+            "how are you"
+        )
+
+    def test_the_split_is_not_tried_without_the_anchor(self) -> None:
+        """Because "java is" joins to "javais", which scores 0.83.
+
+        Unanchored the threshold is 0.8, so allowing the join here would swallow
+        the first two words of "Java is a language" and answer a question about
+        "a language".
+        """
+        assert wake_module.strip_wake_word("Java is a language", "hey_jarvis") == (
+            "Java is a language"
+        )
+
+    def test_a_repeated_phrase_is_removed_to_the_end(self) -> None:
+        """Users repeat themselves when the first try seems to do nothing."""
+        assert wake_module.strip_wake_word(
+            "Hey Jarvis. Hey Jarvis. What time is it", "hey_jarvis"
+        ) == "What time is it"
+
+    def test_repetition_is_bounded(self) -> None:
+        """A pathological transcript must not make this loop for long."""
+        text = "Hey Jarvis. " * 40
+        assert wake_module.strip_wake_word(text, "hey_jarvis") == ("Hey Jarvis. " * 37).strip()
+
+    def test_leading_filler_goes_even_when_the_name_is_unrecognisable(self) -> None:
+        """We are only here because the wake model fired.
+
+        A bare "Hey" left on the front is a word the user did not intend to
+        have transcribed, and dropping it cannot change what was asked.
+        """
+        assert wake_module.strip_wake_word("Hey there, how are you", "hey_jarvis") == (
+            "there, how are you"
+        )
+
+    def test_punctuation_alone_is_not_a_question(self) -> None:
+        assert wake_module.strip_wake_word("Hey Jarvis ...", "hey_jarvis") == ""
+        assert wake_module.strip_wake_word("...", "hey_jarvis") == ""
+        assert wake_module.strip_wake_word("", "hey_jarvis") == ""
+
+    def test_a_bare_name_phrase_has_no_anchor_to_lean_on(self) -> None:
+        """Configure ``wake_word: jarvis`` and the strict threshold applies.
+
+        Nothing corroborates the match, so the loose 0.5 used after "hey" would
+        be reading tea leaves.
+        """
+        assert wake_module.strip_wake_word("Jarvis what time is it", "jarvis") == (
+            "what time is it"
+        )
+        assert wake_module.strip_wake_word("Java is a language", "jarvis") == (
+            "Java is a language"
+        )
+        assert wake_module.strip_wake_word("Jarvo what time is it", "jarvis") == (
+            "Jarvo what time is it"
+        )
+
+    @pytest.mark.parametrize("spelling", ["hey_jarvis", "hey jarvis", "Hey Jarvis"])
+    def test_the_configured_phrase_is_read_as_a_model_name_or_a_phrase(
+        self, spelling: str
+    ) -> None:
+        """``persona.wake_word`` is both, depending on who is reading it."""
+        assert wake_module.strip_wake_word("Hey Jarvis, what time is it", spelling) == (
+            "what time is it"
+        )
+
+    def test_an_unusable_configured_phrase_changes_nothing(self) -> None:
+        assert wake_module.strip_wake_word("  what time is it  ", "") == "what time is it"
+
+    def test_a_different_assistant_name_is_honoured(self) -> None:
+        """Nothing here is hardcoded to Jarvis."""
+        assert wake_module.strip_wake_word("Hey Athena, what time is it", "hey_athena") == (
+            "what time is it"
+        )
+        assert wake_module.strip_wake_word("Hey Athena", "hey_athena") == ""
