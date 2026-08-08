@@ -1385,3 +1385,75 @@ class TestTheWakeWordIsNotTheQuestion:
         assert asked, "no user turn reached the model"
         assert asked[-1]["content"] == "how much memory is free"
         assert "Jadwis" not in str(sent[-1]), "the trigger phrase was sent as the question"
+
+
+class TestTheLanguageModelIsWarmedToo:
+    """Three engines were warmed at startup and the slowest was not one of them.
+
+    Silero, faster-whisper and Kokoro are all loaded before the first question so
+    it does not pay for them. Ollama was left out, so the first question of every
+    session paid to load the weights and then to evaluate the whole preamble,
+    about 3,750 tokens of system prompt and tool schemas. On the cpu tier that is
+    the larger half of the wait, and it is paid again after every idle gap long
+    enough for keep_alive to expire.
+    """
+
+    def test_startup_warms_it(self, config: JarvisConfig) -> None:
+        assistant = Assistant(config, headless=True)
+        _wire(assistant, config, [])
+        warmed: list[bool] = []
+        assistant._orchestrator.warmup = lambda: warmed.append(True) or {}  # type: ignore[method-assign]
+
+        assistant.start()
+        try:
+            deadline = time.monotonic() + 5.0
+            while not warmed and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert warmed, "the model was never warmed"
+        finally:
+            assistant.stop()
+
+    def test_a_warmup_that_fails_does_not_stop_the_assistant(
+        self, config: JarvisConfig
+    ) -> None:
+        """Ollama being down makes the first answer slow, not the loop dead."""
+        assistant = Assistant(config, headless=True)
+        _wire(assistant, config, [])
+
+        def explode() -> dict[str, Any]:
+            raise RuntimeError("ollama is not running")
+
+        assistant._orchestrator.warmup = explode  # type: ignore[method-assign]
+
+        assistant.start()
+        try:
+            time.sleep(0.3)
+            assert assistant.supervisor.health().healthy
+        finally:
+            assistant.stop()
+
+    def test_the_warmup_preamble_is_the_one_a_turn_will_send(
+        self, config: JarvisConfig
+    ) -> None:
+        """Warming a different prefix buys the weights and nothing else.
+
+        Ollama reuses its KV cache only for a prompt prefix it has already seen,
+        so the system prompt and the tool schemas have to match a real turn
+        exactly or the first question evaluates all of them again anyway.
+        """
+        assistant = Assistant(config, headless=True)
+        _wire(assistant, config, [])
+        orchestrator = assistant._orchestrator
+        asked: list[tuple[str, Any]] = []
+
+        def record(prompt: str, *, tools: Any = None) -> dict[str, Any]:
+            asked.append((prompt, tools))
+            return {"prompt_eval_count": 3748}
+
+        orchestrator._llm.warmup = record  # type: ignore[attr-defined]
+        orchestrator.warmup()
+
+        assert asked, "the orchestrator never called through to the client"
+        prompt, tools = asked[0]
+        assert prompt == orchestrator.system_prompt()
+        assert tools == orchestrator._registry.ollama_tools(config=config)

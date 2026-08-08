@@ -677,8 +677,19 @@ class TestTheThinkingSwitchIsBeltAndBraces:
         assert body["think"] is True
         assert body["messages"][-1]["content"] == "plan this out /think"
 
-    def test_only_the_last_user_turn_carries_it(self, tmp_path: Path) -> None:
-        """Qwen3's template reads the most recent one, and repeats add nothing."""
+    def test_the_system_message_carries_it_so_the_prefix_never_moves(
+        self, tmp_path: Path
+    ) -> None:
+        """On the last user turn instead, the cached prefix breaks every turn.
+
+        Ollama reuses its KV cache for the longest prompt prefix it has already
+        seen, and the system prompt plus the tool schemas are about 3,750 tokens
+        of it. Put the switch on the last user message and turn two sends turn
+        one's question *without* the suffix it was sent with, so the two prompts
+        diverge back at the first question and everything after it is evaluated
+        again. On the system message the prefix is byte for byte identical and
+        the conversation only ever grows.
+        """
         body = self._capture(
             self._config(tmp_path, "qwen3:4b"),
             [
@@ -689,7 +700,23 @@ class TestTheThinkingSwitchIsBeltAndBraces:
             ],
         )
         contents = [m["content"] for m in body["messages"]]
-        assert contents == ["you are jarvis", "first", "answered", "second /no_think"]
+        assert contents == ["you are jarvis /no_think", "first", "answered", "second"]
+
+    def test_the_prefix_is_identical_across_turns(self, tmp_path: Path) -> None:
+        """The property the choice above exists for, asserted directly."""
+        config = self._config(tmp_path, "qwen3:4b")
+        turn_one = self._capture(config, [
+            {"role": "system", "content": "you are jarvis"},
+            {"role": "user", "content": "first"},
+        ])
+        turn_two = self._capture(config, [
+            {"role": "system", "content": "you are jarvis"},
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "answered"},
+            {"role": "user", "content": "second"},
+        ])
+        shared = turn_two["messages"][: len(turn_one["messages"])]
+        assert shared == turn_one["messages"], "turn two re-sent turn one differently"
 
     def test_a_model_that_does_not_read_the_switch_never_sees_it(
         self, tmp_path: Path
@@ -709,11 +736,39 @@ class TestTheThinkingSwitchIsBeltAndBraces:
         )
         assert body["messages"][-1]["content"] == "work through this /think"
 
-    def test_a_conversation_with_no_user_turn_is_untouched(self, tmp_path: Path) -> None:
+    def test_without_a_system_message_the_last_user_turn_takes_it(
+        self, tmp_path: Path
+    ) -> None:
+        """Qwen3's other documented home for the switch, and the only one left."""
         body = self._capture(
-            self._config(tmp_path, "qwen3:4b"), [{"role": "system", "content": "hello"}]
+            self._config(tmp_path, "qwen3:4b"),
+            [{"role": "user", "content": "first"}, {"role": "user", "content": "second"}],
         )
-        assert body["messages"] == [{"role": "system", "content": "hello"}]
+        assert [m["content"] for m in body["messages"]] == ["first", "second /no_think"]
+
+    def test_a_conversation_with_no_messages_at_all_is_untouched(
+        self, tmp_path: Path
+    ) -> None:
+        body = self._capture(self._config(tmp_path, "qwen3:4b"), [])
+        assert body["messages"] == []
+
+    def test_the_think_key_is_withheld_from_models_without_the_mode(
+        self, tmp_path: Path
+    ) -> None:
+        """Ollama 0.9 and later validate it and refuse the whole request.
+
+        Sending it unconditionally turns "the user configured llama3" into a
+        400 on every single turn, which reads as the assistant being broken.
+        """
+        body = self._capture(
+            self._config(tmp_path, "llama3.1:8b"), [{"role": "user", "content": "hi"}]
+        )
+        assert "think" not in body
+
+        body = self._capture(
+            self._config(tmp_path, "qwen3:4b"), [{"role": "user", "content": "hi"}]
+        )
+        assert body["think"] is False
 
     def test_the_caller_s_messages_are_not_modified(self, tmp_path: Path) -> None:
         """Memory keeps what was said, not what went on the wire."""
@@ -755,3 +810,74 @@ class TestTheThinkingSwitchIsBeltAndBraces:
         ):
             list(client.chat_stream([]))
         assert not [r for r in caplog.records if "thrown away" in r.getMessage()]
+
+
+class TestTheModelIsWarmedLikeEveryOtherEngine:
+    """Three engines were warmed at startup and this was the one left cold.
+
+    ``Assistant._warm_engines`` loads Silero, faster-whisper and Kokoro so the
+    first question of a session does not pay for them. Ollama was not in that
+    list, so the first question paid for loading the weights *and* for
+    evaluating the whole preamble, roughly 3,750 tokens of system prompt and
+    tool schemas. On the ``cpu`` tier that is the larger half of the wait the
+    user described as "it replies late".
+    """
+
+    @staticmethod
+    def _config(tmp_path: Path, model: str = "qwen3:4b") -> JarvisConfig:
+        return load_config(tmp_path / "absent.yaml", llm={"model": model})
+
+    def test_the_warmup_sends_the_preamble_a_real_turn_will_send(
+        self, tmp_path: Path
+    ) -> None:
+        """A different preamble buys the weights and nothing else.
+
+        Ollama reuses its cache for a prefix it has already seen, so warming
+        with some other prompt leaves the first real question paying the full
+        evaluation anyway.
+        """
+        seen: list[dict[str, Any]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(json.loads(request.content))
+            return httpx.Response(
+                200, json={"message": {"content": ""}, "done": True, "prompt_eval_count": 3748}
+            )
+
+        schema = [{"type": "function", "function": {"name": "sys.cpu", "parameters": {}}}]
+        with _client(self._config(tmp_path), handler) as client:
+            metrics = client.warmup("you are jarvis", tools=schema)
+
+        body = seen[0]
+        assert body["messages"][0] == {"role": "system", "content": "you are jarvis /no_think"}
+        assert body["tools"] == schema
+        assert body["stream"] is False
+        assert body["options"]["num_predict"] == 1, "warmup should not generate a reply"
+        assert body["keep_alive"] == self._config(tmp_path).llm.keep_alive
+        assert metrics["prompt_eval_count"] == 3748
+
+    def test_a_cold_model_is_slow_rather_than_fatal(self, tmp_path: Path) -> None:
+        """Startup must survive Ollama being down. The voice loop does not need it."""
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("connection refused")
+
+        with _client(self._config(tmp_path), handler) as client:
+            assert client.warmup("you are jarvis") == {}
+
+    def test_a_refused_request_is_reported_not_raised(self, tmp_path: Path) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(404, json={"error": "model not found"})
+
+        with _client(self._config(tmp_path), handler) as client:
+            assert client.warmup("you are jarvis") == {}
+
+    def test_ollama_s_own_timings_are_converted_for_a_human(self) -> None:
+        """Nanoseconds in the wire format, seconds in the log."""
+        from jarvis.brain.llm import timing_seconds
+
+        assert timing_seconds(
+            {"load_duration": 2_500_000_000, "eval_duration": 9_000_000_000, "eval_count": 40}
+        ) == {"load_s": 2.5, "eval_s": 9.0}
+        assert timing_seconds({}) == {}
+        assert timing_seconds({"load_duration": 0}) == {}, "a zero is not a measurement"

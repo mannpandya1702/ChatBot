@@ -224,6 +224,7 @@ class Assistant:
             Silero VAD        86 ms   (steady 0.2 ms, §3 budget 250 ms)
             faster-whisper  3,722 ms  (steady 306 ms, §3 budget 200 ms)
             Kokoro          7,706 ms  (steady 568 ms, §3 budget 300 ms)
+            Ollama          model load plus one full preamble evaluation
 
         So the first question of every session took about eleven seconds longer
         than every question after it, which reads as the assistant being broken
@@ -258,6 +259,15 @@ class Assistant:
                 self._synth.begin_utterance()
             except Exception:  # noqa: BLE001
                 _log.debug("could not warm the synthesiser", exc_info=True)
+
+            # Last, and the largest of the four. The other three load a model;
+            # this one also makes Ollama evaluate the preamble, about 3,750
+            # tokens of system prompt and tool schemas, which it then reuses
+            # from its cache for every question in the session.
+            try:
+                self._orchestrator.warmup()
+            except Exception:  # noqa: BLE001
+                _log.debug("could not warm the language model", exc_info=True)
 
             _log.info(
                 "engines warm",

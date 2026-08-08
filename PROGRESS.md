@@ -406,6 +406,16 @@ All 23 confirmed findings are closed.
 
 | 25 | high | Qwen3 was thinking anyway, and the deliberation was generated before being discarded. `think: false` goes in the request body and `ReasoningFilter` catches the inline `<think>` that an Ollama or a template which ignores that key still emits, so the reasoning never reaches the ear, the transcript, or the first-token measurement. It reaches the clock: on the `cpu` tier at a few tokens a second a couple of hundred thrown-away tokens is fifteen seconds of silence before the answer starts, which is what "it replies late" sounds like. The wire payload now also carries Qwen3's own `/no_think` switch on the last user turn, and a turn that discards reasoning says so at info with the character count and the seconds it cost. |
 
+### Found by the audit, fourth pass
+
+| # | Severity | What was wrong |
+|---|---|---|
+| 26 | high | The wake stripper deleted the first word of ordinary sentences. `_PREFIX_RATIO` was 0.8 with a `>=`, and the constant's own comment named the two words that break it: "they" scores 0.857 against "hey" and "he" scores 0.800, so both matched the prefix and the leading-filler rule then removed them. "They keep crashing" reached the model as "keep crashing". Raised to 0.9, which sits above both and below nothing useful. |
+| 27 | high | Nothing warmed Ollama. `_warm_engines` loads Silero, faster-whisper and Kokoro so the first question does not pay for them, and the slowest engine was not in the list, so the first question of every session paid to load the weights and then to evaluate the whole preamble, about 3,750 tokens of system prompt and tool schemas. `OllamaClient.warmup` sends exactly the preamble a real turn sends, with `num_predict` 1, so Ollama's KV cache has the prefix before the user speaks. |
+| 28 | medium | Qwen3's `/no_think` switch was appended to the last user turn, which moves it every turn: turn two re-sends turn one's question without the suffix it was sent with, the prompts diverge there, and everything after is evaluated again. Moved to the system message, which Qwen3 documents equally and which leaves the prefix byte for byte identical across turns. |
+| 29 | medium | `think` was sent to every model. Ollama 0.9 and later validate the key and refuse the whole request for a model with no thinking mode, so a user who configured llama3 would get a 400 on every turn. Now gated on the same model check as the prompt switch. |
+| 30 | low | Ollama's own timings were parsed into `ChatChunk.metrics` and never read. `prompt_eval_count` is the only thing that distinguishes a cached prefix from a re-evaluated one, which on the cpu tier is seconds; it is now logged once per turn along with the measured tokens per second. |
+
 ### Notes
 
 * Two tests in this repo asserted bugs as correct behaviour and so kept them

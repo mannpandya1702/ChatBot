@@ -152,9 +152,13 @@ def _as_float32(samples: Samples) -> Samples:
 _NOT_WORD = re.compile(r"[^a-z0-9']+")
 
 #: How closely a leading token must match a fixed word of the wake phrase, for
-#: example "hey". These are short and common, so a loose threshold here starts
-#: eating real questions: "they" and "he" both score 0.80 against "hey".
-_PREFIX_RATIO = 0.8
+#: example "hey". These are short and common, so the bar has to sit above the
+#: ordinary words that are one edit away from them. "they" scores 0.857 against
+#: "hey" and "he" scores 0.800, and at 0.8 with a ``>=`` both matched: "They
+#: keep crashing" lost its first word and became "keep crashing". There is
+#: nothing useful between 0.9 and a real "hey", so this is close to an exact
+#: match by design, and that is the right shape for a word this short.
+_PREFIX_RATIO = 0.9
 
 #: How closely a token must match the assistant's name when the phrase's fixed
 #: prefix already matched. Deliberately loose. openWakeWord has just told us the

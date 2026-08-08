@@ -1215,6 +1215,25 @@ class TestTheWakePhraseIsNotTheQuestion:
         text = "Hey Jarvis. " * 40
         assert wake_module.strip_wake_word(text, "hey_jarvis") == ("Hey Jarvis. " * 37).strip()
 
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "They keep crashing",
+            "They are using all the memory",
+            "He said it was fine",
+            "Heyward called",
+        ],
+    )
+    def test_a_word_one_edit_from_hey_is_not_hey(self, text: str) -> None:
+        """The threshold has to sit above the ordinary words, not on them.
+
+        "they" scores 0.857 against "hey" and "he" scores 0.800. At a threshold
+        of 0.8 with a ``>=`` both matched the prefix and the leading-filler rule
+        then deleted them, so "They keep crashing" reached the model as "keep
+        crashing" and the question changed meaning on the way in.
+        """
+        assert wake_module.strip_wake_word(text, "hey_jarvis") == text
+
     def test_leading_filler_goes_even_when_the_name_is_unrecognisable(self) -> None:
         """We are only here because the wake model fired.
 

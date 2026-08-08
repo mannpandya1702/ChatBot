@@ -31,6 +31,8 @@ __all__ = [
     "OllamaClient",
     "ReasoningFilter",
     "ToolCall",
+    "supports_thinking",
+    "timing_seconds",
 ]
 
 _log = logging.getLogger(__name__)
@@ -78,6 +80,34 @@ REASONING_TAGS: tuple[tuple[str, str], ...] = (
 )
 
 
+#: Ollama's own per-request timings, in the order it reports them. Nanoseconds.
+_OLLAMA_TIMINGS = (
+    "total_duration",
+    "load_duration",
+    "prompt_eval_count",
+    "prompt_eval_duration",
+    "eval_count",
+    "eval_duration",
+)
+
+
+def timing_seconds(metrics: dict[str, Any]) -> dict[str, float]:
+    """Ollama's nanosecond durations as seconds, for a log a human reads.
+
+    ``prompt_eval_count`` is the number worth watching on a slow machine: it
+    counts the tokens Ollama had to evaluate rather than reuse from its cache.
+    A first turn reports the whole preamble, a few thousand tokens; every turn
+    after it should report only what is new. If it does not, the prompt prefix
+    is changing between turns and the machine is paying for all of it again.
+    """
+    out: dict[str, float] = {}
+    for key in ("load_duration", "prompt_eval_duration", "eval_duration"):
+        value = metrics.get(key)
+        if isinstance(value, (int, float)) and value:
+            out[key.replace("_duration", "_s")] = round(value / 1e9, 2)
+    return out
+
+
 #: Qwen3's in-prompt switches for its thinking mode. The API parameter is the
 #: right way to ask and these are the fallback for when it is not honoured.
 _THINK_SWITCH = {True: "/think", False: "/no_think"}
@@ -89,10 +119,20 @@ _THINK_SWITCH = {True: "/think", False: "/no_think"}
 _SWITCHABLE_MODELS = ("qwen3",)
 
 
+def supports_thinking(model: str) -> bool:
+    """Whether ``model`` understands the thinking controls at all.
+
+    Ollama validates the ``think`` key from 0.9 onwards and rejects the request
+    outright for a model that does not support it, so sending it unconditionally
+    turns "the user configured llama3" into a 400 on every turn.
+    """
+    return any(tag in model.lower() for tag in _SWITCHABLE_MODELS)
+
+
 def _switch_thinking(
     messages: Sequence[dict[str, Any]], model: str, *, thinking: bool
 ) -> list[dict[str, Any]]:
-    """Add Qwen3's thinking switch to the last user turn.
+    """Add Qwen3's thinking switch to the system message.
 
     Belt and braces for the failure :class:`ReasoningFilter` was written
     against. ``think`` in the request body is the documented control, but an
@@ -103,22 +143,41 @@ def _switch_thinking(
     tokens is fifteen seconds of silence before the answer starts, which is what
     "it replies late" sounds like from the outside.
 
-    The switch goes on the last user message because that is what Qwen3's
-    template scans for. Applied to the wire payload only, so conversation memory
-    keeps what the user actually said.
+    Qwen3 documents the switch for user *or* system messages, and the system
+    message is the one to use. Ollama reuses the KV cache only for the longest
+    prompt prefix it has already seen, and the system prompt plus the tool
+    schemas are about 3,750 tokens of it. Putting the switch on the last user
+    turn moves it every turn: turn two sends turn one's question without the
+    suffix it was sent with, the prompts diverge at that point, and everything
+    from there on is evaluated again. On the system message the prefix is
+    identical every turn and the conversation only ever grows, which is the
+    shape prefix caching wants.
+
+    A switch the user spoke is left alone and nothing is added, because Qwen3
+    honours the last occurrence and a system-level default would be the earlier
+    one anyway. Applied to the wire payload only, so conversation memory keeps
+    what the user actually said.
     """
     conversation = [dict(m) for m in messages]
-    if not any(tag in model.lower() for tag in _SWITCHABLE_MODELS):
+    if not supports_thinking(model):
         return conversation
     switch = _THINK_SWITCH[thinking]
-    for message in reversed(conversation):
-        if message.get("role") != "user":
-            continue
-        content = str(message.get("content") or "")
-        if _THINK_SWITCH[True] in content or _THINK_SWITCH[False] in content:
-            return conversation
-        message["content"] = f"{content} {switch}".strip()
+    if any(
+        _THINK_SWITCH[True] in str(m.get("content") or "")
+        or _THINK_SWITCH[False] in str(m.get("content") or "")
+        for m in conversation
+    ):
         return conversation
+    for message in conversation:
+        if message.get("role") == "system":
+            message["content"] = f"{message.get('content') or ''!s} {switch}".strip()
+            return conversation
+    # No system message. The last user turn is Qwen3's other documented home for
+    # the switch, and a conversation with neither is nothing to reason about.
+    for message in reversed(conversation):
+        if message.get("role") == "user":
+            message["content"] = f"{message.get('content') or ''!s} {switch}".strip()
+            return conversation
     return conversation
 
 
@@ -363,7 +422,11 @@ class OllamaClient:
                 "num_predict": llm.num_predict,
             },
         }
-        body["think"] = thinking
+        # Only for models that have it. Ollama 0.9 and later validate this key
+        # and refuse the whole request for a model without a thinking mode, so
+        # sending it to everything makes a supported configuration fail.
+        if supports_thinking(name):
+            body["think"] = thinking
         if tools:
             body["tools"] = list(tools)
         return body
@@ -552,6 +615,70 @@ class OllamaClient:
                 metrics = chunk.metrics
         return ChatResponse(content="".join(content), tool_calls=calls, metrics=metrics)
 
+    def warmup(
+        self,
+        system_prompt: str,
+        *,
+        tools: Sequence[dict[str, Any]] | None = None,
+        model: str | None = None,
+    ) -> dict[str, Any]:
+        """Load the model and evaluate the preamble before the user asks anything.
+
+        Three engines are warmed at startup and this was not one of them, so the
+        first question of every session paid for loading the weights and then
+        for evaluating the whole preamble, which on the ``cpu`` tier is the
+        larger half of "it replies late". Both costs are paid once if they are
+        paid here instead: ``keep_alive`` holds the weights, and Ollama reuses
+        the KV cache for the longest prompt prefix it has already seen, which is
+        exactly the system prompt and the tool schemas sent here.
+
+        ``num_predict`` is 1 because generation is not the point. The prompt is
+        evaluated in full either way, and that is the part being bought.
+
+        Args:
+            system_prompt: The same prompt the orchestrator will send, verbatim.
+                A different one warms a prefix no real turn will match.
+            tools: The same schemas the orchestrator will send.
+            model: Overrides the configured model.
+
+        Returns:
+            Ollama's own timings for the call, empty when it could not be made.
+            Never raises: a cold model is slow, not broken.
+        """
+        name = model or self._config.llm_model()
+        body = self._payload(
+            [{"role": "system", "content": system_prompt}, {"role": "user", "content": "ready"}],
+            tools=tools,
+            model=name,
+            stream=False,
+            think=None,
+        )
+        body["options"]["num_predict"] = 1
+        started = time.perf_counter()
+        try:
+            response = self._client.post(self._url("/api/chat"), json=body)
+            self._raise_for_status(response, name)
+            payload = response.json()
+        except (httpx.HTTPError, json.JSONDecodeError, ValueError, LlmError) as exc:
+            _log.info(
+                "could not warm the language model, the first answer will be slower",
+                extra={"context": {"model": name, "error": str(exc)}},
+            )
+            return {}
+        metrics = {key: payload[key] for key in _OLLAMA_TIMINGS if key in payload}
+        _log.info(
+            "language model warm",
+            extra={
+                "context": {
+                    "model": name,
+                    "seconds": round(time.perf_counter() - started, 1),
+                    "preamble_tokens": metrics.get("prompt_eval_count"),
+                    **timing_seconds(metrics),
+                }
+            },
+        )
+        return metrics
+
     def vision(self, prompt: str, image_b64: str, *, model: str | None = None) -> str:
         """Ask a vision model about an image.
 
@@ -640,18 +767,7 @@ class OllamaClient:
 
         metrics: dict[str, Any] | None = None
         if done:
-            metrics = {
-                key: payload[key]
-                for key in (
-                    "total_duration",
-                    "load_duration",
-                    "prompt_eval_count",
-                    "prompt_eval_duration",
-                    "eval_count",
-                    "eval_duration",
-                )
-                if key in payload
-            }
+            metrics = {key: payload[key] for key in _OLLAMA_TIMINGS if key in payload}
 
         chunk = ChatChunk(
             content=content,

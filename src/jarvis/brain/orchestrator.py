@@ -23,7 +23,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
-from jarvis.brain.llm import ChatChunk, OllamaClient, ToolCall
+from jarvis.brain.llm import ChatChunk, OllamaClient, ToolCall, timing_seconds
 from jarvis.brain.memory import ConversationMemory, MemoryMessage
 from jarvis.brain.persona import (
     build_error_response,
@@ -41,6 +41,40 @@ from jarvis.util.latency import Stage, TurnLatency
 __all__ = ["Orchestrator", "TurnResult", "turn_budgets"]
 
 _log = logging.getLogger(__name__)
+
+
+def _log_model_timings(rounds: list[dict[str, Any]]) -> None:
+    """Report what Ollama says it did, once per turn.
+
+    ``prompt_eval_count`` is the number to read on a slow machine: it counts the
+    prompt tokens Ollama evaluated rather than reused from its cache. The
+    preamble here is roughly 3,750 tokens of system prompt and tool schemas, so
+    a first turn reporting all of them is expected and a *later* turn reporting
+    all of them again means the prompt prefix is moving between turns and the
+    machine is paying for it every time. Nothing else in the logs can tell those
+    two apart, and on the ``cpu`` tier they are seconds apart.
+    """
+    if not rounds:
+        return
+    prompt_tokens = sum(int(r.get("prompt_eval_count") or 0) for r in rounds)
+    output_tokens = sum(int(r.get("eval_count") or 0) for r in rounds)
+    seconds: dict[str, float] = {}
+    for served in rounds:
+        for key, value in timing_seconds(served).items():
+            seconds[key] = round(seconds.get(key, 0.0) + value, 2)
+    generated = seconds.get("eval_s", 0.0)
+    _log.info(
+        "model timings",
+        extra={
+            "context": {
+                "round_trips": len(rounds),
+                "prompt_tokens_evaluated": prompt_tokens,
+                "output_tokens": output_tokens,
+                "tokens_per_second": round(output_tokens / generated, 1) if generated else None,
+                **seconds,
+            }
+        },
+    )
 
 #: Speech callback: receives each speakable chunk as soon as it is ready.
 SpeakFn = Callable[[str], None]
@@ -145,6 +179,30 @@ class Orchestrator:
         names = [spec.name for spec in self._registry.select(config=self._config)]
         return build_system_prompt(self._config, tools=names)
 
+    def warmup(self) -> dict[str, Any]:
+        """Load the model and evaluate the preamble before the first question.
+
+        Startup already warms the endpointer, the transcriber and the
+        synthesiser, and the language model was the one left cold, so the first
+        question of every session paid for loading the weights and for
+        evaluating the whole preamble on top of everything else. On the ``cpu``
+        tier that is the larger half of the wait.
+
+        The prompt and the tools are built exactly as :meth:`run_turn` builds
+        them, because Ollama's cache only helps a prefix it has already seen: a
+        warmup with a different preamble buys the weights and nothing else.
+
+        Returns:
+            Ollama's timings, empty when it could not be reached. Never raises.
+        """
+        try:
+            return self._llm.warmup(
+                self.system_prompt(), tools=self._registry.ollama_tools(config=self._config)
+            )
+        except Exception:  # noqa: BLE001 - a cold model is slow, not broken
+            _log.debug("could not warm the language model", exc_info=True)
+            return {}
+
     # -- interruption ------------------------------------------------------
 
     def interrupt(self) -> None:
@@ -205,6 +263,11 @@ class Orchestrator:
             reply: list[str] = []
             called: list[str] = []
             first_token_marked = False
+            # Ollama's own timings, one set per round trip. Worth logging: they
+            # are the only place that says how much of the prompt was actually
+            # evaluated rather than reused from the KV cache, which on a slow
+            # machine is the difference between a pause and a wait.
+            served: list[dict[str, Any]] = []
 
             try:
                 for _round in range(self._config.llm.max_tool_iterations):
@@ -233,6 +296,8 @@ class Orchestrator:
                                 self._emit_speech(ready, speak, latency)
 
                         calls.extend(chunk.tool_calls)
+                        if chunk.metrics:
+                            served.append(chunk.metrics)
 
                     if not calls:
                         for ready in chunker.flush():
@@ -293,6 +358,7 @@ class Orchestrator:
 
             latency.finish()
             latency.log(_log)
+            _log_model_timings(served)
             self.bus.emit(EventType.LATENCY, **latency.breakdown())
             self.state.set(AssistantState.IDLE)
             return TurnResult(text=full, tool_calls=called, latency=latency)
